@@ -37,6 +37,19 @@ SCHEME = {  # datatype/format -> torchao scheme (None = no torchao quantization)
     "bf16": None,   # base weights cast to the dtype (no torchao) — see DTYPE_CAST
     "fp16": None,
     "int8": "int8_weight_only",
+    # ⚠️ `int8` IS WEIGHT-ONLY, AND THAT IS A DIFFERENT PROGRAM FROM AN INTEGER DATAPATH.
+    # `int8_weight_only` dequantizes the weight and emits a FLOAT matmul over it: measured on
+    # tiny_llama, 155 `linalg.matmul` at `prov.orig_dtype = "float32"` over f32 tensors and zero
+    # integer contractions. That is the right capture for a model whose weights are stored int8, and
+    # the wrong one for measuring a systolic integer mesh -- and it cannot be repaired by substituting
+    # a golden, because the program contains no integer contraction to grade.
+    #
+    # `int8_w8a8` quantizes the ACTIVATIONS too, so the export contains `aten._int_mm` accumulating in
+    # i32 -- the arithmetic the hardware performs -- and torch eager then computes the same quantized
+    # math, which makes the golden right by construction. Added as a separate FORMAT rather than by
+    # changing what `int8` means: every existing int8 bundle, tolerance table and comparison is keyed
+    # on the weight-only meaning, and silently redefining it would move all of them at once.
+    "int8_w8a8": "int8_dyn_act_int8_weight",
     "fp8": "float8_weight_only_e4m3",
 }
 
@@ -106,7 +119,8 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
     sys.path.insert(0, str(model_dir))
     from loader import get_model_and_inputs  # type: ignore
 
-    suffix = {"fp32": "", "bf16": "_bf16", "fp16": "_fp16", "int8": "_int8", "fp8": "_fp8"}
+    suffix = {"fp32": "", "bf16": "_bf16", "fp16": "_fp16", "int8": "_int8",
+              "int8_w8a8": "_int8_w8a8", "fp8": "_fp8"}
     results = {}
     for fmt in formats:
         try:
