@@ -158,6 +158,37 @@ def _capture_region_goldens(mdl, inputs, fqns) -> dict[str, "np.ndarray"]:
     return caught, g
 
 
+def _numpy_unrepresentable() -> frozenset:
+    import torch
+    out = [torch.bfloat16]
+    for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"):
+        dt = getattr(torch, name, None)
+        if dt is not None:
+            out.append(dt)
+    return frozenset(out)
+
+
+def _numpy_safe(x):
+    """A tensor as numpy, converting ONLY the dtypes numpy cannot represent.
+
+    `numpy` has no bfloat16 (nor any float8), so `.numpy()` on such a tensor raises
+    `TypeError: Got unsupported ScalarType BFloat16`. Measured on smolvla, whose vision tower takes
+    bf16 inputs: the export succeeded, the goldens were written, and the bundle died on `inputs.npz` --
+    the one write here that lacked the conversion `golden.npy` and the buffer writes already do.
+
+    ⚠️ NOT a blanket `.float()`. An LLM's `input_ids` are int64, and casting those to float32 corrupts
+    the token ids silently -- the input would still load, still have the right shape, and index a
+    different embedding row. So the conversion is keyed on the dtype actually being unrepresentable and
+    every other dtype passes through untouched.
+
+    bf16 -> f32 is lossless (bf16 is a truncated f32), so no precision is traded for the storage.
+    """
+    t = x.detach().cpu()
+    if t.dtype in _numpy_unrepresentable():
+        t = t.float()
+    return t.numpy()
+
+
 def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: bool = True) -> dict:
     """Convert ``mdl`` and write the full bundle to ``out``. Returns a summary dict.
 
@@ -195,7 +226,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     np.save(out / "golden.npy", golden.detach().float().cpu().numpy())
 
     np.savez(out / "inputs.npz",
-             **{f"in{i}": x.detach().cpu().numpy() for i, x in enumerate(inputs)})
+             **{f"in{i}": _numpy_safe(x) for i, x in enumerate(inputs)})
 
     extra: dict = {}
     for name, t in mdl.named_buffers():
