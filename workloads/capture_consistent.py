@@ -27,6 +27,24 @@ REPO = Path(__file__).resolve().parent.parent
 WORKLOADS = REPO / "workloads"
 
 
+def _perturb_zero_parameters_for_smoke(mdl) -> int:
+    """Make random-init smoke goldens nondegenerate without changing paper checkpoints.
+
+    Some smoke-only diffusion loaders intentionally start with an all-zero output head.  Perturbing
+    that head is useful for lowering coverage, but doing the same to a ``paper_ready`` pretrained
+    model silently changes its checkpoint.  Paper captures therefore preserve every parameter byte.
+    """
+    if bool(getattr(mdl, "paper_ready", False)):
+        return 0
+    perturbed = 0
+    with torch.no_grad():
+        for parameter in mdl.parameters():
+            if float(parameter.detach().abs().max()) == 0.0:
+                parameter.copy_(torch.randn_like(parameter) * 0.02)
+                perturbed += 1
+    return perturbed
+
+
 def _bundle(model: str, fmt: str, out: Path) -> None:
     import m2m
     sys.path.insert(0, str(WORKLOADS))
@@ -35,11 +53,19 @@ def _bundle(model: str, fmt: str, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     cfg = _load_toml(WORKLOADS / model)
     sys.path.insert(0, str(WORKLOADS / model))
-    from loader import get_model_and_inputs                          # type: ignore
+    import loader as loader_module                                  # type: ignore
 
     torch.manual_seed(0)
     np.random.seed(0)
-    mdl, inputs = get_model_and_inputs()
+    mdl, inputs = loader_module.get_model_and_inputs()
+    q = _quant_for(cfg, fmt)
+    write_multi = getattr(mdl, "write_bundle", None)
+    if callable(write_multi):
+        summary = write_multi(out, quant=q)
+        print("__BUNDLE_OK__ " + json.dumps({
+            "model": model, "fmt": fmt, "out": str(out), **summary,
+        }))
+        return
     mdl.eval()
     inputs = tuple(inputs)
 
@@ -47,12 +73,8 @@ def _bundle(model: str, fmt: str, out: Path) -> None:
     # forward is all-zeros -- a degenerate golden that doesn't exercise the compute. Perturb
     # exactly-zero parameters with small noise; the captured weights stay self-consistent
     # with the golden, and the test now covers the full numeric path.
-    with torch.no_grad():
-        for p in mdl.parameters():
-            if float(p.detach().abs().max()) == 0.0:
-                p.copy_(torch.randn_like(p) * 0.02)
+    _perturb_zero_parameters_for_smoke(mdl)
 
-    q = _quant_for(cfg, fmt)
     weights_path = str(out / "weights.safetensors")
     r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=q,
                     level="linalg-on-tensors", weights_path=weights_path)
@@ -139,12 +161,21 @@ def _bundle(model: str, fmt: str, out: Path) -> None:
         k += 1
     (out / "input_order.json").write_text(json.dumps(order, indent=2))
 
+    session_summary = {}
+    get_session_spec = getattr(loader_module, "get_session_spec", None)
+    if callable(get_session_spec):
+        from m2m.capture.bundle import write_session_artifacts
+        session = get_session_spec(mdl, inputs)
+        if session is not None:
+            session_summary = write_session_artifacts(
+                mdl, inputs, out, manifest=man, input_order=order, session=session)
+
     print("__BUNDLE_OK__ " + json.dumps({
         "model": model, "fmt": fmt, "out": str(out), "n_inputs": len(inputs),
         "n_buffers": sum(1 for k in extra if k.startswith("buf::")),
         "n_lifted": sum(1 for k in extra if k.startswith("c_lifted")),
         "golden_shape": list(golden.shape), "linalg": r.mlir_text.count("linalg."),
-        "input_order": order,
+        "input_order": order, **session_summary,
     }))
 
 

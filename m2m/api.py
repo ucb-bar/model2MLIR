@@ -59,6 +59,7 @@ def convert(
     preserve_qdq: bool = True,
     fully_standard: bool = False,
     weights_path: str | None = None,
+    quantization_preapplied: bool = False,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -100,7 +101,9 @@ def convert(
             return convert_jax(model, example_inputs)
         except ImportError:
             pass  # no jax; fall through and let the torch path try (will error clearly)
-    if quantization is not None:
+    if quantization_preapplied and quantization is None:
+        raise ValueError("quantization_preapplied=True requires a quantization config for provenance")
+    if quantization is not None and not quantization_preapplied:
         # Quantized (tensor-subclass) weights are swapped by .to()/.eval() during
         # capture; disable swap-on-conversion process-wide so capture uses copy
         # semantics and doesn't trip the weakref guard.

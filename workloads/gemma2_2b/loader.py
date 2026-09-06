@@ -21,6 +21,14 @@ Env:
                          matmul. The example input is the REAL embedding rows for the drawn token ids,
                          so the section's boundary tensor is the tensor the whole model would have fed it.
     M2M_SEQ=N            sequence length for the example input (default 8)
+    M2M_GEMMA_SESSION=decode|e2e
+                         ``decode`` exports the diagnostic recurrent step; ``e2e`` emits separate
+                         compiled prefill+decode programs for the primary continuous session
+    M2M_GEMMA_TOKEN_IDS=/path/to/input_ids.npy
+                         tokenized prefill+decode corpus used by the decode session
+    M2M_GEMMA_TOKEN_SOURCE=...
+    M2M_GEMMA_PAPER_READY=1
+                         opt in only with the full checkpoint and an attributed external corpus
 
 Weights come from the local HF cache (google/gemma-2-2b-it); HF_HOME is set by capture.toml.
 
@@ -80,6 +88,8 @@ def get_model_and_inputs() -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
     if n_layers and n_slice:
         raise RuntimeError("set M2M_GEMMA_LAYERS (random init) or M2M_GEMMA_SLICE_LAYERS (pretrained "
                            "section), not both")
+    if os.environ.get("M2M_GEMMA_SESSION") in {"decode", "e2e"} and entry != "ids":
+        raise RuntimeError("M2M_GEMMA_SESSION=decode|e2e requires M2M_GEMMA_ENTRY=ids")
 
     if n_layers:
         # Smoke path: the real Gemma 2 architecture at fewer layers, randomly initialized. Keeps both
@@ -123,6 +133,17 @@ def get_model_and_inputs() -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
         model.config.layer_types = list(model.config.layer_types)[:keep]
 
     vocab = model.config.vocab_size
+    if os.environ.get("M2M_GEMMA_SESSION") in {"decode", "e2e"}:
+        from m2m.capture.causal_session import make_causal_program_capture, make_decode_session
+
+        factory = (make_causal_program_capture
+                   if os.environ.get("M2M_GEMMA_SESSION") == "e2e" else make_decode_session)
+        return factory(
+            model.eval(), env_prefix="M2M_GEMMA",
+            checkpoint=_MODEL_ID, full_checkpoint=not bool(n_layers or n_slice),
+            prefill_tokens=int(os.environ.get("M2M_PREFILL_TOKENS", "128")),
+            decode_tokens=int(os.environ.get("M2M_DECODE_TOKENS", "32")))
+
     input_ids = torch.randint(0, vocab, (1, seq), dtype=torch.long)
 
     if entry == "embeds":
@@ -140,3 +161,9 @@ def get_model_and_inputs() -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
 
     model = _LogitsOnly(model.eval()).eval()
     return model, (input_ids,)
+
+
+def get_session_spec(model: nn.Module, inputs: tuple[torch.Tensor, ...]) -> dict | None:
+    from m2m.capture.causal_session import session_spec
+
+    return session_spec(model, inputs)

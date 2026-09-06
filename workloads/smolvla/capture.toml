@@ -1,3 +1,6 @@
 venv = "/scratch/agustin/projects/smolvla_capture/.venv"
 python = "3.12"
 deps = ["lerobot[smolvla]==0.5.1"]
+
+[env]
+M2M_SMOLVLA_SESSION = "e2e"

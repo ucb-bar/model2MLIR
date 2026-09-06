@@ -3296,7 +3296,11 @@ def decompose_batch_norm_inference(operands, meta, node_name):
     if mean is None or var is None:
         return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
                               "normalization", pattern_hint="batch_norm")
-    eps = _fx_arg(meta, 6, 1e-5)
+    # ``aten.batch_norm.default`` has the same tensor operands but includes both ``training`` and
+    # ``momentum`` before eps, so eps is positional argument 7 rather than 6. Torch versions differ
+    # on whether export leaves this public alias or rewrites to the native inference op.
+    eps_index = 7 if meta.get("_aten_target") == "aten.batch_norm.default" else 6
+    eps = _fx_arg(meta, eps_index, 1e-5)
     try:
         eps = float(eps)
     except (TypeError, ValueError):
@@ -3351,6 +3355,149 @@ def decompose_batch_norm_inference(operands, meta, node_name):
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("normalization")
     return DecompResult(ops=ops, result=cur, region_ids=[rid], pattern_hint="batch_norm")
+
+
+def _pair_arg(value, default):
+    """Normalize a pooling scalar/list argument to an integer pair."""
+    if value in (None, []):
+        value = default
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            value = (value[0], value[0])
+        elif len(value) == 2:
+            value = (value[0], value[1])
+        else:
+            return None
+    else:
+        value = (value, value)
+    try:
+        return int(value[0]), int(value[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def decompose_max_pool2d(operands, meta, node_name):
+    """aten.max_pool2d.default -> padded windowed linalg.generic max reduction.
+
+    Supports the static NCHW inference form, including stride/padding/dilation. ``ceil_mode`` is
+    refused until its asymmetric high-edge extension is represented explicitly; emitting a floor
+    pool for that case would be a silent semantic error.
+    """
+    from xdsl.dialects.arith import ConstantOp, MaximumfOp
+    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr, IntegerType
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import InsertSliceOp, SplatOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    if not operands:
+        return _opaque_decomp("aten_max_pool2d", operands, meta, "pool", pattern_hint="max_pool2d")
+    x = operands[0]
+    in_shape = _shape_of(x)
+    val: Any = meta.get("val")
+    primary = val[0] if isinstance(val, (tuple, list)) and val else val
+    out_shape = _static_shape(getattr(primary, "shape", [])) if primary is not None else []
+    if (in_shape is None or len(in_shape) != 4 or len(out_shape) != 4 or
+            any(d < 0 for d in (*in_shape, *out_shape))):
+        return _opaque_decomp("aten_max_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="max_pool2d")
+    kernel = _pair_arg(_fx_arg(meta, 1, None), None)
+    stride = _pair_arg(_fx_arg(meta, 2, None), kernel)
+    padding = _pair_arg(_fx_arg(meta, 3, 0), (0, 0))
+    dilation = _pair_arg(_fx_arg(meta, 4, 1), (1, 1))
+    ceil_mode = bool(_fx_arg(meta, 5, False))
+    if None in (kernel, stride, padding, dilation) or ceil_mode:
+        return _opaque_decomp("aten_max_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="max_pool2d")
+    kh, kw = kernel
+    sh, sw = stride
+    ph, pw = padding
+    dh, dw = dilation
+    n, c, h, w = in_shape
+    no, co, oh, ow = out_shape
+    if min(kh, kw, sh, sw, dh, dw) < 1 or min(ph, pw) < 0 or (n, c) != (no, co):
+        return _opaque_decomp("aten_max_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="max_pool2d")
+    expected = ((h + 2 * ph - dh * (kh - 1) - 1) // sh + 1,
+                (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1)
+    if expected != (oh, ow):
+        return _opaque_decomp("aten_max_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="max_pool2d")
+    elem = _t_elem(x)
+    if isinstance(elem, IntegerType):
+        # Integer minimum depends on signedness/bit width; add it only with an explicit dtype policy.
+        return _opaque_decomp("aten_max_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="max_pool2d")
+
+    ops: list[Operation] = []
+    neg_inf = ConstantOp(FloatAttr(float("-inf"), elem), elem)
+    ops.append(neg_inf)
+    source = x
+    if ph or pw:
+        padded_type = TensorType(elem, [n, c, h + 2 * ph, w + 2 * pw])
+        padded = SplatOp(neg_inf.results[0], [], padded_type)
+        inserted = InsertSliceOp.from_static_parameters(
+            x, padded.results[0], [0, 0, ph, pw], in_shape, [1, 1, 1, 1])
+        ops += [padded, inserted]
+        source = inserted.results[0]
+
+    out_type = TensorType(elem, out_shape)
+    init = SplatOp(neg_inf.results[0], [], out_type)
+    # A WINDOW OPERAND, shaped exactly like the pooling window, carries the two facts the strided
+    # access map cannot: it makes the op's concatenated indexing map invertible, and it states the
+    # window extents. Without it the window dims (d4, d5) appear ONLY inside `d2 * sh + d4 * dh`,
+    # never as a bare dim, so `inversePermutation` fails -- MLIR rejects the op at parse time with
+    # "invalid indexing maps are non-invertible" -- and even if it did not, the loop bounds for the
+    # reduction would be unrecoverable from the shapes (a 114-wide padded input is consistent with
+    # both a 3- and a 4-tall window at stride 2, and the two compute different maxima). This is
+    # precisely why the upstream `linalg.pooling_*` named ops take a shape-only `K` operand. The
+    # value is never read: the body ignores its block argument.
+    window = _make_empty(TensorType(elem, [kh, kw]))
+    block = Block(arg_types=[elem, elem, elem])
+    maximum = MaximumfOp(block.args[0], block.args[2])
+    block.add_op(maximum)
+    block.add_op(YieldOp(maximum.results[0]))
+    D = AffineExpr.dimension  # n,c,oh,ow,kh,kw
+    pool = GenericOp(
+        inputs=[source, window.results[0]], outputs=[init.results[0]], body=Region(block),
+        indexing_maps=[
+            AffineMapAttr(AffineMap(6, 0, (
+                D(0), D(1), D(2) * sh + D(4) * dh, D(3) * sw + D(5) * dw))),
+            AffineMapAttr(AffineMap(6, 0, (D(4), D(5)))),
+            AffineMapAttr(AffineMap(6, 0, (D(0), D(1), D(2), D(3)))),
+        ],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * 4 +
+                       [IteratorTypeAttr(IteratorType.REDUCTION)] * 2,
+        result_types=[out_type],
+    )
+    ops += [init, window, pool]
+    rid = _next_region_id("max_pool2d")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("pool")
+    return DecompResult(ops=ops, result=pool.results[0], region_ids=[rid],
+                        pattern_hint="max_pool2d")
+
+
+def decompose_adaptive_avg_pool2d(operands, meta, node_name):
+    """aten.adaptive_avg_pool2d.default for global (1,1) pooling -> mean over H,W."""
+    if not operands:
+        return _opaque_decomp("aten_adaptive_avg_pool2d", operands, meta, "pool",
+                              pattern_hint="adaptive_avg_pool2d")
+    x = operands[0]
+    in_shape = _shape_of(x)
+    val: Any = meta.get("val")
+    out_shape = _static_shape(getattr(val, "shape", [])) if val is not None else []
+    output_size = _pair_arg(_fx_arg(meta, 1, None), None)
+    if (in_shape is None or len(in_shape) != 4 or output_size != (1, 1) or
+            out_shape != [in_shape[0], in_shape[1], 1, 1]):
+        return _opaque_decomp("aten_adaptive_avg_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="adaptive_avg_pool2d")
+    rewritten = dict(meta)
+    rewritten["_fx_args"] = (meta.get("_fx_args", (x,))[0], [2, 3], True)
+    result = decompose_mean_dim(operands[:1], rewritten, node_name)
+    result.pattern_hint = "adaptive_avg_pool2d"
+    return result
 
 
 def _rank1_rsqrt(src, rt: TensorType, elem):
@@ -5906,6 +6053,10 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.conv2d.default": decompose_convolution,
     "aten.constant_pad_nd.default": decompose_constant_pad_nd,
     "aten._native_batch_norm_legit_no_training.default": decompose_batch_norm_inference,
+    "aten.batch_norm.default": decompose_batch_norm_inference,
+    "aten.max_pool2d.default": decompose_max_pool2d,
+    "aten.max_pool2d_with_indices.default": decompose_max_pool2d,
+    "aten.adaptive_avg_pool2d.default": decompose_adaptive_avg_pool2d,
     "aten.upsample_bilinear2d.vec": decompose_upsample_bilinear2d,
     "aten.upsample_nearest2d.vec": decompose_upsample_nearest2d,
     # torch.fft: real DFT contractions, complex carried as a trailing (re, im) pair.
@@ -6017,6 +6168,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
 DECOMPOSITION_TABLE.update(
     {
         "aten.relu.default": decompose_relu,
+        "aten.relu_.default": decompose_relu,
         "aten.clamp.default": decompose_clamp,
         "aten.clamp.Tensor": decompose_clamp,
         "aten.maximum.default": _make_minmax("MaximumfOp", "maximum"),
