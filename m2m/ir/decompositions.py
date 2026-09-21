@@ -2262,7 +2262,11 @@ def decompose_convolution(operands, meta, node_name):
             return [default, default]
         if isinstance(v, (list, tuple)):
             vals = [int(x) for x in v]
-            return [default, vals[0]] if rank == 3 else vals[:2]
+            if rank == 3:
+                return [default, vals[0]]
+            # ATen broadcasts single elem int[] (e.g. from Conv2d(padding="valid"), 
+            # need [0, 0] for both spatial dims
+            return [vals[0], vals[0]] if len(vals) == 1 else vals[:2]
         return [default, int(v)] if rank == 3 else [int(v), int(v)]
 
     # Two aten spellings reach here with DIFFERENT arg layouts, and conflating them is a

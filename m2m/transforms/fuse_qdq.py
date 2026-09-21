@@ -6,7 +6,7 @@ pass recognizes that pair via the taxonomy tags (`prov.op == "dtype_cast"` then 
 rewrites it to an explicit ``quant_ext.dequantize_per_{tensor,channel}`` op, so the
 quantization is first-class and matchable (a target-aware fuse can then map it to a native
 quantized matmul). Symmetric weight-only -> zero_point = 0.
-
+   j 
 Safe by construction: the whole module is verified after rewriting; on ANY failure the
 original (unfused) module is returned, so this can never regress the portable output.
 """
@@ -33,6 +33,25 @@ def _producer(value):
 
     owner = getattr(value, "owner", None)
     return owner if isinstance(owner, Operation) else None
+
+
+def _hoist_producers_before(value, anchor, block, seen) -> None:
+    """Ensure ``value``'s producer (and, transitively, its operands' producers) is
+    positioned before ``anchor`` in ``block``, moving ops earlier as needed.
+
+    Needed because rewriting can move a *consumer* earlier (e.g. wiring the scale
+    into a new op inserted before the matmul) without moving the scale's own
+    *producer* (e.g. a view/collapse_shape reshaping [N,1] -> [N]), which was only
+    valid in its original position because its sole consumer used to sit later."""
+    op = _producer(value)
+    if op is None or op in seen or op.parent_block() is not block:
+        return
+    seen.add(op)
+    for operand in op.operands:
+        _hoist_producers_before(operand, anchor, block, seen)
+    if not op.is_before_in_block(anchor):
+        op.detach()
+        Rewriter.insert_op(op, InsertPoint.before(anchor))
 
 
 def fuse_qdq(module: ModuleOp) -> ModuleOp:
@@ -109,6 +128,11 @@ def _fuse(module: ModuleOp) -> None:
             deq.attributes["prov.quant_inner_w"] = _wk
         if _sk is not None:
             deq.attributes["prov.quant_inner_s"] = _sk
+        # `scale`'s producer (e.g. a view/collapse_shape reshaping [N,1] -> [N]) was only
+        # positioned after `mm` because its sole consumer used to be the post-matmul `mul`;
+        # now that `deq` (which needs `scale`) is inserted before `cast`/`mm`, that producer
+        # must be hoisted too, or the emitted IR uses `scale` before it's defined.
+        _hoist_producers_before(scale, cast, cast.parent_block(), set())
         Rewriter.insert_op([zero, zp, deq], InsertPoint.before(cast))
         cast.results[0].replace_all_uses_with(deq.results[0])   # matmul now reads the dequant
         mul.results[0].replace_all_uses_with(mm.results[0])     # drop the post-matmul scale
