@@ -77,6 +77,25 @@ def test_true_int_matmul_present():
     assert "i32" in r.mlir_text  # int32 accumulation
 
 
+def test_pt2e_scalar_qparams_are_materialized_before_import():
+    """PT2E calibration stores per-tensor scale and zero point as FX scalars."""
+
+    class QDQ(nn.Module):
+        def forward(self, x):
+            q = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                x, 0.125, 0, -128, 127, torch.int8
+            )
+            return torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                q, 0.125, 0, -128, 127, torch.int8
+            )
+
+    result = m2m.convert(QDQ().eval(), (torch.randn(2, 8),), backend="fx_importer", decompose=False)
+    assert result.ok
+    assert opaque_report(result.mlir_text) == {}
+    assert "quant_ext.quantize_per_tensor" in result.mlir_text
+    assert "quant_ext.dequantize_per_tensor" in result.mlir_text
+
+
 def test_fp8_type_renders_native_spelling():
     """The shim fp8 type prints with the MLIR-native spelling (f8E4M3FN) on text emission,
     so an artifact carrying f8 storage parses in a standard MLIR toolchain."""

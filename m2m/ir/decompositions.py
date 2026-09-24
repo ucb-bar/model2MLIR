@@ -5250,6 +5250,43 @@ def _torch_dtype_tag(val: Any) -> str:
     return str(val.dtype).replace("torch.", "")
 
 
+def _pt2e_per_tensor_operands(operands, meta):
+    """Build input, scale and zero point from their original FX positions.
+
+    PT2E activation qparams can be scalar literals rather than graph nodes.
+    Materialize those literals as rank-zero tensors; retain SSA values for
+    tensor qparams. Without this, the importer leaves opaque calls that have
+    already discarded the qparam values and cannot be recovered downstream.
+    """
+    from xdsl.dialects.builtin import Float32Type, IntegerType
+
+    by_position = meta.get("_fx_ssa_args") or {}
+    built_ops: list[Operation] = []
+    resolved = []
+    for index, typ in (
+        (0, None),
+        (1, TensorType(Float32Type(), [])),
+        (2, TensorType(IntegerType(64), [])),
+    ):
+        value = by_position.get(index)
+        if value is None and index < len(operands) and not by_position:
+            # Direct decomposition callers have no positional FX metadata.
+            value = operands[index]
+        if value is None and typ is not None:
+            raw = _fx_arg(meta, index)
+            if not isinstance(raw, (int, float)):
+                raise IndexError(f"PT2E qparam argument {index} is not materializable: {raw!r}")
+            made = _splat_scalar(raw, typ)
+            if made is None:
+                raise TypeError(f"could not materialize PT2E qparam argument {index}")
+            built_ops.extend(made[0])
+            value = made[1]
+        if value is None:
+            raise IndexError(f"missing PT2E Q/DQ operand at argument {index}")
+        resolved.append(value)
+    return built_ops, resolved
+
+
 def decompose_quantize_per_tensor(operands, meta, node_name):
     """torch.ops.quantized_decomposed.quantize_per_tensor.default.
 
@@ -5263,13 +5300,7 @@ def decompose_quantize_per_tensor(operands, meta, node_name):
     elem = _element_type_from_meta(meta)
     result_type = TensorType(elem, _static_shape(val.shape))
 
-    # Require at least input + scale + zero_point as SSA operands. In
-    # the real FX path these all exist; in unit tests the caller passes
-    # three tensor placeholders which we accept as-is.
-    if len(operands) < 3:
-        raise IndexError(
-            f"decompose_quantize_per_tensor expects input + scale + zero_point (3 operands), got {len(operands)}"
-        )
+    qparam_ops, qoperands = _pt2e_per_tensor_operands(operands, meta)
 
     properties: dict[str, Any] = {}
     qmin = _fx_arg(meta, 3)
@@ -5284,13 +5315,13 @@ def decompose_quantize_per_tensor(operands, meta, node_name):
 
     rid = _next_region_id("quantize")
     op = QuantizePerTensorOp(
-        operands=[operands[0], operands[1], operands[2]],
+        operands=qoperands,
         result_types=[result_type],
         properties=properties,
     )
     _attach_region_id(op, rid)
     return DecompResult(
-        ops=[op],
+        ops=[*qparam_ops, op],
         result=op.results[0],
         region_ids=[rid],
         pattern_hint="quantize_per_tensor",
@@ -5305,8 +5336,7 @@ def decompose_dequantize_per_tensor(operands, meta, node_name):
     elem = _element_type_from_meta(meta)
     result_type = TensorType(elem, _static_shape(val.shape))
 
-    if len(operands) < 3:
-        raise IndexError(f"decompose_dequantize_per_tensor expects input + scale + zero_point, got {len(operands)}")
+    qparam_ops, qoperands = _pt2e_per_tensor_operands(operands, meta)
 
     properties: dict[str, Any] = {}
     qmin = _fx_arg(meta, 3)
@@ -5318,13 +5348,13 @@ def decompose_dequantize_per_tensor(operands, meta, node_name):
 
     rid = _next_region_id("dequantize")
     op = DequantizePerTensorOp(
-        operands=[operands[0], operands[1], operands[2]],
+        operands=qoperands,
         result_types=[result_type],
         properties=properties,
     )
     _attach_region_id(op, rid)
     return DecompResult(
-        ops=[op],
+        ops=[*qparam_ops, op],
         result=op.results[0],
         region_ids=[rid],
         pattern_hint="dequantize_per_tensor",

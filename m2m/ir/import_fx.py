@@ -812,6 +812,14 @@ class FXImporter:
                 # quant_max, etc.) that don't show up as SSA operands.
                 meta["_fx_args"] = tuple(node.args)
                 meta["_fx_kwargs"] = dict(node.kwargs)
+                # Keep each SSA value at its original FX argument position. PT2E
+                # passes calibrated scalar qparams as literals and weight qparams
+                # as graph nodes; the flattened operands alone lose that distinction.
+                meta["_fx_ssa_args"] = {
+                    i: value_map[arg.name]
+                    for i, arg in enumerate(node.args)
+                    if hasattr(arg, "name") and arg.name in value_map
+                }
                 meta["_aten_target"] = target_str  # provenance: source aten op
                 meta["_emit_named_ops"] = self.emit_named_ops  # high-level form toggle
                 meta["_quant_inner"] = _quant_inner_key.get(node.name)  # subclass attr path
