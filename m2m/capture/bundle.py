@@ -421,7 +421,8 @@ def _numpy_safe(x):
 
 
 def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: bool = True,
-                 session: dict | None = None, quantization_preapplied: bool = False) -> dict:
+                 session: dict | None = None, quantization_preapplied: bool = False,
+                 source_path: str | Path | None = None) -> dict:
     """Convert ``mdl`` and write the full bundle to ``out``. Returns a summary dict.
 
     ``quant`` is an m2m ``QuantizationConfig`` (or ``None`` for an unquantized/fp bundle). The golden
@@ -502,6 +503,10 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         session_summary = write_session_artifacts(
             mdl, inputs, out, manifest=man, input_order=order, session=session,
             quality_reference=quality_reference)
+
+    from m2m.capture.provenance import write_capture_receipt
+
+    write_capture_receipt(out, source_path=source_path)
 
     return {
         "out": str(out), "n_inputs": len(inputs),

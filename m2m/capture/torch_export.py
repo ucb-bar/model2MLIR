@@ -155,15 +155,24 @@ def _count_graph_partitions(graphs: tuple[torch.fx.GraphModule, ...]) -> int:
 
 
 def _serialize_range_constraints(exported_program: Any) -> tuple[RangeConstraint, ...]:
+    import math
+
+    def finite_bound(raw: Any) -> int | None:
+        if raw is None:
+            return None
+        try:
+            if not math.isfinite(float(raw)):
+                return None
+            return int(raw)
+        except (OverflowError, TypeError, ValueError):
+            # An unbounded or symbolic endpoint is not a finite constraint.
+            return None
+
     constraints = []
     raw_constraints = getattr(exported_program, "range_constraints", {}) or {}
     for symbol, value in raw_constraints.items():
-        minimum = getattr(value, "lower", None)
-        maximum = getattr(value, "upper", None)
-        if minimum is not None:
-            minimum = int(minimum)
-        if maximum is not None:
-            maximum = int(maximum)
+        minimum = finite_bound(getattr(value, "lower", None))
+        maximum = finite_bound(getattr(value, "upper", None))
         constraints.append(RangeConstraint(symbol=str(symbol), minimum=minimum, maximum=maximum))
     return tuple(constraints)
 
