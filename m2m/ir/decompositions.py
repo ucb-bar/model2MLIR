@@ -3953,6 +3953,35 @@ def decompose_split_with_sizes(operands, meta, node_name):
     return DecompResult(ops=ops, result=results[0], results=results, region_ids=[rid], pattern_hint="split")
 
 
+def decompose_split_tensor(operands, meta, node_name):
+    """aten.split.Tensor(input, chunk_size, dim) via the validated multi-slice writer."""
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+    shape = _shape_of(operands[0])
+    pieces = meta.get("val")
+    chunk = _fx_arg(meta, 1, None)
+    raw_dim = _fx_arg(meta, 2, 0)
+    if (shape is None or not shape or any(d < 0 for d in shape)
+            or not isinstance(chunk, int) or isinstance(chunk, bool) or chunk <= 0
+            or not isinstance(raw_dim, int) or isinstance(raw_dim, bool)
+            or not isinstance(pieces, (tuple, list)) or not pieces):
+        return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+    dim = raw_dim % len(shape)
+    sizes = []
+    for piece in pieces:
+        part_shape = _static_shape(getattr(piece, "shape", []))
+        if len(part_shape) != len(shape) or any(
+            part_shape[axis] != extent for axis, extent in enumerate(shape) if axis != dim
+        ):
+            return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+        sizes.append(part_shape[dim])
+    if sum(sizes) != shape[dim] or any(size != chunk for size in sizes[:-1]) or not 0 <= sizes[-1] <= chunk:
+        return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+    sliced_meta = dict(meta)
+    sliced_meta["_fx_args"] = (None, sizes, dim)
+    return decompose_split_with_sizes(operands, sliced_meta, node_name)
+
+
 def decompose_unbind(operands, meta, node_name):
     """aten.unbind.int(input, dim) -> N rank-reducing slices (multi-output). Each output is
     input[..., k, ...] for k in 0..size[dim]-1 (extract_slice + squeeze the dim)."""
@@ -5733,6 +5762,29 @@ def decompose_where_scalar(operands, meta, node_name):
     return _opaque_decomp("aten_where", operands[:1], meta, "select", pattern_hint="where")
 
 
+def decompose_where_scalar_other(operands, meta, node_name):
+    """aten.where.ScalarOther(condition, tensor, scalar) -> typed pointwise select."""
+    from xdsl.dialects.arith import ConstantOp, SelectOp
+    from xdsl.dialects.builtin import FloatAttr, IntegerAttr, IntegerType
+
+    other = _fx_arg(meta, 2, None)
+    if len(operands) < 2 or not isinstance(other, (bool, int, float)):
+        return _opaque_decomp("aten_where", operands[:2], meta, "select", pattern_hint="where")
+
+    def build(args, out_elem):
+        cast_ops, value = _cast_scalar_arg(args[1], out_elem)
+        attr = (IntegerAttr(int(other), out_elem) if isinstance(out_elem, IntegerType)
+                else FloatAttr(float(other), out_elem))
+        scalar = ConstantOp(attr, out_elem)
+        selected = SelectOp(args[0], value, scalar.results[0])
+        return [*cast_ops, scalar, selected], selected.results[0]
+
+    real = _pointwise(operands[:2], meta, build, family="select")
+    return real if real is not None else _opaque_decomp(
+        "aten_where", operands[:2], meta, "select", pattern_hint="where"
+    )
+
+
 def decompose_ones(operands, meta, node_name):
     """aten.ones[.default](size, ...) -> splat of 1 (family fill)."""
     val: Any = meta["val"]
@@ -6082,6 +6134,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.expand.default": decompose_expand,
     "aten.cat.default": decompose_cat,
     "aten.split_with_sizes.default": decompose_split_with_sizes,
+    "aten.split.Tensor": decompose_split_tensor,
     "aten.clone.default": decompose_clone,
     # production-readiness fill-ins:
     "aten.contiguous.default": decompose_contiguous,
@@ -6130,8 +6183,10 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.__and__.Tensor": decompose_bitwise_and,
     "aten.arange.start": decompose_arange,            # arange(start, end)
     "aten.ones.default": decompose_ones,
+    "aten.new_ones.default": decompose_ones,
     "aten.linspace.default": decompose_linspace,
     "aten.where.Scalar": decompose_where_scalar,
+    "aten.where.ScalarOther": decompose_where_scalar_other,
     "aten.conv2d.padding": decompose_conv2d_padding,
     "aten.where.self": decompose_where_self,
     "aten.scalar_tensor.default": decompose_scalar_tensor,
