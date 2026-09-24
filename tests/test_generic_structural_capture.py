@@ -22,6 +22,41 @@ class _NewOnes(torch.nn.Module):
         return torch.ops.aten.new_ones.default(x, [2, 3])
 
 
+class _IdentityAsStrided(torch.nn.Module):
+    def forward(self, x):
+        # Singleton strides are irrelevant to element mapping.  A ResNet
+        # global-average-pool export emits exactly this shape of view.
+        return torch.ops.aten.as_strided.default(x, [1, 2, 1, 1], [2, 1, 2, 2], 0)
+
+
+class _ReorderedAsStrided(torch.nn.Module):
+    def forward(self, x):
+        return torch.ops.aten.as_strided.default(x, [2, 3], [1, 2], 0)
+
+
+def test_raw_export_identity_as_strided_has_no_opaque_call():
+    example = torch.randn(1, 2, 1, 1)
+    exported = torch.export.export(_IdentityAsStrided(), (example,))
+    assert "aten.as_strided.default" in {
+        str(node.target) for node in exported.graph.nodes if node.op == "call_function"
+    }
+    result = m2m.convert(
+        _IdentityAsStrided(), (example,), backend="fx_importer",
+        level="linalg-on-tensors", decompose=False,
+    )
+    assert result.ok, result.diagnostics
+    assert not opaque_report(result.mlir_text), opaque_report(result.mlir_text)
+
+
+def test_nonidentity_as_strided_remains_opaque():
+    result = m2m.convert(
+        _ReorderedAsStrided(), (torch.randn(2, 3),), backend="fx_importer",
+        level="linalg-on-tensors", decompose=False,
+    )
+    assert result.ok, result.diagnostics
+    assert opaque_report(result.mlir_text) == {"aten_as_strided_default": 1}
+
+
 def test_raw_export_structural_overloads_have_no_opaque_calls():
     # decompose=False is essential: the default torch-export decomposition pass rewrites these
     # overloads before the FX importer sees them, hiding its missing handlers.

@@ -3837,6 +3837,46 @@ def decompose_view(operands, meta, node_name):
     return _reshape_decomp(operands, meta, node_name, hint="view", prefix="view")
 
 
+def decompose_as_strided_identity(operands, meta, node_name):
+    """Forward an as_strided view only when it has identical element mapping.
+
+    Arbitrary strides can alias/reorder elements and cannot be represented by
+    forwarding a value-semantics MLIR tensor.  This narrow case removes a
+    real exported-model identity view without claiming general as_strided
+    support; all other geometries remain opaque for the coverage gate.
+    """
+    source = _fx_arg(meta, 0)
+    source_value = getattr(source, "meta", {}).get("val")
+    size = _fx_arg(meta, 1)
+    strides = _fx_arg(meta, 2)
+    offset = _fx_arg(meta, 3, None)
+    if operands and source_value is not None and isinstance(size, (tuple, list)) and isinstance(strides, (tuple, list)):
+        try:
+            source_shape = tuple(int(x) for x in source_value.shape)
+            source_strides = tuple(int(x) for x in source_value.stride())
+            source_offset = int(source_value.storage_offset())
+            requested_shape = tuple(int(x) for x in size)
+            requested_strides = tuple(int(x) for x in strides)
+            requested_offset = source_offset if offset is None else int(offset)
+            result_shape = tuple(int(x) for x in meta["val"].shape)
+            if (
+                requested_shape == source_shape == result_shape
+                and len(requested_strides) == len(source_strides)
+                and all(
+                    extent == 1 or requested == original
+                    for extent, requested, original in zip(
+                        requested_shape, requested_strides, source_strides
+                    )
+                )
+                and requested_offset == source_offset
+                and operands[0].type == TensorType(_element_type_from_meta(meta), requested_shape)
+            ):
+                return DecompResult(ops=[], result=operands[0], pattern_hint="as_strided_identity")
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
+
+
 def decompose_unsqueeze(operands, meta, node_name):
     """aten.unsqueeze.default(input, dim) -> tensor.reshape inserting a size-1 dim."""
     return _reshape_decomp(operands, meta, node_name, hint="unsqueeze", prefix="unsqueeze")
@@ -6280,6 +6320,7 @@ DECOMPOSITION_TABLE.update(
         "aten.any.default": decompose_any_real,
         "aten.any.dims": decompose_any_real,
         "aten.reshape.default": decompose_view,
+        "aten.as_strided.default": decompose_as_strided_identity,
         "aten._unsafe_view.default": decompose_view,
         "aten.sum.dim_IntList": decompose_sum_dim,
         "aten.reciprocal.default": decompose_reciprocal,
