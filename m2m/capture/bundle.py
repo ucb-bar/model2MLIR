@@ -71,16 +71,19 @@ def _flatten_subclass(obj: Any, prefix: str, out: dict) -> None:
         out[f"qinner::{prefix}"] = arr
 
 
-def _lifted_constants(mdl, inputs, extra: dict) -> None:
+def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> None:
     """Populate c_lifted_tensor_<i> from m2m's own export (graph order matches the importer)."""
     try:
-        from m2m.capture.torch_export import capture_frontend_artifact
-        from m2m.ir.torchmlir_decomps import torch_mlir_gap_decompositions
         from torch.export.graph_signature import InputKind
 
-        artifact = capture_frontend_artifact(
-            mdl, inputs, export_decomposition_table=torch_mlir_gap_decompositions())
-        ep = artifact.exported_program or artifact.original_exported_program
+        ep = exported_program
+        if ep is None:
+            from m2m.capture.torch_export import capture_frontend_artifact
+            from m2m.ir.torchmlir_decomps import torch_mlir_gap_decompositions
+
+            artifact = capture_frontend_artifact(
+                mdl, inputs, export_decomposition_table=torch_mlir_gap_decompositions())
+            ep = artifact.exported_program or artifact.original_exported_program
         consts = dict(getattr(ep, "constants", {}) or {})
         sd = dict(getattr(ep, "state_dict", {}) or {})
         li = 0
@@ -422,7 +425,7 @@ def _numpy_safe(x):
 
 def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: bool = True,
                  session: dict | None = None, quantization_preapplied: bool = False,
-                 source_path: str | Path | None = None) -> dict:
+                 source_path: str | Path | None = None, exported_program=None) -> dict:
     """Convert ``mdl`` and write the full bundle to ``out``. Returns a summary dict.
 
     ``quant`` is an m2m ``QuantizationConfig`` (or ``None`` for an unquantized/fp bundle). The golden
@@ -483,7 +486,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     for pname, p in mdl.named_parameters():
         if type(p).__name__ not in ("Parameter", "Tensor") or hasattr(p, "__tensor_flatten__"):
             _flatten_subclass(p, pname, extra)
-    _lifted_constants(mdl, inputs, extra)
+    _lifted_constants(mdl, inputs, extra, exported_program=exported_program)
     np.savez(out / "extra.npz", **extra)
 
     man = json.loads(Path(weights_path + ".manifest.json").read_text())

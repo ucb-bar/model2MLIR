@@ -4,10 +4,12 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import sympy
 import torch
 
-from m2m.capture.bundle import write_bundle
+from m2m.capture.bundle import _lifted_constants, write_bundle
+from m2m.capture.provenance import capture_receipt
 from m2m.capture.torch_export import _serialize_range_constraints
 
 
@@ -42,6 +44,15 @@ def test_bundle_receipt_binds_source_tool_framework_and_materialized_abi(tmp_pat
         data = (bundle / name).read_bytes()
         assert record == {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
+    # The original PT2 can lift a scalar. NumPy's ascontiguousarray promotes it
+    # to [1], which would silently put the wrong ABI shape in the receipt.
+    manifest_path = bundle / "weights.safetensors.manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest[str(len(manifest))] = {"kind": "constant", "name": "c_lifted_tensor_0"}
+    manifest_path.write_text(json.dumps(manifest))
+    np.savez(bundle / "extra.npz", c_lifted_tensor_0=np.array(1.0, dtype=np.float32))
+    assert capture_receipt(bundle)["lifted_constants"]["c_lifted_tensor_0"]["shape"] == []
+
 
 def test_unbounded_export_constraint_does_not_break_lifted_constant_capture():
     exported = SimpleNamespace(range_constraints={
@@ -49,3 +60,19 @@ def test_unbounded_export_constraint_does_not_break_lifted_constant_capture():
     })
     assert _serialize_range_constraints(exported)[0].minimum == 1
     assert _serialize_range_constraints(exported)[0].maximum is None
+
+
+def test_original_export_supplies_lifted_constants_without_second_export():
+    from torch.export.graph_signature import ConstantArgument, InputKind, InputSpec
+
+    exported = SimpleNamespace(
+        constants={"lifted_tensor_0": torch.tensor([True, False])},
+        state_dict={},
+        graph_signature=SimpleNamespace(input_specs=[
+            InputSpec(InputKind.CONSTANT_TENSOR, ConstantArgument("c_lifted_tensor_0", None),
+                      "lifted_tensor_0"),
+        ]),
+    )
+    extra = {}
+    _lifted_constants(None, (), extra, exported_program=exported)
+    assert extra["c_lifted_tensor_0"].tolist() == [True, False]

@@ -74,7 +74,7 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
         for name in sorted(extras.files):
             if not name.startswith("c_lifted_tensor_"):
                 continue
-            value = np.ascontiguousarray(extras[name])
+            value = np.asarray(extras[name])
             lifted[name] = {
                 "shape": list(value.shape),
                 "dtype": str(value.dtype),
