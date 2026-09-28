@@ -152,6 +152,17 @@ def run_pt2e_integer_reference(
         def run_node(self, node: Any) -> Any:
             if node.op != "call_function" or node.target not in (conv2d, linear, *matmuls):
                 return super().run_node(node)
+            # The integerizer only rewrites contractions whose operands are
+            # direct PT2E dequantize nodes.  An attention matmul over the
+            # results of integerized linears (often reshaped/transposed) is a
+            # floating-point contraction, not another int8 contraction.
+            if len(node.args) < 2 or not all(
+                isinstance(operand, Node)
+                and operand.op == "call_function"
+                and operand.target in (dequant_tensor, dequant_channel)
+                for operand in node.args[:2]
+            ):
+                return super().run_node(node)
 
             args, kwargs = self.fetch_args_kwargs_from_env(node)
             output_axis = args[1].ndim - 1 if node.target in matmuls else 0

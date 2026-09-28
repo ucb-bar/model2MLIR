@@ -52,6 +52,7 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
         torch.ops.aten.convolution.default,
     }
     refusals: list[dict[str, str]] = []
+    precision_decisions: list[dict[str, str]] = []
     qparam_receipts: list[dict[str, Any]] = []
     quantized_by_kind = {
         kind: {"seen": 0, "integerized": 0, "remaining": 0}
@@ -66,6 +67,16 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
         "integer_mm_emitted": 0,
         "max_reduction_k": 0,
     }
+
+    class _IncompatibleDequantPrecision(ValueError):
+        def __init__(self, declared: Any, observed: Any) -> None:
+            self.source_dtype = str(observed if observed is not None else declared)
+            super().__init__(
+                f"dequantize output is declared {declared} and observed {observed}; "
+                "this i8xi8->i32 rewrite assumes float32 Q/DQ operands. Non-float32 "
+                "dequantization changes per-operand rounding, so it needs an explicit "
+                "precision conversion and a separate numerical qualification"
+            )
 
     def _shape(node: Node) -> tuple[int, ...]:
         value = node.meta.get("tensor_meta") or node.meta.get("val")
@@ -93,8 +104,14 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
         per_channel = node.target == channel_dequant
         if len(node.args) < (7 if per_channel else 6) or not isinstance(node.args[0], Node):
             raise ValueError("dequantize has no integer tensor or complete qparams")
-        if node.kwargs.get("out_dtype", torch.float32) not in (None, torch.float32):
-            raise ValueError("dequantize output must be float32")
+        declared_output = node.kwargs.get("out_dtype", torch.float32) or torch.float32
+        observed_output = getattr(node.meta.get("tensor_meta") or node.meta.get("val"), "dtype", None)
+        if observed_output is None:
+            raise ValueError("dequantize output dtype is unobserved")
+        if declared_output != observed_output:
+            raise ValueError(f"dequantize output dtype mismatch: declared {declared_output}, observed {observed_output}")
+        if observed_output != torch.float32:
+            raise _IncompatibleDequantPrecision(declared_output, observed_output)
         if per_channel:
             _, scale, zero_point, axis, qmin, qmax, dtype = node.args[:7]
         else:
@@ -158,6 +175,8 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
         if node.target in unsupported_contractions:
             if quantized:
                 quantized_by_kind["unsupported"]["seen"] += 1
+                precision_decisions.append({"kind": "unsupported", "node": node.name,
+                                            "decision": "unresolved", "reason": "no verified integer rewrite"})
                 refusals.append({
                     "kind": str(node.target), "node": node.name,
                     "reason": "PT2E Q/DQ contraction has no verified integer rewrite",
@@ -170,6 +189,8 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
             # not belong to the integer coverage claim.
             continue
         quantized_by_kind[kind]["seen"] += 1
+        decision = {"kind": kind, "node": node.name, "decision": "unresolved"}
+        precision_decisions.append(decision)
         try:
             if len(node.args) < 2:
                 raise ValueError(f"{kind} has fewer than two operands")
@@ -235,6 +256,11 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
             counts["max_reduction_k"] = max(counts["max_reduction_k"], reduction)
         except ValueError as exc:
             refusals.append({"kind": kind, "node": node.name, "reason": str(exc)})
+            if isinstance(exc, _IncompatibleDequantPrecision):
+                decision.update(decision="preserve_float_qdq", source_dtype=exc.source_dtype,
+                                required_numeric_semantics="dequantize-before-floating-contraction")
+            else:
+                decision["reason"] = str(exc)
             continue
 
         preceding = set(graph.nodes)
@@ -344,6 +370,8 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
         counts[f"{kind}_integerized"] += 1
         counts["quantized_contractions_integerized"] += 1
         quantized_by_kind[kind]["integerized"] += 1
+        decision.update(decision="integerized_i32", source_dtype="torch.float32",
+                        required_numeric_semantics="integer-accumulate-then-scale")
         qparam_receipts.append({"kind": kind, "activation": activation_qparams,
                                "weight": weight_qparams, "reduction_k": reduction,
                                "accumulator_dtype": "torch.int32", "output_dtype": "torch.float32"})
@@ -357,6 +385,8 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
     )
     for row in quantized_by_kind.values():
         row["remaining"] = row["seen"] - row["integerized"]
+    decision_counts = {label: sum(row["decision"] == label for row in precision_decisions)
+                       for label in ("integerized_i32", "preserve_float_qdq", "unresolved")}
     return model, {
         "schema": "m2m.pt2e-integerize.v1",
         **counts,
@@ -368,4 +398,9 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
         "accumulator_bound_checked": True,
         "qparams": qparam_receipts,
         "refusals": refusals,
+        # Numeric decisions over every PT2E-selected contraction. A target must
+        # separately admit each lane and implement any host/device partition;
+        # this frontend receipt is never a device-placement certificate.
+        "precision_decisions": precision_decisions,
+        "precision_decision_counts": decision_counts,
     }

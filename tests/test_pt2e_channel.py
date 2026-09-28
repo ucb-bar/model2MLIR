@@ -60,6 +60,49 @@ def test_frozen_output_channel_linear_conv_and_batched_matmul_capture():
         assert 'prov.aten = "aten._int_mm.default"' in result.mlir_text
 
 
+def test_integer_reference_preserves_float_attention_after_integer_linears():
+    """An attention matmul over linear results is not itself a PT2E Q/DQ contraction."""
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+
+    class Attention(nn.Module):
+        def __init__(self, style):
+            super().__init__()
+            self.style = style
+            self.register_buffer("query_weight", torch.arange(64).remainder(13).sub(6).reshape(8, 8).to(torch.int8))
+            self.register_buffer("key_weight", torch.arange(64).remainder(11).sub(5).reshape(8, 8).to(torch.int8))
+
+        def dequantize(self, value):
+            return torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                value, 0.125, 0, -128, 127, torch.int8)
+
+        def forward(self, x, context):
+            query = torch.ops.aten.linear.default(
+                self.dequantize(torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                    x, 0.125, 0, -128, 127, torch.int8)),
+                self.dequantize(self.query_weight), None)
+            key = torch.ops.aten.linear.default(
+                self.dequantize(torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                    context, 0.125, 0, -128, 127, torch.int8)),
+                self.dequantize(self.key_weight), None)
+            if self.style == "causal_decoder":
+                query = query.reshape(1, 2, 2, 4).transpose(1, 2)
+                key = key.reshape(1, 2, 2, 4).transpose(1, 2)
+            return query @ key.transpose(-2, -1)
+
+    for style, context_length in (("causal_decoder", 2), ("multimodal_policy", 3)):
+        inputs = (torch.arange(16, dtype=torch.float32).reshape(1, 2, 8) / 8,
+                  torch.arange(context_length * 8, dtype=torch.float32).reshape(1, context_length, 8) / 8)
+        model = torch.export.export(Attention(style).eval(), inputs).module()
+        portable = model(*inputs)
+        reference = run_pt2e_integer_reference(model, inputs, expected_contractions=2)
+        rewritten, receipt = integerize_pt2e(model, inputs)
+        assert receipt["linear_integerized"] == 2
+        assert receipt["matmul_integerized"] == 0
+        assert reference.linear_count == 2 and reference.matmul_count == 0
+        torch.testing.assert_close(reference.output, rewritten(*inputs), atol=0, rtol=0)
+        torch.testing.assert_close(reference.output, portable, atol=1e-5, rtol=1e-5)
+
+
 def test_channel_reduction_axes_and_nonzero_zero_points_remain_diagnostic():
     for kind, axis, zp in (("linear", 1, 0), ("conv2d", 1, 0), ("matmul", 1, 0), ("linear", 0, 3)):
         inputs = _inputs(kind)
@@ -134,3 +177,86 @@ def test_dynamic_or_nonfinite_channel_scales_cannot_qualify():
         _, receipt = integerize_pt2e(model, _inputs("linear"))
         assert receipt["quantized_contractions_remaining"] == 1
         assert "finite positive" in receipt["refusals"][0]["reason"]
+
+
+def test_bf16_dequant_linear_requires_a_distinct_precision_contract():
+    """BF16 Q/DQ rounds each operand before the contraction, unlike W8A8/i32."""
+    class Bf16QDQLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.tensor([[120, -110, 61, 90]], dtype=torch.int8))
+
+        def forward(self, qx):
+            dx = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                qx, 0.0137, 0, -128, 127, torch.int8, out_dtype=torch.bfloat16)
+            dw = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.weight, 0.0193, 0, -127, 127, torch.int8, out_dtype=torch.bfloat16)
+            return torch.ops.aten.linear.default(dx, dw)
+
+    qx = torch.tensor([[123, 117, -90, 31]], dtype=torch.int8)
+    exported = torch.export.export(Bf16QDQLinear(), (qx,)).module()
+    portable = exported(qx)
+    integer_result = ((qx.int() @ exported.weight.int().T).float() * 0.0137 * 0.0193).to(torch.bfloat16)
+    assert abs(float(portable.item()) - float(integer_result.item())) > 0.005
+
+    rewritten, receipt = integerize_pt2e(exported, (qx,))
+    assert receipt["quantized_contractions_seen"] == receipt["quantized_contractions_remaining"] == 1
+    assert receipt["linear_integerized"] == receipt["integer_mm_emitted"] == 0
+    assert receipt["remaining_dequant_count"] == 2
+    assert len(receipt["refusals"]) == 1
+    assert "torch.bfloat16" in receipt["refusals"][0]["reason"]
+    assert receipt["precision_decision_counts"] == {"integerized_i32": 0, "preserve_float_qdq": 1, "unresolved": 0}
+    torch.testing.assert_close(rewritten(qx), portable, atol=0, rtol=0)
+    from torch.ao.quantization import allow_exported_model_train_eval
+
+    allow_exported_model_train_eval(rewritten)
+    lowered = m2m.convert(rewritten, (qx,), backend="fx_importer")
+    assert lowered.ok and opaque_report(lowered.mlir_text) == {}
+    assert "quant_ext.dequantize_per_tensor" in lowered.mlir_text
+    assert "tensor<1x4xbf16>" in lowered.mlir_text
+    assert 'prov.aten = "aten._int_mm.default"' not in lowered.mlir_text
+
+
+def test_mixed_qdq_precision_records_integer_and_float_lanes():
+    """One supported integer rewrite must not relabel a neighbouring BF16 Q/DQ site."""
+    class MixedQDQ(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("integer_weight", torch.tensor([[2, 3, -4, 5]], dtype=torch.int8))
+            self.register_buffer("bf16_weight", torch.tensor([[120, -110, 61, 90]], dtype=torch.int8))
+
+        def forward(self, qx):
+            dx_f32 = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                qx, 0.125, 0, -128, 127, torch.int8)
+            dw_f32 = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.integer_weight, 0.0625, 0, -127, 127, torch.int8)
+            dx_bf16 = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                qx, 0.0137, 0, -128, 127, torch.int8, out_dtype=torch.bfloat16)
+            dw_bf16 = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.bf16_weight, 0.0193, 0, -127, 127, torch.int8, out_dtype=torch.bfloat16)
+            return torch.ops.aten.linear.default(dx_f32, dw_f32), torch.ops.aten.linear.default(dx_bf16, dw_bf16)
+
+    qx = torch.tensor([[123, 117, -90, 31]], dtype=torch.int8)
+    exported = torch.export.export(MixedQDQ(), (qx,)).module()
+    portable = exported(qx)
+    rewritten, receipt = integerize_pt2e(exported, (qx,))
+    assert receipt["quantized_contractions_seen"] == 2
+    assert receipt["quantized_contractions_integerized"] == 1
+    assert receipt["quantized_contractions_remaining"] == 1
+    assert receipt["precision_decision_counts"] == {"integerized_i32": 1, "preserve_float_qdq": 1, "unresolved": 0}
+    sites = receipt["precision_decisions"]
+    assert len(sites) == receipt["quantized_contractions_seen"]
+    assert {row["decision"] for row in sites} == {"integerized_i32", "preserve_float_qdq"}
+    assert next(row for row in sites if row["decision"] == "preserve_float_qdq")["source_dtype"] == "torch.bfloat16"
+    actual = rewritten(qx)
+    torch.testing.assert_close(actual[0], portable[0], atol=0, rtol=0)
+    torch.testing.assert_close(actual[1], portable[1], atol=0, rtol=0)
+
+    from torch.ao.quantization import allow_exported_model_train_eval
+
+    allow_exported_model_train_eval(rewritten)
+    lowered = m2m.convert(rewritten, (qx,), backend="fx_importer")
+    assert lowered.ok and opaque_report(lowered.mlir_text) == {}
+    assert lowered.mlir_text.count('prov.aten = "aten._int_mm.default"') >= 1
+    assert "quant_ext.dequantize_per_tensor" in lowered.mlir_text
+    assert "tensor<1x4xbf16>" in lowered.mlir_text
