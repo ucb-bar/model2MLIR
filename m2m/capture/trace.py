@@ -509,9 +509,12 @@ def _unused_tuple_selection(source: dict[str, Any], node: dict[str, Any]) -> dic
             "proof": {"tuple_node_id": producer["id"], "result_index": index}}
 
 
-_GUARD_TARGETS = {
+_ANCHORED_TARGETS = {
     "aten.sym_size.int", "aten.sym_constrain_range_for_size.default",
     "<built-in function ge>", "<built-in function le>", "aten._assert_scalar.default",
+    "aten._assert_tensor_metadata.default", "aten.unsqueeze.default", "aten.expand.default",
+    "aten.to.dtype", "aten.to.dtype_layout", "aten.matmul.default", "aten.transpose.int",
+    "aten.cat.default", "aten.cos.default", "aten.sin.default", "aten.mul.Tensor",
 }
 
 # Exact ATen forward-value operations whose outputs can be discarded without
@@ -545,9 +548,134 @@ def _dead_forward_value_relations(source: dict[str, Any], consumed: set[str]) ->
             for node in source["nodes"] if node["id"] in dead]
 
 
+def _inlined_parameter_relations(source: dict[str, Any], dest: dict[str, Any],
+                                 relations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bind a uniquely invoked grad-disabled body's inputs to its caller values."""
+    src_nodes = {node["id"]: node for node in source["nodes"]}
+    dst_nodes = {node["id"]: node for node in dest["nodes"]}
+    mapped: dict[str, set[str]] = {}
+    for row in relations:
+        for identity in row["source_ids"]:
+            mapped.setdefault(identity, set()).update(row["destination_ids"])
+
+    def specs(node: dict[str, Any]) -> list[dict[str, Any]]:
+        return [{key: value for key, value in result.items() if key != "id"}
+                for result in node.get("results") or []]
+
+    result = []
+    scopes = {node["graph_id"].split(":", 2)[-1] for node in source["nodes"]
+              if isinstance(node.get("graph_id"), str)
+              and node["graph_id"] != f"g:{source['stage']}:root"}
+    for scope in sorted(scopes):
+        attrs = [node for node in source["nodes"] if node.get("op") == "get_attr"
+                 and node.get("graph_id") == f"g:{source['stage']}:root" and node.get("target") == scope]
+        if len(attrs) != 1:
+            continue
+        wrappers = [node for node in source["nodes"] if node.get("target") == "wrap_with_set_grad_enabled"
+                    and node.get("graph_id") == f"g:{source['stage']}:root"
+                    and isinstance(node.get("args"), list) and len(node["args"]) >= 2
+                    and node["args"][0] is False
+                    and isinstance(node["args"][1], dict)
+                    and node["args"][1].get("node_id") == attrs[0]["id"]]
+        if len(wrappers) != 1:
+            continue
+        placeholders = [node for node in source["nodes"] if node.get("op") == "placeholder"
+                        and node.get("graph_id") == f"g:{source['stage']}:{scope}"]
+        arguments = wrappers[0]["args"][2:]
+        if len(placeholders) != len(arguments):
+            continue
+        bindings = []
+        for placeholder, argument in zip(placeholders, arguments, strict=True):
+            if not isinstance(argument, dict):
+                break
+            parent = src_nodes.get(argument.get("node_id"))
+            selected = next((index for index, value in enumerate(parent.get("results") or [])
+                             if value.get("id") == argument.get("value_id")), None) if parent else None
+            if selected is None or specs(placeholder) != [specs(parent)[selected]]:
+                break
+            candidates = [dst_nodes[identity] for identity in mapped.get(parent["id"], set())
+                          if identity in dst_nodes and len(specs(dst_nodes[identity])) > selected
+                          and specs(dst_nodes[identity])[selected] == specs(parent)[selected]]
+            if len(candidates) != 1:
+                break
+            bindings.append({"source_ids": [placeholder["id"]], "destination_ids": [candidates[0]["id"]],
+                             "kind": "inlined_parameter_binding",
+                             "proof": {"wrapper_node_id": wrappers[0]["id"],
+                                       "submodule": scope, "argument_result_index": selected}})
+        if len(bindings) == len(placeholders):
+            result.extend(bindings)
+    return result
+
+
+def _no_op_dtype_aliases(source: dict[str, Any], dest: dict[str, Any],
+                         relations: list[dict[str, Any]], consumed: set[str]) -> list[dict[str, Any]]:
+    """Map a no-copy, same-dtype ``aten.to`` to its already mapped input value."""
+    src_nodes = {node["id"]: node for node in source["nodes"]}
+    dst_nodes = {node["id"]: node for node in dest["nodes"]}
+    mapped: dict[str, set[str]] = {}
+    for row in relations:
+        for identity in row["source_ids"]:
+            mapped.setdefault(identity, set()).update(row["destination_ids"])
+
+    def specs(node: dict[str, Any]) -> list[dict[str, Any]]:
+        return [{key: value for key, value in result.items() if key != "id"}
+                for result in node.get("results") or []]
+
+    aliases = []
+    for node in source["nodes"]:
+        args, kwargs = node.get("args"), node.get("kwargs") or {}
+        target = node.get("target")
+        if (node["id"] in consumed or target not in {"aten.to.dtype", "aten.to.dtype_layout"}
+                or not isinstance(args, list) or not args or not isinstance(args[0], dict)):
+            continue
+        producer = src_nodes.get(args[0].get("node_id"))
+        if producer is None or len(producer.get("results") or []) != 1 or len(node.get("results") or []) != 1:
+            continue
+        original = producer["results"][0]
+        if (args[0].get("value_id") != original.get("id")
+                or original.get("kind") != "tensor" or specs(node) != specs(producer)):
+            continue
+        if target == "aten.to.dtype":
+            if (len(args) != 2 or args[1] != {"kind": "dtype", "value": f"torch.{original.get('dtype')}"}
+                    or set(kwargs) - {"non_blocking", "copy", "memory_format"}
+                    or kwargs.get("non_blocking", False) is not False
+                    or kwargs.get("copy", False) is not False
+                    or kwargs.get("memory_format") is not None):
+                continue
+        elif (len(args) != 1
+              or set(kwargs) - {"dtype", "layout", "device", "pin_memory",
+                                "non_blocking", "copy", "memory_format"}
+              or kwargs.get("dtype") != {"kind": "dtype", "value": f"torch.{original.get('dtype')}"}
+              or kwargs.get("layout") not in (None, {"kind": "layout", "value": original.get("layout")})
+              or kwargs.get("device") not in (None, {"kind": "device", "value": original.get("device")})
+              or kwargs.get("pin_memory") is not None
+              or kwargs.get("non_blocking", False) is not False
+              or kwargs.get("copy", False) is not False
+              or kwargs.get("memory_format") is not None):
+            continue
+        candidates = [dst_nodes[identity] for identity in mapped.get(producer["id"], set())
+                      if identity in dst_nodes and specs(dst_nodes[identity]) == specs(producer)]
+        if len(candidates) == 1 and all(
+            edge.get("producer_value_id") == candidates[0]["results"][0]["id"]
+            and edge.get("dtype") == original.get("dtype")
+            and edge.get("shape") == original.get("shape")
+            for edge in dest.get("edges") or [] if edge.get("producer_node_id") == candidates[0]["id"]
+        ) and all(
+            edge.get("producer_value_id") == node["results"][0]["id"]
+            and edge.get("dtype") == original.get("dtype")
+            and edge.get("shape") == original.get("shape")
+            for edge in source.get("edges") or [] if edge.get("producer_node_id") == node["id"]
+        ):
+            aliases.append({"source_ids": [node["id"]], "destination_ids": [candidates[0]["id"]],
+                            "kind": "value_alias",
+                            "proof": {"no_copy_same_dtype": True, "input_node_id": producer["id"],
+                                      "exact_typed_value": True}})
+    return aliases
+
+
 def _anchored_guard_relations(source: dict[str, Any], dest: dict[str, Any],
                               relations: list[dict[str, Any]], consumed: set[str]) -> list[dict[str, Any]]:
-    """Match identical guard calls through uniquely mapped typed input values.
+    """Match identical calls through uniquely mapped typed input values.
 
     Decomposition can retain a guard unchanged while dropping its FX lineage.
     Names, ordinals, operator spelling and output type alone are never enough:
@@ -584,6 +712,18 @@ def _anchored_guard_relations(source: dict[str, Any], dest: dict[str, Any],
         return [{key: value for key, value in result.items() if key != "id"}
                 for result in node.get("results") or []]
 
+    def call_arguments(node: dict[str, Any]) -> tuple[Any, Any] | None:
+        args, kwargs = node.get("args"), node.get("kwargs") or {}
+        if node["target"] != "aten._assert_tensor_metadata.default":
+            return args, kwargs
+        fields = ("a", "size", "stride", "dtype", "device", "layout")
+        if (not isinstance(args, list) or len(args) > len(fields)
+                or not isinstance(kwargs, dict) or set(kwargs) - set(fields)
+                or any(field in kwargs for field in fields[:len(args)])):
+            return None
+        return [args[index] if index < len(args) else kwargs.get(field)
+                for index, field in enumerate(fields)], {}
+
     while True:
         mapped: dict[str, set[str]] = {}
         for row in [*relations, *inferred]:
@@ -591,7 +731,7 @@ def _anchored_guard_relations(source: dict[str, Any], dest: dict[str, Any],
                 mapped.setdefault(origin, set()).update(row["destination_ids"])
         candidates = []
         for node in source["nodes"]:
-            if node["id"] in consumed or node["target"] not in _GUARD_TARGETS:
+            if node["id"] in consumed or node["target"] not in _ANCHORED_TARGETS:
                 continue
             matches = []
             for other in dest["nodes"]:
@@ -599,7 +739,11 @@ def _anchored_guard_relations(source: dict[str, Any], dest: dict[str, Any],
                         or node["op"] != other["op"] or node["target"] != other["target"]
                         or specs(node) != specs(other)):
                     continue
-                left_args, right_args = node.get("args"), other.get("args")
+                left_call, right_call = call_arguments(node), call_arguments(other)
+                if left_call is None or right_call is None:
+                    continue
+                left_args, left_kwargs = left_call
+                right_args, right_kwargs = right_call
                 if node["target"] == "aten._assert_scalar.default":
                     if (not isinstance(left_args, list) or not isinstance(right_args, list)
                             or len(left_args) != 2 or len(right_args) != 2
@@ -610,7 +754,7 @@ def _anchored_guard_relations(source: dict[str, Any], dest: dict[str, Any],
                     # are the functional guard contract.
                     left_args, right_args = left_args[:1], right_args[:1]
                 args_ok, anchors = same_args(left_args, right_args, mapped)
-                kwargs_ok, kw_anchors = same_args(node.get("kwargs"), other.get("kwargs"), mapped)
+                kwargs_ok, kw_anchors = same_args(left_kwargs, right_kwargs, mapped)
                 if args_ok and kwargs_ok and anchors + kw_anchors > 0:
                     matches.append(other)
             if len(matches) == 1:
@@ -624,7 +768,7 @@ def _anchored_guard_relations(source: dict[str, Any], dest: dict[str, Any],
             break
         for node, other in accepted:
             inferred.append({"source_ids": [node["id"]], "destination_ids": [other["id"]],
-                             "kind": "structural_guard_equivalence",
+                             "kind": "structural_call_equivalence",
                              "proof": {"exact_typed_anchored_arguments": True,
                                        "unique_destination_call": True,
                                        "diagnostic_text_equated": node["target"] !=
@@ -659,10 +803,18 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
             if proved is not None:
                 consumed.add(node["id"])
                 relations.append(proved)
-    inferred = _anchored_guard_relations(source, dest, relations, consumed)
-    relations.extend(inferred)
-    unknown = [identity for identity in unknown if identity not in {
-        target for relation in inferred for target in relation["destination_ids"]}]
+    bindings = _inlined_parameter_relations(source, dest, relations)
+    relations.extend(bindings)
+    while True:
+        inferred = _anchored_guard_relations(source, dest, relations, consumed)
+        aliases = _no_op_dtype_aliases(source, dest, [*relations, *inferred], consumed)
+        new = [*inferred, *aliases]
+        if not new:
+            break
+        relations.extend(new)
+        consumed.update(identity for relation in new for identity in relation["source_ids"])
+        unknown = [identity for identity in unknown if identity not in {
+            target for relation in new for target in relation["destination_ids"]}]
     dead = _dead_forward_value_relations(source, consumed)
     relations.extend(dead)
     consumed.update(origin for relation in dead for origin in relation["source_ids"])
