@@ -5,7 +5,7 @@ import json
 import torch
 
 import m2m
-from m2m.capture.trace import finalize_trace
+from m2m.capture.trace import finalize_trace, graph_relation
 from m2m.capture.torchao_pipeline import QuantizationConfig
 
 
@@ -166,3 +166,60 @@ def test_traced_failed_capture_is_not_recaptured(monkeypatch):
     assert not result.ok
     assert result.capture_trace["status"] == "diagnostic"
     assert len(attempts) == 1
+
+
+def test_identity_dtype_cast_requires_exact_typed_bypass():
+    class IdentityCast(torch.nn.Module):
+        def forward(self, x):
+            return x.to(torch.float32) + 1
+
+    trace = _check_trace(m2m.convert(
+        IdentityCast(), (torch.ones(2, 3),), backend="fx_importer", capture_trace=True))
+    source, dest = trace["graphs"]["quantized"], trace["graphs"]["prepared"]
+    cast = next(n for n in source["nodes"] if n["target"] == "aten.to.dtype")
+    relation = graph_relation(source, dest)
+    assert cast["id"] not in relation["unresolved_source_ids"]
+    assert any(r["kind"] == "eliminated" and r["source_ids"] == [cast["id"]]
+               and r["proof"]["typed_bypass_edges"] for r in relation["relations"])
+
+    import copy
+    unproven = copy.deepcopy(dest)
+    add = next(n["id"] for n in dest["nodes"] if n["target"] == "aten.add.Tensor")
+    edge = next(e for e in unproven["edges"] if e["consumer_node_id"] == add
+                and e["argument_path"] == "args/0")
+    edge["dtype"] = "float16"
+    assert cast["id"] in graph_relation(source, unproven)["unresolved_source_ids"]
+
+    requested_copy = copy.deepcopy(source)
+    next(n for n in requested_copy["nodes"] if n["id"] == cast["id"])["kwargs"]["copy"] = True
+    assert cast["id"] in graph_relation(requested_copy, dest)["unresolved_source_ids"]
+
+    dtype_layout = copy.deepcopy(source)
+    changed_cast = next(n for n in dtype_layout["nodes"] if n["id"] == cast["id"])
+    changed_cast["target"] = "aten.to.dtype_layout"
+    changed_cast["args"] = changed_cast["args"][:1]
+    changed_cast["kwargs"] = {
+        "dtype": {"kind": "dtype", "value": "torch.float32"},
+        "device": {"kind": "device", "value": "cpu"},
+        "layout": {"kind": "layout", "value": "torch.strided"},
+    }
+    assert cast["id"] not in graph_relation(dtype_layout, dest)["unresolved_source_ids"]
+
+    device = copy.deepcopy(source)
+    changed_cast = next(n for n in device["nodes"] if n["id"] == cast["id"])
+    changed_cast["target"] = "aten.to.device"
+    changed_cast["args"] = [changed_cast["args"][0],
+                            {"kind": "device", "value": "cpu"},
+                            {"kind": "dtype", "value": "torch.float32"}]
+    assert cast["id"] not in graph_relation(device, dest)["unresolved_source_ids"]
+
+    class RealCast(torch.nn.Module):
+        def forward(self, x):
+            return x.to(torch.float16) + 1
+
+    changed = m2m.convert(RealCast(), (torch.ones(2, 3),),
+                          backend="fx_importer", capture_trace=True).capture_trace
+    source_cast = next(n for n in changed["graphs"]["quantized"]["nodes"]
+                       if n["target"] == "aten.to.dtype")
+    assert not any(r["kind"] == "eliminated" and source_cast["id"] in r["source_ids"]
+                   for r in changed["transformations"][1]["relations"])

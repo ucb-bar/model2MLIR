@@ -360,6 +360,110 @@ def tuple_selection_trace_program(exported: Any) -> Any:
     return detached
 
 
+def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
+                                node: dict[str, Any]) -> dict[str, Any] | None:
+    """Prove a vanished type/device/layout-preserving conversion at each use.
+
+    PyTorch export can remove ``aten.to`` before a registered decomposition
+    observes it. Matching operation names or output dtypes alone is insufficient:
+    the destination graph must route the cast's original producer to every
+    corresponding consumer at the same typed argument path. Any missing lineage,
+    changed dtype/shape, requested copy, or layout request leaves it unresolved.
+    """
+    target = node.get("target")
+    if node.get("op") != "call_function" or target not in {
+            "aten.to.dtype", "aten.to.dtype_layout", "aten.to.device"}:
+        return None
+    args, kwargs = node.get("args"), node.get("kwargs") or {}
+    if not isinstance(args, list) or not args or not isinstance(kwargs, dict):
+        return None
+    input_ref = args[0]
+    if not isinstance(input_ref, dict) or not isinstance(input_ref.get("node_id"), str):
+        return None
+    sources = {item["id"]: item for item in source["nodes"]}
+    producer = sources.get(input_ref["node_id"])
+    outputs = node.get("results") or []
+    inputs = producer.get("results") or [] if producer is not None else []
+    if len(outputs) != 1 or len(inputs) != 1 or input_ref.get("value_id") != inputs[0].get("id"):
+        return None
+    output, original = outputs[0], inputs[0]
+
+    def same_spec(raw: Any, kind: str, expected: str) -> bool:
+        return raw is None or (isinstance(raw, dict)
+                               and raw.get("kind") == kind and raw.get("value") == expected)
+
+    if target == "aten.to.dtype":
+        if (len(args) < 2 or len(args) > 5
+                or set(kwargs) - {"non_blocking", "copy", "memory_format"}
+                or args[1] is None
+                or not same_spec(args[1], "dtype", f"torch.{original.get('dtype')}")
+                or (args[2] if len(args) > 2 else kwargs.get("non_blocking", False)) is not False
+                or (args[3] if len(args) > 3 else kwargs.get("copy", False)) is not False
+                or (args[4] if len(args) > 4 else kwargs.get("memory_format")) is not None):
+            return None
+    elif target == "aten.to.dtype_layout":
+        if (len(args) != 1
+                or set(kwargs) - {"dtype", "layout", "device", "pin_memory",
+                                  "non_blocking", "copy", "memory_format"}
+                or not same_spec(kwargs.get("dtype"), "dtype", f"torch.{original.get('dtype')}")
+                or not same_spec(kwargs.get("layout"), "layout", original.get("layout"))
+                or not same_spec(kwargs.get("device"), "device", original.get("device"))
+                or kwargs.get("pin_memory") is not None
+                or kwargs.get("non_blocking", False) is not False
+                or kwargs.get("copy", False) is not False
+                or kwargs.get("memory_format") is not None):
+            return None
+    else:
+        if (len(args) < 3 or len(args) > 6
+                or set(kwargs) - {"non_blocking", "copy", "memory_format"}
+                or args[1] is None or args[2] is None
+                or not same_spec(args[1], "device", original.get("device"))
+                or not same_spec(args[2], "dtype", f"torch.{original.get('dtype')}")
+                or (args[3] if len(args) > 3 else kwargs.get("non_blocking", False)) is not False
+                or (args[4] if len(args) > 4 else kwargs.get("copy", False)) is not False
+                or (args[5] if len(args) > 5 else kwargs.get("memory_format")) is not None):
+            return None
+    if original.get("kind") != "tensor" or original.get("dtype") is None:
+        return None
+    if any(output.get(field) != original.get(field) for field in
+           ("kind", "dtype", "storage_dtype", "compute_dtype", "shape",
+            "device", "layout", "stride")):
+        return None
+    descendants: dict[str, set[str]] = {}
+    for item in dest["nodes"]:
+        for ancestor in item.get("origin_node_ids") or ():
+            descendants.setdefault(ancestor, set()).add(item["id"])
+    corresponding_producers = descendants.get(producer["id"], set())
+    if not corresponding_producers:
+        return None
+    dest_edges = dest.get("edges") or []
+    uses = [edge for edge in source.get("edges") or []
+            if edge.get("producer_node_id") == node["id"]]
+    if not uses or any(edge.get("producer_value_id") != output.get("id") for edge in uses):
+        return None
+    matched = []
+    for use in uses:
+        consumers = descendants.get(use.get("consumer_node_id"), set())
+        # A fanout of transformed consumer nodes needs its own SSA-value
+        # correspondence proof. A single mapped consumer is the only case in
+        # which this exact argument edge identifies the original use.
+        if len(consumers) != 1:
+            return None
+        matching_edges = [edge for edge in dest_edges
+                          if edge.get("consumer_node_id") in consumers
+                          and edge.get("argument_path") == use.get("argument_path")]
+        if (len(matching_edges) != 1
+                or matching_edges[0].get("producer_node_id") not in corresponding_producers
+                or matching_edges[0].get("dtype") != use.get("dtype")
+                or matching_edges[0].get("shape") != use.get("shape")):
+            return None
+        matched.extend((edge["producer_node_id"], edge["consumer_node_id"],
+                        edge["argument_path"]) for edge in matching_edges)
+    return {"source_ids": [node["id"]], "destination_ids": [], "kind": "eliminated",
+            "reason": "type/device/layout-preserving aten.to with exact typed consumer-edge bypass",
+            "proof": {"input_node_id": producer["id"], "typed_bypass_edges": sorted(set(matched))}}
+
+
 def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -> dict[str, Any]:
     if not source or not dest or source.get("status") != "complete" or dest.get("status") != "complete":
         return {"from_stage": (source or {}).get("stage"), "to_stage": (dest or {}).get("stage"),
@@ -379,6 +483,12 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
         if origins:
             consumed.update(origins)
             relations.append({**elimination, "source_ids": origins, "destination_ids": []})
+    for node in source["nodes"]:
+        if node["id"] not in consumed:
+            proved = _identity_conversion_bypass(source, dest, node)
+            if proved is not None:
+                consumed.add(node["id"])
+                relations.append(proved)
     fanout = Counter(s for rel in relations for s in rel["source_ids"] if rel["destination_ids"])
     for rel in relations:
         if rel["kind"] == "transformation":
