@@ -509,6 +509,130 @@ def _unused_tuple_selection(source: dict[str, Any], node: dict[str, Any]) -> dic
             "proof": {"tuple_node_id": producer["id"], "result_index": index}}
 
 
+_GUARD_TARGETS = {
+    "aten.sym_size.int", "aten.sym_constrain_range_for_size.default",
+    "<built-in function ge>", "<built-in function le>", "aten._assert_scalar.default",
+}
+
+# Exact ATen forward-value operations whose outputs can be discarded without
+# changing any observable tensor result. Do not infer purity from an absent
+# mutation marker: random and externally observable calls need separate proof.
+_DEAD_VALUE_TARGETS = {
+    "aten.arange.default", "aten.unsqueeze.default", "aten.to.dtype", "aten.mul.Tensor",
+}
+
+
+def _dead_forward_value_relations(source: dict[str, Any], consumed: set[str]) -> list[dict[str, Any]]:
+    users: dict[str, set[str]] = {}
+    for edge in source.get("edges") or []:
+        users.setdefault(edge["producer_node_id"], set()).add(edge["consumer_node_id"])
+    dead: set[str] = set()
+    while True:
+        newly_dead = {
+            node["id"] for node in source["nodes"]
+            if node["id"] not in consumed and node["id"] not in dead
+            and node.get("op") == "call_function" and node.get("target") in _DEAD_VALUE_TARGETS
+            and users.get(node["id"], set()) <= dead
+        }
+        if not newly_dead:
+            break
+        dead.update(newly_dead)
+    return [{"source_ids": [node["id"]], "destination_ids": [], "kind": "eliminated",
+             "reason": "dead forward tensor value from an explicitly pure ATen operation",
+             "proof": {"operator": node["target"],
+                       "source_users": sorted(users.get(node["id"], set())),
+                       "all_users_dead": True}}
+            for node in source["nodes"] if node["id"] in dead]
+
+
+def _anchored_guard_relations(source: dict[str, Any], dest: dict[str, Any],
+                              relations: list[dict[str, Any]], consumed: set[str]) -> list[dict[str, Any]]:
+    """Match identical guard calls through uniquely mapped typed input values.
+
+    Decomposition can retain a guard unchanged while dropping its FX lineage.
+    Names, ordinals, operator spelling and output type alone are never enough:
+    every referenced argument must already be mapped to the exact corresponding
+    producer result, and there must be exactly one matching destination call.
+    """
+    src_nodes = {node["id"]: node for node in source["nodes"]}
+    dst_nodes = {node["id"]: node for node in dest["nodes"]}
+    inferred = []
+
+    def value_index(nodes: dict[str, Any], ref: dict[str, Any]) -> int | None:
+        owner = nodes.get(ref.get("node_id"))
+        return next((index for index, value in enumerate(owner.get("results") or [])
+                     if value.get("id") == ref.get("value_id")), None) if owner else None
+
+    def same_args(left: Any, right: Any, mapped: dict[str, set[str]]) -> tuple[bool, int]:
+        if isinstance(left, dict) and "node_id" in left:
+            if not isinstance(right, dict) or "node_id" not in right:
+                return False, 0
+            origin, target = left["node_id"], right["node_id"]
+            src_index, dst_index = value_index(src_nodes, left), value_index(dst_nodes, right)
+            return (target in mapped.get(origin, set()) and src_index is not None
+                    and src_index == dst_index
+                    and specs(src_nodes[origin])[src_index] == specs(dst_nodes[target])[dst_index]), 1
+        if isinstance(left, list) and isinstance(right, list) and len(left) == len(right):
+            checked = [same_args(a, b, mapped) for a, b in zip(left, right, strict=True)]
+            return all(ok for ok, _ in checked), sum(count for _, count in checked)
+        if isinstance(left, dict) and isinstance(right, dict) and left.keys() == right.keys():
+            checked = [same_args(left[key], right[key], mapped) for key in left]
+            return all(ok for ok, _ in checked), sum(count for _, count in checked)
+        return left == right, 0
+
+    def specs(node: dict[str, Any]) -> list[dict[str, Any]]:
+        return [{key: value for key, value in result.items() if key != "id"}
+                for result in node.get("results") or []]
+
+    while True:
+        mapped: dict[str, set[str]] = {}
+        for row in [*relations, *inferred]:
+            for origin in row["source_ids"]:
+                mapped.setdefault(origin, set()).update(row["destination_ids"])
+        candidates = []
+        for node in source["nodes"]:
+            if node["id"] in consumed or node["target"] not in _GUARD_TARGETS:
+                continue
+            matches = []
+            for other in dest["nodes"]:
+                if (other["id"] in {row["destination_ids"][0] for row in inferred}
+                        or node["op"] != other["op"] or node["target"] != other["target"]
+                        or specs(node) != specs(other)):
+                    continue
+                left_args, right_args = node.get("args"), other.get("args")
+                if node["target"] == "aten._assert_scalar.default":
+                    if (not isinstance(left_args, list) or not isinstance(right_args, list)
+                            or len(left_args) != 2 or len(right_args) != 2
+                            or not isinstance(left_args[1], str) or not isinstance(right_args[1], str)):
+                        continue
+                    # Dynamo rewrites diagnostic FX node names in the text;
+                    # the predicate and runtime rejection, not that prose,
+                    # are the functional guard contract.
+                    left_args, right_args = left_args[:1], right_args[:1]
+                args_ok, anchors = same_args(left_args, right_args, mapped)
+                kwargs_ok, kw_anchors = same_args(node.get("kwargs"), other.get("kwargs"), mapped)
+                if args_ok and kwargs_ok and anchors + kw_anchors > 0:
+                    matches.append(other)
+            if len(matches) == 1:
+                candidates.append((node, matches[0]))
+        if not candidates:
+            break
+        # Two source calls competing for one destination call are ambiguous.
+        counts = Counter(other["id"] for _, other in candidates)
+        accepted = [(node, other) for node, other in candidates if counts[other["id"]] == 1]
+        if not accepted:
+            break
+        for node, other in accepted:
+            inferred.append({"source_ids": [node["id"]], "destination_ids": [other["id"]],
+                             "kind": "structural_guard_equivalence",
+                             "proof": {"exact_typed_anchored_arguments": True,
+                                       "unique_destination_call": True,
+                                       "diagnostic_text_equated": node["target"] !=
+                                       "aten._assert_scalar.default" or node["args"][1] == other["args"][1]}})
+            consumed.add(node["id"])
+    return inferred
+
+
 def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -> dict[str, Any]:
     if not source or not dest or source.get("status") != "complete" or dest.get("status") != "complete":
         return {"from_stage": (source or {}).get("stage"), "to_stage": (dest or {}).get("stage"),
@@ -535,6 +659,13 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
             if proved is not None:
                 consumed.add(node["id"])
                 relations.append(proved)
+    inferred = _anchored_guard_relations(source, dest, relations, consumed)
+    relations.extend(inferred)
+    unknown = [identity for identity in unknown if identity not in {
+        target for relation in inferred for target in relation["destination_ids"]}]
+    dead = _dead_forward_value_relations(source, consumed)
+    relations.extend(dead)
+    consumed.update(origin for relation in dead for origin in relation["source_ids"])
     fanout = Counter(s for rel in relations for s in rel["source_ids"] if rel["destination_ids"])
     for rel in relations:
         if rel["kind"] == "transformation":
