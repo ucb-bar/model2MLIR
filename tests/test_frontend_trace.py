@@ -329,6 +329,49 @@ def test_grad_disabled_inline_binding_requires_exact_caller_value():
     assert nested["id"] in graph_relation(mismatched, dest)["unresolved_source_ids"]
 
 
+def test_pt2e_unchanged_nested_graph_requires_exact_body_and_caller():
+    import copy
+
+    class Wrapped(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = torch.nn.Linear(4, 4)
+
+        def forward(self, x):
+            with torch.set_grad_enabled(False):
+                nested = torch.cos(x.unsqueeze(0))
+            return self.fc(nested)
+
+    result = m2m.convert(
+        Wrapped().eval(), (torch.randn(4),), backend="fx_importer", capture_trace=True,
+        quantization=QuantizationConfig(scheme="int8_static_act_int8_weight"),
+    )
+    assert result.ok, result.diagnostics
+    source, dest = (result.capture_trace["graphs"][name] for name in ("original", "quantized"))
+    nested = next(node for node in source["nodes"]
+                  if node["target"] == "aten.cos.default" and node["graph_id"] != "g:original:root")
+    relation = graph_relation(source, dest)
+    assert nested["id"] not in relation["unresolved_source_ids"]
+    assert any(row["kind"] == "nested_structural_identity" and nested["id"] in row["source_ids"]
+               for row in relation["relations"])
+
+    changed = copy.deepcopy(dest)
+    next(node for node in changed["nodes"] if node["target"] == "aten.cos.default"
+         and node["graph_id"] != "g:quantized:root")["target"] = "aten.sin.default"
+    assert nested["id"] in graph_relation(source, changed)["unresolved_source_ids"]
+
+    wrong_value = copy.deepcopy(dest)
+    inner = next(node for node in wrong_value["nodes"] if node["target"] == "aten.cos.default"
+                 and node["graph_id"] != "g:quantized:root")
+    inner["args"][0]["value_id"] = "not-a-result"
+    assert nested["id"] in graph_relation(source, wrong_value)["unresolved_source_ids"]
+
+    wrong_caller = copy.deepcopy(dest)
+    wrapper = next(node for node in wrong_caller["nodes"] if node["target"] == "wrap_with_set_grad_enabled")
+    wrapper["args"][2] = wrapper["args"][1]
+    assert nested["id"] in graph_relation(source, wrong_caller)["unresolved_source_ids"]
+
+
 def test_nested_matmul_decomposition_retains_the_inner_call_identity():
     class Nested(torch.nn.Module):
         def forward(self, x, y):

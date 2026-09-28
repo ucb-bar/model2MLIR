@@ -843,6 +843,166 @@ def _anchored_guard_relations(source: dict[str, Any], dest: dict[str, Any],
     return inferred
 
 
+def _unchanged_nested_graph_relations(source: dict[str, Any], dest: dict[str, Any],
+                                      relations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Recover a nested graph's identity only when its body and caller are exact.
+
+    PT2E may reconstruct a grad-disabled GraphModule without carrying inner FX
+    lineage. Matching its operator names or result types alone is insufficient:
+    the entire typed body, ordered arguments, and uniquely mapped caller values
+    must agree. A changed or ambiguously invoked body remains unresolved.
+    """
+    def specs(node: dict[str, Any]) -> list[dict[str, Any]]:
+        return [{key: value for key, value in result.items() if key != "id"}
+                for result in node.get("results") or []]
+
+    def scopes(snapshot: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        root = f"g:{snapshot['stage']}:root"
+        for node in snapshot["nodes"]:
+            graph_id = node.get("graph_id")
+            if isinstance(graph_id, str) and graph_id != root:
+                grouped.setdefault(graph_id.split(":", 2)[-1], []).append(node)
+        return grouped
+
+    def body(nodes: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+        ids = {node["id"]: index for index, node in enumerate(nodes)}
+        if len(ids) != len(nodes):
+            return None
+
+        def remap(value: Any) -> Any:
+            if isinstance(value, list):
+                return [remap(item) for item in value]
+            if isinstance(value, dict):
+                if "node_id" in value:
+                    owner = nodes[ids[value["node_id"]]]
+                    indices = [index for index, result in enumerate(owner.get("results") or [])
+                               if result.get("id") == value.get("value_id")]
+                    if len(indices) != 1:
+                        raise ValueError("unbound nested result")
+                    return {"ordinal": ids[value["node_id"]], "result_index": indices[0]}
+                return {key: remap(item) for key, item in value.items()}
+            return value
+
+        rows = []
+        try:
+            for node in nodes:
+                args, kwargs = node.get("args"), node.get("kwargs") or {}
+                if node.get("target") == "aten._assert_tensor_metadata.default":
+                    fields = ("a", "size", "stride", "dtype", "device", "layout")
+                    if (not isinstance(args, list) or len(args) > len(fields)
+                            or not isinstance(kwargs, dict) or set(kwargs) - set(fields)
+                            or any(field in kwargs for field in fields[:len(args)])):
+                        return None
+                    args = [args[index] if index < len(args) else kwargs.get(field)
+                            for index, field in enumerate(fields)]
+                    kwargs = {}
+                rows.append({"op": node.get("op"), "target": node.get("target"),
+                             "args": remap(args), "kwargs": remap(kwargs),
+                             "results": specs(node), "input_kind": node.get("input_kind"),
+                             "input_target": node.get("input_target")})
+        except (KeyError, ValueError):
+            return None
+        return rows
+
+    def caller(snapshot: dict[str, Any], scope: str) -> dict[str, Any] | None:
+        root = f"g:{snapshot['stage']}:root"
+        attrs = [node for node in snapshot["nodes"] if node.get("graph_id") == root
+                 and node.get("op") == "get_attr" and node.get("target") == scope]
+        if len(attrs) != 1:
+            return None
+        wrappers = [node for node in snapshot["nodes"] if node.get("graph_id") == root
+                    and node.get("target") == "wrap_with_set_grad_enabled"
+                    and isinstance(node.get("args"), list) and len(node["args"]) >= 2
+                    and node["args"][0] is False and isinstance(node["args"][1], dict)
+                    and node["args"][1].get("node_id") == attrs[0]["id"]]
+        if len(wrappers) != 1:
+            return None
+        attr_results = attrs[0].get("results") or []
+        if (len(attr_results) != 1
+                or wrappers[0]["args"][1].get("value_id") != attr_results[0].get("id")):
+            return None
+        return wrappers[0]
+
+    mapped: dict[str, set[str]] = {}
+    reverse: dict[str, set[str]] = {}
+    for relation in relations:
+        for source_id in relation["source_ids"]:
+            mapped.setdefault(source_id, set()).update(relation["destination_ids"])
+            for dest_id in relation["destination_ids"]:
+                reverse.setdefault(dest_id, set()).add(source_id)
+    src_nodes = {node["id"]: node for node in source["nodes"]}
+    dst_nodes = {node["id"]: node for node in dest["nodes"]}
+
+    def same_caller(source_wrapper: dict[str, Any], dest_wrapper: dict[str, Any],
+                    src_body: list[dict[str, Any]], dst_body: list[dict[str, Any]]) -> bool:
+        source_args, dest_args = source_wrapper["args"][2:], dest_wrapper["args"][2:]
+        source_inputs = [node for node in src_body if node.get("op") == "placeholder"]
+        dest_inputs = [node for node in dst_body if node.get("op") == "placeholder"]
+        if (len(source_args) != len(dest_args) or len(source_args) != len(source_inputs)
+                or len(dest_args) != len(dest_inputs)
+                or source_wrapper.get("kwargs") != dest_wrapper.get("kwargs")
+                or specs(source_wrapper) != specs(dest_wrapper)):
+            return False
+        for source_arg, dest_arg, source_input, dest_input in zip(
+                source_args, dest_args, source_inputs, dest_inputs, strict=True):
+            if not isinstance(source_arg, dict) or not isinstance(dest_arg, dict):
+                return False
+            source_parent = src_nodes.get(source_arg.get("node_id"))
+            dest_parent = dst_nodes.get(dest_arg.get("node_id"))
+            if (source_parent is None or dest_parent is None
+                    or mapped.get(source_parent["id"]) != {dest_parent["id"]}):
+                return False
+            source_index = [index for index, value in enumerate(source_parent.get("results") or [])
+                            if value.get("id") == source_arg.get("value_id")]
+            dest_index = [index for index, value in enumerate(dest_parent.get("results") or [])
+                          if value.get("id") == dest_arg.get("value_id")]
+            if (len(source_index) != 1 or source_index != dest_index
+                    or specs(source_parent)[source_index[0]] != specs(dest_parent)[dest_index[0]]
+                    or specs(source_input) != [specs(source_parent)[source_index[0]]]
+                    or specs(dest_input) != [specs(dest_parent)[dest_index[0]]]):
+                return False
+        return True
+
+    source_scopes, dest_scopes = scopes(source), scopes(dest)
+    candidates = []
+    for source_scope, source_body in source_scopes.items():
+        source_wrapper = caller(source, source_scope)
+        source_rows = body(source_body)
+        if source_wrapper is None or source_rows is None:
+            continue
+        matches = []
+        for dest_scope, dest_body in dest_scopes.items():
+            dest_wrapper = caller(dest, dest_scope)
+            pairs = (list(zip(source_body, dest_body, strict=True))
+                     if dest_wrapper is not None and len(source_body) == len(dest_body) else [])
+            if (dest_wrapper is not None and source_rows == body(dest_body)
+                    and all(mapped.get(left["id"], {right["id"]}) == {right["id"]}
+                            and reverse.get(right["id"], {left["id"]}) == {left["id"]}
+                            for left, right in pairs)
+                    and same_caller(source_wrapper, dest_wrapper, source_body, dest_body)):
+                matches.append((dest_scope, dest_body, dest_wrapper))
+        if len(matches) == 1:
+            candidates.append((source_scope, source_body, source_wrapper, *matches[0]))
+    counts = Counter(dest_scope for _, _, _, dest_scope, _, _ in candidates)
+    inferred = []
+    for source_scope, source_body, source_wrapper, dest_scope, dest_body, dest_wrapper in candidates:
+        if counts[dest_scope] != 1:
+            continue
+        for source_node, dest_node in zip(source_body, dest_body, strict=True):
+            inferred.append({"source_ids": [source_node["id"]],
+                             "destination_ids": [dest_node["id"]],
+                             "kind": "nested_structural_identity",
+                             "proof": {"exact_typed_body": True, "exact_caller_bindings": True,
+                                       "source_scope": source_scope, "destination_scope": dest_scope}})
+        inferred.append({"source_ids": [source_wrapper["id"]],
+                         "destination_ids": [dest_wrapper["id"]],
+                         "kind": "nested_call_identity",
+                         "proof": {"exact_typed_body": True, "exact_caller_bindings": True,
+                                   "source_scope": source_scope, "destination_scope": dest_scope}})
+    return inferred
+
+
 def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -> dict[str, Any]:
     if not source or not dest or source.get("status") != "complete" or dest.get("status") != "complete":
         return {"from_stage": (source or {}).get("stage"), "to_stage": (dest or {}).get("stage"),
@@ -882,6 +1042,11 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
             if proved is not None:
                 consumed.add(node["id"])
                 relations.append(proved)
+    nested = _unchanged_nested_graph_relations(source, dest, relations)
+    relations.extend(nested)
+    consumed.update(identity for relation in nested for identity in relation["source_ids"])
+    unknown = [identity for identity in unknown if identity not in {
+        target for relation in nested for target in relation["destination_ids"]}]
     bindings, verified_scopes = _inlined_parameter_relations(source, dest, relations)
     relations.extend(bindings)
     for node, identities in pending_inlined:
