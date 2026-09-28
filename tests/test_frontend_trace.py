@@ -168,6 +168,43 @@ def test_traced_failed_capture_is_not_recaptured(monkeypatch):
     assert len(attempts) == 1
 
 
+def test_unused_tuple_selection_requires_exact_typed_dead_result():
+    import copy
+
+    def value(identity):
+        return {"id": identity, "kind": "tensor", "dtype": "int64", "storage_dtype": "int64",
+                "compute_dtype": None, "shape": [1, 1], "device": "cpu",
+                "layout": "torch.strided", "stride": [1, 1]}
+
+    source = {"stage": "quantized", "status": "complete", "nodes": [
+        {"id": "q:min", "op": "call_function", "target": "aten.min.dim",
+         "results": [value("q:min:v0"), value("q:min:v1")]},
+        {"id": "q:getitem", "op": "call_function", "target": "<built-in function getitem>",
+         "args": [{"node_id": "q:min", "value_id": "q:min:v1"}, 1], "kwargs": {},
+         "results": [value("q:getitem:v0")]},
+    ], "edges": [{"producer_node_id": "q:min", "producer_value_id": "q:min:v1",
+                   "consumer_node_id": "q:getitem", "argument_path": "args/0"}]}
+    dest = {"stage": "prepared", "status": "complete", "nodes": [
+        {"id": "p:min", "op": "call_function", "target": "aten.min.dim",
+         "origin_node_ids": ["q:min"]},
+    ], "edges": []}
+    relation = graph_relation(source, dest)
+    assert relation["status"] == "complete"
+    assert any(row.get("proof") == {"tuple_node_id": "q:min", "result_index": 1}
+               for row in relation["relations"])
+
+    used = copy.deepcopy(source)
+    used["edges"].append({"producer_node_id": "q:getitem", "consumer_node_id": "q:output",
+                          "argument_path": "args/0"})
+    assert "q:getitem" in graph_relation(used, dest)["unresolved_source_ids"]
+    mismatched = copy.deepcopy(source)
+    mismatched["nodes"][1]["results"][0]["dtype"] = "int32"
+    assert "q:getitem" in graph_relation(mismatched, dest)["unresolved_source_ids"]
+    invalid = copy.deepcopy(source)
+    invalid["nodes"][1]["args"][1] = 2
+    assert "q:getitem" in graph_relation(invalid, dest)["unresolved_source_ids"]
+
+
 def test_identity_dtype_cast_requires_exact_typed_bypass():
     class IdentityCast(torch.nn.Module):
         def forward(self, x):

@@ -472,6 +472,35 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
             "proof": {"input_node_id": producer["id"], "typed_bypass_edges": sorted(set(matched))}}
 
 
+def _unused_tuple_selection(source: dict[str, Any], node: dict[str, Any]) -> dict[str, Any] | None:
+    """Prove an unobserved, in-bounds tuple getitem cannot affect program output."""
+    if (node.get("op") != "call_function" or node.get("target") != "<built-in function getitem>"
+            or node.get("kwargs") or len(node.get("args") or ()) != 2
+            or any(edge.get("producer_node_id") == node.get("id") for edge in source.get("edges") or ())):
+        return None
+    ref, index = node["args"]
+    if not isinstance(ref, dict) or type(index) is not int:
+        return None
+    producer = next((item for item in source["nodes"] if item["id"] == ref.get("node_id")), None)
+    results = producer.get("results") or [] if producer is not None else []
+    if len(results) < 2 or not -len(results) <= index < len(results):
+        return None
+    selected = results[index]
+    output = node.get("results") or []
+    if (len(output) != 1 or ref.get("value_id") != selected.get("id")
+            or any(output[0].get(field) != selected.get(field) for field in
+                   ("kind", "dtype", "storage_dtype", "compute_dtype", "shape", "device", "layout", "stride"))):
+        return None
+    incoming = [edge for edge in source.get("edges") or [] if edge.get("consumer_node_id") == node["id"]]
+    if (len(incoming) != 1 or incoming[0].get("producer_node_id") != producer["id"]
+            or incoming[0].get("producer_value_id") != selected.get("id")
+            or incoming[0].get("argument_path") != "args/0"):
+        return None
+    return {"source_ids": [node["id"]], "destination_ids": [], "kind": "eliminated",
+            "reason": "unused in-bounds selection of an exactly typed tuple result",
+            "proof": {"tuple_node_id": producer["id"], "result_index": index}}
+
+
 def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -> dict[str, Any]:
     if not source or not dest or source.get("status") != "complete" or dest.get("status") != "complete":
         return {"from_stage": (source or {}).get("stage"), "to_stage": (dest or {}).get("stage"),
@@ -493,7 +522,8 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
             relations.append({**elimination, "source_ids": origins, "destination_ids": []})
     for node in source["nodes"]:
         if node["id"] not in consumed:
-            proved = _identity_conversion_bypass(source, dest, node)
+            proved = (_identity_conversion_bypass(source, dest, node)
+                      or _unused_tuple_selection(source, node))
             if proved is not None:
                 consumed.add(node["id"])
                 relations.append(proved)
