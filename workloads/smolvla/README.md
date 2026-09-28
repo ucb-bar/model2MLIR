@@ -39,14 +39,19 @@ The generic workload driver can instead invoke the loader's three-program
 session contract: `python workloads/capture.py smolvla --formats fp32`.
 It reads `capture.toml`, writes `workloads/smolvla/smolvla_session/` with separate
 stage MLIR and capture receipts. This is the loader's three-stage capture path,
-not the small smoke command above. The command has not yet been qualified on a
-complete SmolVLA capture and does not execute compiled programs.
+not the small smoke command above. An offline run with the full checkpoint and
+synthetic inputs produced all three stage bundles with zero opaque operations;
+each stage also lowered to LLVM IR. Those checks did not execute compiled code.
+The `fp32` format label selects the capture request; it does not cast every
+internal operation to FP32. The prefix and flow stages retain BF16 operations.
 
 ## Status
 
 Merlin's separate session capture treats `prefix_encode`, recurrent `flow_denoise`, and
 `action_decode` as separate programs. Capturing or lowering them is not evidence
-of accelerator execution or full-model numerical accuracy.
+of accelerator execution or full-model numerical accuracy. The current stage
+receipts do not establish frontend source closure, and the root session contract
+is not yet covered by a bundle-wide integrity receipt.
 
 PT2E models may store a weight as `i8` while dequantizing it to `bf16` before a
 floating contraction. Such a contraction is **not** an `i8 x i8 -> i32` operation.
