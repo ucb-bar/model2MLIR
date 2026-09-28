@@ -241,7 +241,7 @@ def test_data_dependent_size_guards_survive_preparation_and_mlir():
     assert result.mlir_text.count('"tensor.dim"') == 1
     assert result.mlir_text.count('"cf.assert"') == 3
     relations = trace["transformations"][1]["relations"]
-    guards = [row for row in relations if row["kind"] == "structural_guard_equivalence"]
+    guards = [row for row in relations if row["kind"] == "structural_call_equivalence"]
     assert len(guards) == 6
     assert any(row["proof"]["diagnostic_text_equated"] is False for row in guards)
     lineage_free = {node["id"] for node in trace["graphs"]["prepared"]["nodes"]
@@ -256,6 +256,32 @@ def test_data_dependent_size_guards_survive_preparation_and_mlir():
     assert mismatch["status"] == "diagnostic"
     assert any(node["target"] == "<built-in function le>" and node["id"] in mismatch["unresolved_source_ids"]
                for node in trace["graphs"]["quantized"]["nodes"])
+
+
+def test_grad_disabled_inline_binding_requires_exact_caller_value():
+    import copy
+
+    class Wrapped(torch.nn.Module):
+        def forward(self, x):
+            with torch.set_grad_enabled(False):
+                return torch.cos(x.unsqueeze(0))
+
+    result = m2m.convert(Wrapped(), (torch.randn(3),), backend="fx_importer", capture_trace=True)
+    assert result.ok
+    source, dest = result.capture_trace["graphs"]["quantized"], result.capture_trace["graphs"]["prepared"]
+    nested = next(node for node in source["nodes"] if node["target"] == "aten.unsqueeze.default"
+                  and node["graph_id"] != "g:quantized:root")
+    relation = graph_relation(source, dest)
+    assert nested["id"] not in relation["unresolved_source_ids"]
+    assert any(row["kind"] == "inlined_parameter_binding" for row in relation["relations"])
+    assert any(row["kind"] == "structural_call_equivalence" and row["source_ids"] == [nested["id"]]
+               for row in relation["relations"])
+
+    mismatched = copy.deepcopy(source)
+    wrapper = next(node for node in mismatched["nodes"] if node["target"] == "wrap_with_set_grad_enabled"
+                   and len(node["args"]) == 3)
+    wrapper["args"][2] = wrapper["args"][1]
+    assert nested["id"] in graph_relation(mismatched, dest)["unresolved_source_ids"]
 
 
 def test_identity_dtype_cast_requires_exact_typed_bypass():

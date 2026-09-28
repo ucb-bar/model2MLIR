@@ -39,6 +39,12 @@ and `cf.assert` in the MLIR, with exact prepared-call provenance. A later compil
 must preserve or explicitly discharge `cf.assert`; a complete frontend trace
 alone does not prove its runtime implementation.
 
+When a grad-disabled nested graph is inlined, the trace binds each inner
+placeholder to its uniquely selected, exactly typed caller value. Identical
+inner calls can then be matched through their typed arguments. A renamed,
+decomposed, or ambiguously repeated call remains diagnostic rather than being
+matched by operator name or FX ordinal.
+
 If an external quantizer will mutate the model, snapshot first and pass that receipt:
 
 ```python
