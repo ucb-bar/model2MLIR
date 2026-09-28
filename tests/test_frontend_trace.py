@@ -254,6 +254,17 @@ def test_identity_dtype_cast_requires_exact_typed_bypass():
     next(n for n in requested_copy["nodes"] if n["id"] == cast["id"])["kwargs"]["copy"] = True
     assert cast["id"] in graph_relation(requested_copy, dest)["unresolved_source_ids"]
 
+    detached = copy.deepcopy(source)
+    detach = next(n for n in detached["nodes"] if n["id"] == cast["id"])
+    detach["target"] = "aten.detach_.default"
+    detach["args"] = detach["args"][:1]
+    bypass = graph_relation(detached, dest)
+    proof = next(r["proof"] for r in bypass["relations"] if r["source_ids"] == [cast["id"]])
+    assert proof["typed_bypass_edges"]
+    assert "autograd metadata is not certified" in proof["scope"]
+    next(edge for edge in detached["edges"] if edge["producer_node_id"] == cast["id"])["dtype"] = "float16"
+    assert cast["id"] in graph_relation(detached, dest)["unresolved_source_ids"]
+
     dtype_layout = copy.deepcopy(source)
     changed_cast = next(n for n in dtype_layout["nodes"] if n["id"] == cast["id"])
     changed_cast["target"] = "aten.to.dtype_layout"

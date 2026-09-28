@@ -362,17 +362,19 @@ def tuple_selection_trace_program(exported: Any) -> Any:
 
 def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
                                 node: dict[str, Any]) -> dict[str, Any] | None:
-    """Prove a vanished type/device/layout-preserving conversion at each use.
+    """Prove a vanished forward-value identity at each exact typed use.
 
     PyTorch export can remove ``aten.to`` before a registered decomposition
     observes it. Matching operation names or output dtypes alone is insufficient:
     the destination graph must route the cast's original producer to every
     corresponding consumer at the same typed argument path. Any missing lineage,
     changed dtype/shape, requested copy, or layout request leaves it unresolved.
+    ``detach_`` affects autograd metadata, which this forward-value trace does not
+    certify; its captured tensor value may be bypassed under the same edge proof.
     """
     target = node.get("target")
     if node.get("op") != "call_function" or target not in {
-            "aten.to.dtype", "aten.to.dtype_layout", "aten.to.device"}:
+            "aten.to.dtype", "aten.to.dtype_layout", "aten.to.device", "aten.detach_.default"}:
         return None
     args, kwargs = node.get("args"), node.get("kwargs") or {}
     if not isinstance(args, list) or not args or not isinstance(kwargs, dict):
@@ -392,7 +394,10 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
         return raw is None or (isinstance(raw, dict)
                                and raw.get("kind") == kind and raw.get("value") == expected)
 
-    if target == "aten.to.dtype":
+    if target == "aten.detach_.default":
+        if len(args) != 1 or kwargs:
+            return None
+    elif target == "aten.to.dtype":
         if (len(args) < 2 or len(args) > 5
                 or set(kwargs) - {"non_blocking", "copy", "memory_format"}
                 or args[1] is None
@@ -468,8 +473,11 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
         matched.extend((edge["producer_node_id"], edge["consumer_node_id"],
                         edge["argument_path"]) for edge in matching_edges)
     return {"source_ids": [node["id"]], "destination_ids": [], "kind": "eliminated",
-            "reason": "type/device/layout-preserving aten.to with exact typed consumer-edge bypass",
-            "proof": {"input_node_id": producer["id"], "typed_bypass_edges": sorted(set(matched))}}
+            "reason": ("forward tensor-value-preserving detach_ with exact typed consumer-edge bypass"
+                       if target == "aten.detach_.default" else
+                       "type/device/layout-preserving aten.to with exact typed consumer-edge bypass"),
+            "proof": {"input_node_id": producer["id"], "typed_bypass_edges": sorted(set(matched)),
+                      "scope": "forward tensor values; autograd metadata is not certified"}}
 
 
 def _unused_tuple_selection(source: dict[str, Any], node: dict[str, Any]) -> dict[str, Any] | None:
