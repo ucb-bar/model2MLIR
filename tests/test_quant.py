@@ -383,6 +383,7 @@ def test_pt2e_census_excludes_unquantized_float_island():
 
 
 def test_pt2e_batched_matmul_integerizes_each_static_batch():
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
     from m2m.capture.pt2e_integerize import integerize_pt2e
 
     class QDQBatch(nn.Module):
@@ -405,12 +406,14 @@ def test_pt2e_batched_matmul_integerizes_each_static_batch():
     inputs = (torch.randn(1, 2, 4, 8),)
     captured = torch.export.export(QDQBatch().eval(), inputs).module()
     expected = captured(*inputs)
+    reference = run_pt2e_integer_reference(captured, inputs, expected_contractions=1)
     rewritten, receipt = integerize_pt2e(captured, inputs)
     assert receipt["matmul_seen"] == receipt["matmul_integerized"] == 1
     assert receipt["integer_mm_emitted"] == 2
     assert receipt["quantized_contractions_remaining"] == 0
     assert receipt["remaining_dequant_count"] == 0
     torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(rewritten(*inputs), reference.output, atol=0, rtol=0)
 
     from torch.ao.quantization import allow_exported_model_train_eval
 

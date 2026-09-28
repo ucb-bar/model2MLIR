@@ -40,15 +40,19 @@ def _inputs(kind):
 def test_frozen_output_channel_linear_conv_and_batched_matmul_capture():
     """Each real export rewrites, executes, and lowers with exact source accounting."""
     from torch.ao.quantization import allow_exported_model_train_eval
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 
     for kind in ("linear", "conv2d", "matmul"):
         inputs = _inputs(kind)
         model = torch.export.export(ChannelContraction(kind).eval(), inputs).module()
         expected = model(*inputs)
+        reference = run_pt2e_integer_reference(model, inputs, expected_contractions=1) if kind == "matmul" else None
         model, receipt = integerize_pt2e(model, inputs)
         assert receipt["quantized_contractions_integerized"] == 1, receipt
         assert receipt["remaining_dequant_count"] == 0 and receipt["refusals"] == []
         torch.testing.assert_close(model(*inputs), expected, atol=1e-5, rtol=1e-5)
+        if reference is not None:
+            torch.testing.assert_close(model(*inputs), reference.output, atol=0, rtol=0)
         allow_exported_model_train_eval(model)
         result = m2m.convert(model, inputs, backend="fx_importer", capture_trace=True)
         assert result.ok and opaque_report(result.mlir_text) == {}

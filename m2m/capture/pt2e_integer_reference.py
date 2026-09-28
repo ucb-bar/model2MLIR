@@ -23,10 +23,11 @@ class IntegerReferenceResult:
     output: Any
     conv2d_count: int
     linear_count: int
+    matmul_count: int = 0
 
     @property
     def contraction_count(self) -> int:
-        return self.conv2d_count + self.linear_count
+        return self.conv2d_count + self.linear_count + self.matmul_count
 
 
 def _pair(value: Any) -> tuple[int, int]:
@@ -57,6 +58,11 @@ def run_pt2e_integer_reference(
 
     conv2d = torch.ops.aten.conv2d.default
     linear = torch.ops.aten.linear.default
+    matmuls = (
+        torch.ops.aten.matmul.default,
+        torch.ops.aten.mm.default,
+        torch.ops.aten.bmm.default,
+    )
     dequant_tensor = torch.ops.quantized_decomposed.dequantize_per_tensor.default
     dequant_channel = torch.ops.quantized_decomposed.dequantize_per_channel.default
 
@@ -66,13 +72,14 @@ def run_pt2e_integer_reference(
             super().__init__(graph_module, garbage_collect_values=False)
             self.conv2d_count = 0
             self.linear_count = 0
+            self.matmul_count = 0
 
         def value(self, item: Any) -> Any:
             return self.env[item] if isinstance(item, Node) else item
 
-        def qparams(self, node: Any, *, weight: bool) -> tuple[Any, Any, Any, bool]:
+        def qparams(self, node: Any, *, weight_axis: int | None) -> tuple[Any, Any, Any, int | None]:
             if not isinstance(node, Node) or node.op != "call_function" or node.target not in (
-                (dequant_tensor, dequant_channel) if weight else (dequant_tensor,)
+                (dequant_tensor, dequant_channel) if weight_axis is not None else (dequant_tensor,)
             ):
                 raise ValueError(
                     "integer PT2E contraction operand is not produced by a supported "
@@ -100,15 +107,15 @@ def run_pt2e_integer_reference(
             if bool(((qvalue < qmin) | (qvalue > qmax)).any()):
                 raise ValueError("integer reference qvalues exceed the declared int8 range")
             if per_channel:
-                if axis != 0 or qvalue.ndim < 1:
-                    raise ValueError("integer reference requires weight channel axis 0")
+                if axis != weight_axis or qvalue.ndim < 1:
+                    raise ValueError(f"integer reference requires weight channel axis {weight_axis}")
                 if not isinstance(node.args[1], Node) or node.args[1].op != "get_attr":
                     raise ValueError("integer reference requires frozen weight channel scales")
                 if (
                     not isinstance(scale, torch.Tensor)
                     or scale.dtype not in (torch.float32, torch.float64)
                     or scale.ndim != 1
-                    or scale.numel() != qvalue.shape[0]
+                        or scale.numel() != qvalue.shape[axis]
                     or not bool(torch.isfinite(scale).all())
                     or not bool((scale > 0).all())
                 ):
@@ -120,11 +127,11 @@ def run_pt2e_integer_reference(
                         not isinstance(zero_point, torch.Tensor)
                         or zero_point.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64)
                         or zero_point.ndim != 1
-                        or zero_point.numel() != qvalue.shape[0]
+                        or zero_point.numel() != qvalue.shape[axis]
                         or bool((zero_point != 0).any())
                     ):
                         raise ValueError("integer reference requires zero weight channel zero points")
-                return qvalue, scale, zero_point, True
+                return qvalue, scale, zero_point, axis
             if (
                 not isinstance(node.args[1], (int, float))
                 or not math.isfinite(float(scale))
@@ -133,23 +140,24 @@ def run_pt2e_integer_reference(
                 or zero_point != 0
             ):
                 raise ValueError("integer reference requires a positive scalar scale and zero point 0")
-            return qvalue, scale, zero_point, False
+            return qvalue, scale, zero_point, None
 
-        def centered(self, value: Any, zero_point: Any, *, channel_axis: bool) -> Any:
+        def centered(self, value: Any, zero_point: Any, *, channel_axis: int | None) -> Any:
             q = value.to(torch.int32)
             zp = torch.as_tensor(zero_point, dtype=torch.int32, device=q.device)
-            if channel_axis:
-                zp = zp.reshape((-1,) + (1,) * (q.ndim - 1))
+            if channel_axis is not None:
+                zp = zp.reshape((1,) * channel_axis + (-1,) + (1,) * (q.ndim - channel_axis - 1))
             return q - zp
 
         def run_node(self, node: Any) -> Any:
-            if node.op != "call_function" or node.target not in (conv2d, linear):
+            if node.op != "call_function" or node.target not in (conv2d, linear, *matmuls):
                 return super().run_node(node)
 
             args, kwargs = self.fetch_args_kwargs_from_env(node)
-            qx, sx, zx, _ = self.qparams(node.args[0], weight=False)
-            qw, sw, zw, weight_channel = self.qparams(node.args[1], weight=True)
-            xq = self.centered(qx, zx, channel_axis=False)
+            output_axis = args[1].ndim - 1 if node.target in matmuls else 0
+            qx, sx, zx, _ = self.qparams(node.args[0], weight_axis=None)
+            qw, sw, zw, weight_channel = self.qparams(node.args[1], weight_axis=output_axis)
+            xq = self.centered(qx, zx, channel_axis=None)
             wq = self.centered(qw, 0 if zw is None else zw, channel_axis=weight_channel)
             bias = args[2] if len(args) > 2 else kwargs.get("bias")
 
@@ -162,11 +170,29 @@ def run_pt2e_integer_reference(
                 out = acc.to(torch.float32) * torch.as_tensor(
                     sx, dtype=torch.float32, device=acc.device)
                 out = out * torch.as_tensor(sw, device=acc.device)
-                if weight_channel:
+                if weight_channel is not None:
                     out = out.to(torch.float32)
                 if bias is not None:
                     out = out + bias
                 self.linear_count += 1
+                return out
+
+            if node.target in matmuls:
+                if (
+                    xq.ndim < 2
+                    or xq.ndim != wq.ndim
+                    or xq.shape[:-2] != wq.shape[:-2]
+                    or xq.shape[-1] != wq.shape[-2]
+                ):
+                    raise ValueError(f"invalid integer Matmul geometry: {xq.shape}/{wq.shape}")
+                if xq.shape[-1] * 128 * 128 > (1 << 31) - 1:
+                    raise ValueError("integer Matmul may overflow its i32 accumulator")
+                acc = torch.matmul(xq, wq)
+                out = acc.to(torch.float32) * torch.as_tensor(sx, dtype=torch.float32, device=acc.device)
+                out = out * torch.as_tensor(sw, device=acc.device)
+                if weight_channel is not None:
+                    out = out.to(torch.float32)
+                self.matmul_count += 1
                 return out
 
             stride = _pair(args[3] if len(args) > 3 else kwargs.get("stride", 1))
@@ -196,10 +222,10 @@ def run_pt2e_integer_reference(
             out = acc.reshape(batch, wq.shape[0], oh, ow).to(torch.float32)
             out = out * torch.as_tensor(sx, dtype=torch.float32, device=acc.device)
             weight_scale = torch.as_tensor(sw, device=acc.device)
-            if weight_channel:
+            if weight_channel is not None:
                 weight_scale = weight_scale.reshape(1, -1, 1, 1)
             out = out * weight_scale
-            if weight_channel:
+            if weight_channel is not None:
                 out = out.to(torch.float32)
             if bias is not None:
                 out = out + bias.reshape(1, -1, 1, 1)
@@ -209,7 +235,7 @@ def run_pt2e_integer_reference(
     runner = _IntegerInterpreter(model)
     with torch.no_grad():
         output = runner.run(*tuple(inputs))
-    result = IntegerReferenceResult(output, runner.conv2d_count, runner.linear_count)
+    result = IntegerReferenceResult(output, runner.conv2d_count, runner.linear_count, runner.matmul_count)
     if expected_contractions is not None and result.contraction_count != expected_contractions:
         raise ValueError(
             f"integer reference executed {result.contraction_count} contractions, "
