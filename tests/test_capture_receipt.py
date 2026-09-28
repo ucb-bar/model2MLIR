@@ -57,6 +57,30 @@ def test_bundle_receipt_binds_source_tool_framework_and_materialized_abi(tmp_pat
     assert capture_receipt(bundle)["lifted_constants"]["c_lifted_tensor_0"]["shape"] == []
 
 
+def test_integer_reference_is_bound_to_capture_receipt(tmp_path):
+    import pytest
+
+    bundle = tmp_path / "bundle"
+    write_bundle(_Tiny().eval(), (torch.randn(2, 4),), bundle, capture_regions=False)
+    reference = bundle / "integer-reference.json"
+    reference.write_text('{"outputs": [1]}\n')
+    digest = hashlib.sha256(reference.read_bytes()).hexdigest()
+    meta = {"integerization_receipt": {"golden_agreement": {
+        "reference": "pt2e_integer", "output": {"path": reference.name, "sha256": digest},
+    }}}
+    (bundle / "meta.json").write_text(json.dumps(meta))
+    receipt = capture_receipt(bundle)
+    assert receipt["artifacts"][reference.name]["sha256"] == digest
+
+    reference.write_text('{"outputs": [2]}\n')
+    with pytest.raises(ValueError, match="differs"):
+        capture_receipt(bundle)
+    meta["integerization_receipt"]["golden_agreement"]["output"]["path"] = "../integer-reference.json"
+    (bundle / "meta.json").write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="bundle-local"):
+        capture_receipt(bundle)
+
+
 def test_unbounded_export_constraint_does_not_break_lifted_constant_capture():
     exported = SimpleNamespace(range_constraints={
         sympy.Symbol("s0"): SimpleNamespace(lower=1, upper=sympy.oo),

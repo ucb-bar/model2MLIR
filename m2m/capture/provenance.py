@@ -93,6 +93,20 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
     for name in ("frontend-trace.json", "meta.json"):
         if (out / name).is_file():
             artifacts[name] = _file_record(out / name)
+    if "meta.json" in artifacts:
+        meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+        agreement = (meta.get("integerization_receipt") or {}).get("golden_agreement") or {}
+        reference = agreement.get("output")
+        if reference is not None:
+            if not isinstance(reference, dict) or reference.get("path") != "integer-reference.json":
+                raise ValueError("integer reference must point to the bundle-local artifact")
+            reference_path = out / "integer-reference.json"
+            if not reference_path.is_file() or reference_path.is_symlink():
+                raise ValueError("integer reference artifact is absent or symlinked")
+            record = _file_record(reference_path)
+            if reference.get("sha256") != record["sha256"]:
+                raise ValueError("integer reference artifact differs from its metadata digest")
+            artifacts["integer-reference.json"] = record
     if "frontend-trace.json" in artifacts:
         trace = json.loads((out / "frontend-trace.json").read_text(encoding="utf-8"))
         if trace.get("mlir", {}).get("sha256") != artifacts["model.mlir"]["sha256"]:
