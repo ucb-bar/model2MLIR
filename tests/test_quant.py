@@ -148,6 +148,55 @@ def test_pt2e_integer_reference_executes_conv_and_linear():
     assert torch.isfinite(result.output).all()
 
 
+def test_pt2e_integer_reference_matches_rewrite_with_per_tensor_weights():
+    """A full exported Conv/Linear graph uses the same frozen integer semantics."""
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    class PerTensorWeights(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("conv_weight", torch.randint(-8, 8, (4, 3, 3, 3), dtype=torch.int8))
+            self.register_buffer("linear_weight", torch.randint(-8, 8, (5, 8), dtype=torch.int8))
+            self.register_buffer("conv_bias", torch.randn(4))
+            self.register_buffer("linear_bias", torch.randn(5))
+
+        def forward(self, image, features):
+            image_q = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                image, 0.125, 0, -128, 127, torch.int8
+            )
+            image_dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                image_q, 0.125, 0, -128, 127, torch.int8
+            )
+            conv_weight = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.conv_weight, 0.25, 0, -127, 127, torch.int8
+            )
+            conv = torch.ops.aten.conv2d.default(
+                image_dq, conv_weight, self.conv_bias, [1, 1], [1, 1], [1, 1]
+            )
+            features_q = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                features, 0.125, 0, -128, 127, torch.int8
+            )
+            features_dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                features_q, 0.125, 0, -128, 127, torch.int8
+            )
+            linear_weight = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.linear_weight, 0.25, 0, -127, 127, torch.int8
+            )
+            linear = torch.ops.aten.linear.default(features_dq, linear_weight, self.linear_bias)
+            return conv, linear
+
+    torch.manual_seed(0)
+    inputs = (torch.randn(1, 3, 6, 6), torch.randn(2, 8))
+    captured = torch.export.export(PerTensorWeights().eval(), inputs).module()
+    reference = run_pt2e_integer_reference(captured, inputs, expected_contractions=2)
+    rewritten, receipt = integerize_pt2e(captured, inputs)
+    assert receipt["quantized_contractions_remaining"] == 0
+    assert (reference.conv2d_count, reference.linear_count) == (1, 1)
+    for observed, expected in zip(reference.output, rewritten(*inputs), strict=True):
+        torch.testing.assert_close(observed, expected, atol=0, rtol=0)
+
+
 def test_pt2e_scalar_qparams_are_materialized_before_import():
     """PT2E calibration stores per-tensor scale and zero point as FX scalars."""
 
@@ -205,6 +254,7 @@ def test_pt2e_linear_integerization_preserves_frozen_qparams_and_bias():
 
 
 def test_pt2e_linear_integerization_refuses_nonzero_zero_point():
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
     from m2m.capture.pt2e_integerize import integerize_pt2e
 
     class Asymmetric(nn.Module):
@@ -226,6 +276,8 @@ def test_pt2e_linear_integerization_refuses_nonzero_zero_point():
 
     inputs = (torch.randn(2, 8),)
     captured = torch.export.export(Asymmetric().eval(), inputs).module()
+    with pytest.raises(ValueError, match="zero point 0"):
+        run_pt2e_integer_reference(captured, inputs, expected_contractions=1)
     _, receipt = integerize_pt2e(captured, inputs)
     assert receipt["linear_seen"] == 1
     assert receipt["linear_integerized"] == 0

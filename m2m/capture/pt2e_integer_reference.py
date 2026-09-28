@@ -13,6 +13,7 @@ falling back while claiming integer coverage.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -69,15 +70,70 @@ def run_pt2e_integer_reference(
         def value(self, item: Any) -> Any:
             return self.env[item] if isinstance(item, Node) else item
 
-        def qparams(self, node: Any, expected_target: Any) -> tuple[Any, Any, Any]:
-            if not isinstance(node, Node) or node.target != expected_target:
+        def qparams(self, node: Any, *, weight: bool) -> tuple[Any, Any, Any, bool]:
+            if not isinstance(node, Node) or node.op != "call_function" or node.target not in (
+                (dequant_tensor, dequant_channel) if weight else (dequant_tensor,)
+            ):
                 raise ValueError(
-                    "integer PT2E contraction operand is not produced by the required "
+                    "integer PT2E contraction operand is not produced by a supported "
                     f"dequantize op: {node!r}"
                 )
-            if len(node.args) < 3:
-                raise ValueError(f"PT2E dequantize node has no qvalue/scale/zero-point: {node}")
-            return tuple(self.value(arg) for arg in node.args[:3])  # type: ignore[return-value]
+            per_channel = node.target == dequant_channel
+            if len(node.args) < (7 if per_channel else 6):
+                raise ValueError(f"PT2E dequantize node has incomplete qparams: {node}")
+            if node.kwargs.get("out_dtype", torch.float32) not in (None, torch.float32):
+                raise ValueError("integer reference requires float32 dequantize output")
+            qvalue, scale, zero_point = (self.value(arg) for arg in node.args[:3])
+            axis = node.args[3] if per_channel else None
+            qmin, qmax, dtype = node.args[4:7] if per_channel else node.args[3:6]
+            if (
+                not isinstance(qvalue, torch.Tensor)
+                or qvalue.dtype != torch.int8
+                or not isinstance(qmin, int)
+                or not isinstance(qmax, int)
+                or qmin < -128
+                or qmax > 127
+                or qmin >= qmax
+                or dtype != torch.int8
+            ):
+                raise ValueError("integer reference requires a valid signed-int8 dequantize operand")
+            if bool(((qvalue < qmin) | (qvalue > qmax)).any()):
+                raise ValueError("integer reference qvalues exceed the declared int8 range")
+            if per_channel:
+                if axis != 0 or qvalue.ndim < 1:
+                    raise ValueError("integer reference requires weight channel axis 0")
+                if not isinstance(node.args[1], Node) or node.args[1].op != "get_attr":
+                    raise ValueError("integer reference requires frozen weight channel scales")
+                if (
+                    not isinstance(scale, torch.Tensor)
+                    or scale.dtype not in (torch.float32, torch.float64)
+                    or scale.ndim != 1
+                    or scale.numel() != qvalue.shape[0]
+                    or not bool(torch.isfinite(scale).all())
+                    or not bool((scale > 0).all())
+                ):
+                    raise ValueError("integer reference requires positive weight channel scales")
+                if zero_point is not None:
+                    if not isinstance(node.args[2], Node) or node.args[2].op != "get_attr":
+                        raise ValueError("integer reference requires frozen weight channel zero points")
+                    if (
+                        not isinstance(zero_point, torch.Tensor)
+                        or zero_point.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64)
+                        or zero_point.ndim != 1
+                        or zero_point.numel() != qvalue.shape[0]
+                        or bool((zero_point != 0).any())
+                    ):
+                        raise ValueError("integer reference requires zero weight channel zero points")
+                return qvalue, scale, zero_point, True
+            if (
+                not isinstance(node.args[1], (int, float))
+                or not math.isfinite(float(scale))
+                or float(scale) <= 0
+                or not isinstance(node.args[2], int)
+                or zero_point != 0
+            ):
+                raise ValueError("integer reference requires a positive scalar scale and zero point 0")
+            return qvalue, scale, zero_point, False
 
         def centered(self, value: Any, zero_point: Any, *, channel_axis: bool) -> Any:
             q = value.to(torch.int32)
@@ -91,21 +147,23 @@ def run_pt2e_integer_reference(
                 return super().run_node(node)
 
             args, kwargs = self.fetch_args_kwargs_from_env(node)
-            qx, sx, zx = self.qparams(node.args[0], dequant_tensor)
-            qw, sw, zw = self.qparams(node.args[1], dequant_channel)
-            # PT2E's portable W8A8 contract uses output-channel weight granularity.
-            weight_axis = int(node.args[1].args[3]) if len(node.args[1].args) > 3 else 0
-            if weight_axis != 0:
-                raise ValueError(f"integer reference requires weight channel axis 0, got {weight_axis}")
+            qx, sx, zx, _ = self.qparams(node.args[0], weight=False)
+            qw, sw, zw, weight_channel = self.qparams(node.args[1], weight=True)
             xq = self.centered(qx, zx, channel_axis=False)
-            wq = self.centered(qw, zw, channel_axis=True)
+            wq = self.centered(qw, 0 if zw is None else zw, channel_axis=weight_channel)
             bias = args[2] if len(args) > 2 else kwargs.get("bias")
 
             if node.target == linear:
+                if xq.ndim < 2 or wq.ndim != 2 or xq.shape[-1] != wq.shape[-1]:
+                    raise ValueError(f"invalid integer Linear geometry: {xq.shape}/{wq.shape}")
+                if xq.shape[-1] * 128 * 128 > (1 << 31) - 1:
+                    raise ValueError("integer Linear may overflow its i32 accumulator")
                 acc = torch.matmul(xq, wq.transpose(-1, -2))
                 out = acc.to(torch.float32) * torch.as_tensor(
                     sx, dtype=torch.float32, device=acc.device)
-                out = out * torch.as_tensor(sw, dtype=torch.float32, device=acc.device)
+                out = out * torch.as_tensor(sw, device=acc.device)
+                if weight_channel:
+                    out = out.to(torch.float32)
                 if bias is not None:
                     out = out + bias
                 self.linear_count += 1
@@ -120,6 +178,8 @@ def run_pt2e_integer_reference(
             if groups < 1 or xq.shape[1] % groups or wq.shape[0] % groups:
                 raise ValueError(f"invalid grouped Conv2d geometry: {xq.shape}/{wq.shape}, groups={groups}")
             kh, kw = int(wq.shape[-2]), int(wq.shape[-1])
+            if int(wq.shape[1]) * kh * kw * 128 * 128 > (1 << 31) - 1:
+                raise ValueError("integer Conv2d may overflow its i32 accumulator")
             cols = F.unfold(
                 xq.to(torch.float32), (kh, kw), dilation=dilation,
                 padding=padding, stride=stride).to(torch.int32)
@@ -135,8 +195,12 @@ def run_pt2e_integer_reference(
                 raise ValueError(f"unfold produced {positions} columns, expected {oh}x{ow}")
             out = acc.reshape(batch, wq.shape[0], oh, ow).to(torch.float32)
             out = out * torch.as_tensor(sx, dtype=torch.float32, device=acc.device)
-            out = out * torch.as_tensor(sw, dtype=torch.float32, device=acc.device).reshape(
-                1, -1, 1, 1)
+            weight_scale = torch.as_tensor(sw, device=acc.device)
+            if weight_channel:
+                weight_scale = weight_scale.reshape(1, -1, 1, 1)
+            out = out * weight_scale
+            if weight_channel:
+                out = out.to(torch.float32)
             if bias is not None:
                 out = out + bias.reshape(1, -1, 1, 1)
             self.conv2d_count += 1
@@ -152,4 +216,3 @@ def run_pt2e_integer_reference(
             f"expected {expected_contractions}"
         )
     return result
-

@@ -69,13 +69,17 @@ def test_channel_reduction_axes_and_nonzero_zero_points_remain_diagnostic():
 
 
 def test_channel_scale_dtype_and_qparams_are_not_substituted():
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+
     inputs = _inputs("linear")
     model = torch.export.export(ChannelContraction("linear", scale_dtype=torch.float64).eval(), inputs).module()
     expected = model(*inputs)
+    reference = run_pt2e_integer_reference(model, inputs, expected_contractions=1)
     model, receipt = integerize_pt2e(model, inputs)
     assert receipt["quantized_contractions_integerized"] == 1, receipt
     assert model.scales.dtype == torch.float64
     assert model(*inputs).dtype == expected.dtype == torch.float32
+    torch.testing.assert_close(reference.output, model(*inputs), atol=0, rtol=0)
     torch.testing.assert_close(model(*inputs), expected, atol=1e-5, rtol=1e-5)
 
 
