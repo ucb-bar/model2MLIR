@@ -437,6 +437,8 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
     if not corresponding_producers:
         return None
     dest_edges = dest.get("edges") or []
+    dest_values = {value["id"]: value for item in dest["nodes"]
+                   for value in item.get("results") or [] if isinstance(value.get("id"), str)}
     uses = [edge for edge in source.get("edges") or []
             if edge.get("producer_node_id") == node["id"]]
     if not uses or any(edge.get("producer_value_id") != output.get("id") for edge in uses):
@@ -444,18 +446,24 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
     matched = []
     for use in uses:
         consumers = descendants.get(use.get("consumer_node_id"), set())
-        # A fanout of transformed consumer nodes needs its own SSA-value
-        # correspondence proof. A single mapped consumer is the only case in
-        # which this exact argument edge identifies the original use.
-        if len(consumers) != 1:
+        if not consumers:
             return None
+        # One source consumer may decompose into several prepared calls. Demand
+        # exactly one direct edge from the mapped producer into that descendant
+        # set at the original argument path; an internal edge from a different
+        # producer cannot establish that the vanished cast was bypassed.
         matching_edges = [edge for edge in dest_edges
                           if edge.get("consumer_node_id") in consumers
-                          and edge.get("argument_path") == use.get("argument_path")]
+                          and edge.get("argument_path") == use.get("argument_path")
+                          and edge.get("producer_node_id") in corresponding_producers]
+        dest_value = dest_values.get(matching_edges[0].get("producer_value_id")) if len(matching_edges) == 1 else None
         if (len(matching_edges) != 1
-                or matching_edges[0].get("producer_node_id") not in corresponding_producers
                 or matching_edges[0].get("dtype") != use.get("dtype")
-                or matching_edges[0].get("shape") != use.get("shape")):
+                or matching_edges[0].get("shape") != use.get("shape")
+                or dest_value is None
+                or any(dest_value.get(field) != original.get(field) for field in
+                       ("kind", "dtype", "storage_dtype", "compute_dtype", "shape",
+                        "device", "layout", "stride"))):
             return None
         matched.extend((edge["producer_node_id"], edge["consumer_node_id"],
                         edge["argument_path"]) for edge in matching_edges)

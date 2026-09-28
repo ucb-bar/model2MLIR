@@ -183,6 +183,29 @@ def test_identity_dtype_cast_requires_exact_typed_bypass():
                and r["proof"]["typed_bypass_edges"] for r in relation["relations"])
 
     import copy
+    # One source consumer may expand into several prepared nodes. The exact
+    # producer-to-entry edge still proves the no-op cast disappeared, while
+    # internal decomposition edges must not be mistaken for that bypass.
+    decomposed = copy.deepcopy(dest)
+    source_add = next(n for n in source["nodes"] if n["target"] == "aten.add.Tensor")
+    prepared_add = next(n for n in decomposed["nodes"] if n["target"] == "aten.add.Tensor")
+    tail = copy.deepcopy(prepared_add)
+    tail["id"] = "g:prepared:root:decomposition_tail"
+    tail["target"] = "aten.relu.default"
+    tail["origin_node_ids"] = [source_add["id"]]
+    tail["results"][0]["id"] = f"{tail['id']}:v0"
+    tail["args"] = [{"node_id": prepared_add["id"],
+                      "value_id": prepared_add["results"][0]["id"]}]
+    decomposed["nodes"].append(tail)
+    decomposed["edges"].append({
+        "producer_node_id": prepared_add["id"],
+        "producer_value_id": prepared_add["results"][0]["id"],
+        "consumer_node_id": tail["id"], "argument_path": "args/0",
+        "dtype": prepared_add["results"][0]["dtype"],
+        "shape": prepared_add["results"][0]["shape"], "value_kind": "tensor",
+    })
+    assert cast["id"] not in graph_relation(source, decomposed)["unresolved_source_ids"]
+
     unproven = copy.deepcopy(dest)
     add = next(n["id"] for n in dest["nodes"] if n["target"] == "aten.add.Tensor")
     edge = next(e for e in unproven["edges"] if e["consumer_node_id"] == add
