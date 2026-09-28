@@ -27,6 +27,12 @@ exact returned MLIR bytes and their SHA-256 digest. Traced FXImporter output use
 generic MLIR serialization so custom printers cannot silently discard identity
 attributes on operations such as `tensor.empty`.
 
+Eliminated calls need explicit evidence: an unused tuple selection must be
+in-bounds, exactly typed, and have no users; a vanished no-op cast or `detach_`
+must have an exact typed producer-to-consumer bypass at every use. The `detach_`
+proof covers forward tensor values only. It does not certify autograd metadata or
+training semantics; those require a separate contract.
+
 If an external quantizer will mutate the model, snapshot first and pass that receipt:
 
 ```python
