@@ -122,8 +122,8 @@ remain float64; the scaled result is explicitly converted to PT2E's float32
 output type.
 
 The independent reference executes frozen per-tensor or per-output-channel
-weight Q/DQ for Linear and Conv2d in PyTorch without reading the rewritten
-graph or compiler IR. It validates the actual int8 range, scales, zero points,
+weight Q/DQ for Linear, Conv2d and equal-batch Matmul in PyTorch without
+reading the rewritten graph or compiler IR. It validates the actual int8 range, scales, zero points,
 axis and output dtype and accounts for the number of contractions executed.
 Supply the expected contraction count from a separately recorded graph census;
 the example's `2` is illustrative. Exact equality to the rewritten model on
