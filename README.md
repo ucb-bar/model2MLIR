@@ -33,6 +33,12 @@ must have an exact typed producer-to-consumer bypass at every use. The `detach_`
 proof covers forward tensor values only. It does not certify autograd metadata or
 training semantics; those require a separate contract.
 
+Data-dependent size guards are not silently discarded: supported
+`sym_size`/range-constraint/assertion chains become `tensor.dim`, `arith.cmpi`,
+and `cf.assert` in the MLIR, with exact prepared-call provenance. A later compiler
+must preserve or explicitly discharge `cf.assert`; a complete frontend trace
+alone does not prove its runtime implementation.
+
 If an external quantizer will mutate the model, snapshot first and pass that receipt:
 
 ```python

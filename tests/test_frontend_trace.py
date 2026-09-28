@@ -205,6 +205,59 @@ def test_unused_tuple_selection_requires_exact_typed_dead_result():
     assert "q:getitem" in graph_relation(invalid, dest)["unresolved_source_ids"]
 
 
+def test_dead_pure_value_chain_cannot_reach_output_or_unknown_effect():
+    import copy
+
+    source = {"stage": "quantized", "status": "complete", "nodes": [
+        {"id": "q:arange", "op": "call_function", "target": "aten.arange.default"},
+        {"id": "q:unsqueeze", "op": "call_function", "target": "aten.unsqueeze.default"},
+        {"id": "q:output", "op": "output", "target": "output"},
+    ], "edges": [{"producer_node_id": "q:arange", "consumer_node_id": "q:unsqueeze"}]}
+    dest = {"stage": "prepared", "status": "complete", "nodes": [], "edges": []}
+    relation = graph_relation(source, dest)
+    assert relation["status"] == "complete"
+    assert {row["source_ids"][0] for row in relation["relations"]} == {"q:arange", "q:unsqueeze"}
+
+    used = copy.deepcopy(source)
+    used["edges"].append({"producer_node_id": "q:unsqueeze", "consumer_node_id": "q:output"})
+    assert set(graph_relation(used, dest)["unresolved_source_ids"]) == {"q:arange", "q:unsqueeze"}
+    effect_unknown = copy.deepcopy(source)
+    effect_unknown["nodes"][0]["target"] = "aten.rand.default"
+    assert "q:arange" in graph_relation(effect_unknown, dest)["unresolved_source_ids"]
+
+
+def test_data_dependent_size_guards_survive_preparation_and_mlir():
+    import copy
+
+    class Masked(torch.nn.Module):
+        def forward(self, x):
+            selected = x[x > 0]
+            torch.sym_constrain_range_for_size(selected.shape[0], max=4)
+            return selected
+
+    result = m2m.convert(Masked(), (torch.tensor([1.0, 0.0, 2.0, 0.0]),),
+                         backend="fx_importer", capture_trace=True)
+    trace = _check_trace(result)
+    assert result.mlir_text.count('"tensor.dim"') == 1
+    assert result.mlir_text.count('"cf.assert"') == 3
+    relations = trace["transformations"][1]["relations"]
+    guards = [row for row in relations if row["kind"] == "structural_guard_equivalence"]
+    assert len(guards) == 6
+    assert any(row["proof"]["diagnostic_text_equated"] is False for row in guards)
+    lineage_free = {node["id"] for node in trace["graphs"]["prepared"]["nodes"]
+                    if node["target"] in {"aten.sym_size.int", "aten.sym_constrain_range_for_size.default"}}
+    assert all(not op["origin_node_ids"] for op in trace["mlir"]["operations"]
+               if lineage_free.intersection(op["source_node_ids"]))
+
+    changed = copy.deepcopy(trace["graphs"]["prepared"])
+    upper = next(node for node in changed["nodes"] if node["target"] == "<built-in function le>")
+    upper["args"][1] = 5
+    mismatch = graph_relation(trace["graphs"]["quantized"], changed)
+    assert mismatch["status"] == "diagnostic"
+    assert any(node["target"] == "<built-in function le>" and node["id"] in mismatch["unresolved_source_ids"]
+               for node in trace["graphs"]["quantized"]["nodes"])
+
+
 def test_identity_dtype_cast_requires_exact_typed_bypass():
     class IdentityCast(torch.nn.Module):
         def forward(self, x):

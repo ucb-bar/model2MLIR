@@ -14,6 +14,7 @@ Invariants:
 from __future__ import annotations
 
 import io
+import operator
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -204,7 +205,8 @@ def _forward_fx_meta(
 
         custom = fx_meta.get("custom") or {}
         stamp_mlir_sources(op, fx_meta.get("_m2m_node_id") or custom.get("m2m_node_id"),
-                           fx_meta.get("_m2m_origin_ids") or custom.get("m2m_lineage", ()))
+                           fx_meta["_m2m_origin_ids"] if "_m2m_origin_ids" in fx_meta
+                           else custom.get("m2m_lineage", ()))
         if fx_meta.get("_compgen_transpose_absorbed") and "prov.transpose_absorbed" not in op.attributes:
             op.attributes["prov.transpose_absorbed"] = StringAttr("true")
         if fx_meta.get("_compgen_fuse_dequant") and "prov.fuse_dequant" not in op.attributes:
@@ -703,6 +705,75 @@ class FXImporter:
         # Process call_function nodes
         for node in call_nodes:
             target_str = _canonicalize_fx_target_str(str(node.target))
+            # Exported data-dependent dimensions carry runtime constraints. Do
+            # not silently drop the SymInt chain merely because it has no
+            # TensorType result: its assertions restrict valid model inputs.
+            if node.target == torch.ops.aten.sym_size.int and len(node.args) == 2:
+                from xdsl.dialects import arith, tensor
+                from xdsl.dialects.builtin import IndexType
+
+                inp, dim = node.args
+                imported = value_map.get(getattr(inp, "name", ""))
+                if (type(dim) is int and imported is not None
+                        and isinstance(imported.type, TensorType)
+                        and 0 <= dim < len(imported.type.get_shape())):
+                    axis = arith.ConstantOp.from_int_and_width(dim, IndexType())
+                    extent = tensor.DimOp(imported, axis.result)
+                    for op in (axis, extent):
+                        _forward_fx_meta(op, node.meta, "shape_extent")
+                        block.add_op(op)
+                    value_map[node.name] = extent.result
+                    self.decomposed_count += 1
+                    continue
+            if node.target == torch.ops.aten.sym_constrain_range_for_size.default and len(node.args) == 1:
+                from xdsl.dialects import arith, cf
+                from xdsl.dialects.builtin import IndexType
+
+                extent = value_map.get(getattr(node.args[0], "name", ""))
+                lower = node.kwargs.get("min")
+                upper = node.kwargs.get("max")
+                if (extent is not None and isinstance(extent.type, IndexType)
+                        and (lower is None or type(lower) is int)
+                        and (upper is None or type(upper) is int)):
+                    for bound, predicate in ((0 if lower is None else lower, "sge"), (upper, "sle")):
+                        if bound is None:
+                            continue
+                        constant = arith.ConstantOp.from_int_and_width(bound, IndexType())
+                        compare = arith.CmpiOp(extent, constant.result, predicate)
+                        assertion = cf.AssertOp(compare.result, f"size constraint {predicate} {bound}")
+                        for op in (constant, compare, assertion):
+                            _forward_fx_meta(op, node.meta, "shape_guard")
+                            block.add_op(op)
+                    self.decomposed_count += 1
+                    continue
+            if node.target in (operator.ge, operator.le) and len(node.args) == 2:
+                from xdsl.dialects import arith
+                from xdsl.dialects.builtin import IndexType
+
+                lhs = value_map.get(getattr(node.args[0], "name", ""))
+                rhs = node.args[1]
+                if lhs is not None and isinstance(lhs.type, IndexType) and type(rhs) is int:
+                    constant = arith.ConstantOp.from_int_and_width(rhs, IndexType())
+                    compare = arith.CmpiOp(lhs, constant.result, "sge" if node.target is operator.ge else "sle")
+                    for op in (constant, compare):
+                        _forward_fx_meta(op, node.meta, "shape_guard")
+                        block.add_op(op)
+                    value_map[node.name] = compare.result
+                    self.decomposed_count += 1
+                    continue
+            if node.target == torch.ops.aten._assert_scalar.default and len(node.args) == 2:
+                from xdsl.dialects import cf
+                from xdsl.dialects.builtin import IntegerType
+
+                condition = value_map.get(getattr(node.args[0], "name", ""))
+                message = node.args[1]
+                if (condition is not None and isinstance(condition.type, IntegerType)
+                        and condition.type.width.data == 1 and isinstance(message, str)):
+                    assertion = cf.AssertOp(condition, message)
+                    _forward_fx_meta(assertion, node.meta, "shape_guard")
+                    block.add_op(assertion)
+                    self.decomposed_count += 1
+                    continue
             if node.target == torch.ops.aten._assert_tensor_metadata.default:
                 # Export inserts metadata guards around explicit dtype casts.
                 # Erase only assertions proved by the actual imported static SSA
