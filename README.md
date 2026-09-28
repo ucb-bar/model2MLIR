@@ -98,11 +98,16 @@ Python branches: any different Python specialization needs a separate capture.
 ## Portable PT2E integer contractions
 
 ```python
+import torch
 from m2m.capture.pt2e_integerize import integerize_pt2e
+from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 
 # quantized_model is a converted PT2E GraphModule, not a TorchAO source edit.
+# Run the independent framework-side integer oracle on the same frozen graph.
+reference = run_pt2e_integer_reference(quantized_model, inputs, expected_contractions=2)
 integer_model, receipt = integerize_pt2e(quantized_model, inputs)
 assert receipt["quantized_contractions_remaining"] == 0, receipt["refusals"]
+torch.testing.assert_close(integer_model(*inputs), reference.output, atol=0, rtol=0)
 # Use this same rewritten model for the integer host golden and capture.
 ```
 
@@ -115,6 +120,15 @@ Matmul weights use their last/output axis. Frozen scale/zero-point byte hashes,
 axis, dtype, geometry and refusals appear in the receipt. Float64 scale tensors
 remain float64; the scaled result is explicitly converted to PT2E's float32
 output type.
+
+The independent reference executes frozen per-tensor or per-output-channel
+weight Q/DQ for Linear and Conv2d in PyTorch without reading the rewritten
+graph or compiler IR. It validates the actual int8 range, scales, zero points,
+axis and output dtype and accounts for the number of contractions executed.
+Supply the expected contraction count from a separately recorded graph census;
+the example's `2` is illustrative. Exact equality to the rewritten model on
+selected inputs checks that particular integer execution, not all inputs,
+model quality, accelerator lowering or source-closed capture provenance.
 
 Nonzero zero points, reduction/batch channel axes, per-channel activations,
 dynamic qparams/shapes, grouped convolution and unsupported broadcast geometry
