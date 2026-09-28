@@ -64,6 +64,10 @@ def test_driver_writes_three_program_session_with_stage_receipts(monkeypatch):
         assert "no source-closure or execution proof" in result["qualification"]
         root = workload_root / "tiny_session" / "tiny_session_session"
         assert (root / "session_contract.yaml").is_file()
+        assert result["bundle_integrity"] == str(root / "bundle_integrity.json")
+        integrity = json.loads((root / "bundle_integrity.json").read_text())
+        assert integrity["source_closure_verified"] is False
+        assert "session_contract.yaml" in {row["path"] for row in integrity["files"]}
         assert [row["name"] for row in result["programs"]] == ["prefix", "flow", "action"]
         for name in ("prefix", "flow", "action"):
             stage = root / "stages" / name
@@ -143,3 +147,32 @@ def test_driver_rejects_receipt_listed_weight_tamper():
             assert "receipt does not bind weights.safetensors" in str(exc)
         else:
             raise AssertionError("session capture accepted a tampered weight artifact")
+
+
+def test_driver_rejects_root_contract_tamper_after_bundle_receipt():
+    class TamperedSession:
+        def write_bundle(self, out, *, quant=None):
+            assert quant is None
+            from m2m.capture.bundle import write_multi_program_bundle
+
+            summary = write_multi_program_bundle(
+                [{"name": "step", "model": _Step(),
+                  "inputs": (torch.ones(1),), "steps": 1}],
+                {"kind": "test_session", "paper_ready": False,
+                 "stages": ["step"],
+                 "stage_schedule": [{"name": "step", "steps": 1,
+                                     "execution": "compiled", "timed": False}],
+                 "quality_program": "step", "parameters": {}, "states": []},
+                out,
+            )
+            contract = out / "session_contract.yaml"
+            contract.write_text(contract.read_text().replace("test_session", "evil_session"))
+            return summary
+
+    with tempfile.TemporaryDirectory(prefix="m2m-session-root-tamper-") as directory:
+        try:
+            capture._capture_multi_program(TamperedSession(), Path(directory), "bad", None)
+        except ValueError as exc:
+            assert "integrity receipt does not bind session_contract.yaml" in str(exc)
+        else:
+            raise AssertionError("session capture accepted a tampered root contract")

@@ -599,12 +599,18 @@ def write_multi_program_bundle(programs: list[dict], root_session: dict, out: st
     output ordinals are already stable exported ABI values.
     """
     import yaml
+    from m2m.capture.bundle_integrity import _bundle_files, write_bundle_integrity
 
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
+    # Refuse an existing symlink before any stage writer can follow it out of
+    # this directory. The final receipt repeats this check after writing.
+    _bundle_files(out)
     names = [str(program["name"]) for program in programs]
     if not names or len(set(names)) != len(names):
         raise ValueError("multi-program capture needs unique program names")
+    if any(name in {".", ".."} or "\\" in name or Path(name).parts != (name,) for name in names):
+        raise ValueError("multi-program capture needs plain single-component program names")
     if names != [str(value) for value in root_session.get("stages", ())]:
         raise ValueError("program order must exactly equal the root session stages")
     stage_records: dict[str, dict] = {}
@@ -664,6 +670,7 @@ def write_multi_program_bundle(programs: list[dict], root_session: dict, out: st
     }
     (out / "session_contract.yaml").write_text(
         yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+    integrity_path = write_bundle_integrity(out)
     return {"out": str(out), "session_kind": contract["kind"], "paper_ready": contract["paper_ready"],
             "n_programs": len(programs), "programs": summaries,
-            "n_bindings": len(bindings)}
+            "n_bindings": len(bindings), "bundle_integrity": str(integrity_path)}

@@ -49,9 +49,13 @@ internal operation to FP32. The prefix and flow stages retain BF16 operations.
 
 Merlin's separate session capture treats `prefix_encode`, recurrent `flow_denoise`, and
 `action_decode` as separate programs. Capturing or lowering them is not evidence
-of accelerator execution or full-model numerical accuracy. The current stage
-receipts do not establish frontend source closure, and the root session contract
-is not yet covered by a bundle-wide integrity receipt.
+of accelerator execution or full-model numerical accuracy. Stage receipts do
+not establish frontend source closure. New captures made through the generic
+driver include `bundle_integrity.json`, which byte-binds the root session
+contract and all root/stage files, including session artifacts. The driver
+verifies this receipt before reporting capture success. The earlier offline
+capture predates this receipt and is not retroactively certified by it; file
+integrity still does not prove source closure or numerical execution.
 
 PT2E models may store a weight as `i8` while dequantizing it to `bf16` before a
 floating contraction. Such a contraction is **not** an `i8 x i8 -> i32` operation.

@@ -152,6 +152,13 @@ inputs, actual selected-model goldens, `frontend-trace.json`, and merged
 exact bytes, including the trace and its MLIR digest. Lifted constants come from
 the same prepared export used for lowering, not a hidden replacement capture.
 Session and multi-program helpers expose the same trace opt-in.
+For a multi-program session, `write_multi_program_bundle` also writes
+`bundle_integrity.json`: a sorted SHA-256/byte-count inventory of every regular
+file beneath the session root, including `session_contract.yaml`, stage
+receipts, and any root or stage session inputs/goldens. The generic workload
+driver verifies the whole inventory and rejects missing, added, changed, or
+symlinked files before reporting success. This is captured-file integrity,
+not proof of frontend source closure, numerical correctness, or execution.
 
 If a caller has already converted the actual selected model into this same output
 directory, pass `conversion_result=r` to `write_bundle` to reuse it without

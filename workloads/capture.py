@@ -113,6 +113,7 @@ def _capture_multi_program(mdl, model_dir: Path, stem: str, quant) -> dict:
     """Use a loader's generic deferred-session writer and check its stage artifacts."""
     import hashlib
     import yaml
+    from m2m.capture.bundle_integrity import verify_bundle_integrity
     from m2m.coverage import family_histogram, opaque_report
 
     out = model_dir / f"{stem}_session"
@@ -186,15 +187,21 @@ def _capture_multi_program(mdl, model_dir: Path, stem: str, quant) -> dict:
             "families": len(stage_families), "bytes": len(mlir_bytes),
         })
 
+    # Stage receipts do not cover the root contract or stage-level session
+    # trajectories. Require the writer's exact whole-tree byte inventory too.
+    integrity_path = verify_bundle_integrity(out)
+
     return {
         "ok": all(row["opaque"] == 0 for row in stages),
         "opaque": sum(row["opaque"] for row in stages),
         "linalg": sum(row["linalg"] for row in stages),
         "families": len(families),
         "sections": 0, "path": str(out), "bytes": sum(row["bytes"] for row in stages),
-        "session_contract": str(contract_path), "n_programs": len(stages),
+        "session_contract": str(contract_path), "bundle_integrity": str(integrity_path),
+        "n_programs": len(stages),
         "programs": stages,
-        "qualification": "receipt-listed capture artifacts byte-verified; no source-closure or execution proof",
+        "qualification": "stage receipts and whole-bundle file integrity verified; "
+                         "no source-closure or execution proof",
         "source_closure_verified": False,
     }
 

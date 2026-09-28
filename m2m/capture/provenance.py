@@ -36,6 +36,7 @@ def _tool_identity() -> dict:
     sources = (
         "m2m/api.py",
         "m2m/capture/bundle.py",
+        "m2m/capture/bundle_integrity.py",
         "m2m/capture/provenance.py",
         "m2m/capture/trace.py",
         "m2m/capture/torch_mlir_bridge.py",
