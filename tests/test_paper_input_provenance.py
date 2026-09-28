@@ -55,3 +55,25 @@ def test_resnet_requires_v2_preprocessing_and_hashes_inputs_and_weights(tmp_path
     model = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2)).eval()
     assert loader._state_dict_sha256(model) == loader._state_dict_sha256(model)
     assert len(loader._state_dict_sha256(model)) == 64
+
+
+def test_resnet_can_keep_calibration_separate_from_measured_input(tmp_path, monkeypatch):
+    loader = _loader("resnet50_v1_5")
+    measured = torch.zeros((1, 1, 3, 224, 224))
+    corpus = tmp_path / "calibration.npz"
+    np.savez(corpus, images=np.ones((2, 3, 224, 224), np.float32))
+    monkeypatch.setenv("M2M_RESNET_CALIBRATION_NPZ", str(corpus))
+    monkeypatch.setenv("M2M_RESNET_CALIBRATION_SOURCE", "independent/calibration/v1")
+
+    calibration, provenance = loader._calibration_images(measured)
+    assert calibration.shape == (2, 1, 3, 224, 224)
+    assert not torch.equal(calibration[0], measured[0])
+    assert provenance["calibration_source"] == "independent/calibration/v1"
+    assert len(provenance["calibration_sha256"]) == 64
+
+    holder = nn.Module()
+    holder.calibration_images = calibration
+    samples = list(loader.get_calibration_inputs(holder, (measured[0],)))
+    assert len(samples) == 2
+    assert all(len(sample) == 1 and sample[0].shape == (1, 3, 224, 224)
+               for sample in samples)

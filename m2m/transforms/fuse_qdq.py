@@ -89,6 +89,13 @@ def _fuse(module: ModuleOp) -> None:
         )
         deq.attributes["prov.op"] = StringAttr("dequantize")
         deq.attributes["prov.family"] = StringAttr("quantize")
+        from m2m.capture.trace import copy_mlir_sources
+
+        # Both deleted operations survive as explicitly fused origins.
+        copy_mlir_sources(deq, cast, mul, role="lowering")
+        copy_mlir_sources(zero, cast, mul)
+        copy_mlir_sources(zp, cast, mul)
+        copy_mlir_sources(mm, mul, role="lowering")
         # Propagate the int_data/scale model attribute paths (set by the access-subclass
         # decomposition) onto the dequant. xDSL's printer drops attributes on tensor.empty,
         # so the tags can't ride on the elided inner-tensor empties through the text handoff;

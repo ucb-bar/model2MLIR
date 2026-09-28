@@ -39,3 +39,21 @@ def test_weights_externalized_and_recoverable(tmp_path):
     weights = {v["weight"]: v for v in manifest.values() if "weight" in v}
     assert weights["a.weight"]["shape"] == [16, 8]
     assert weights["a.weight"]["kind"] == "param"
+
+
+def test_parameter_free_program_has_a_real_empty_weight_container(tmp_path):
+    from safetensors.torch import load_file
+
+    from m2m.capture.bundle import write_bundle
+    from m2m.capture.provenance import capture_receipt
+
+    class Stateless(nn.Module):
+        def forward(self, x):
+            return x[:, :2] + 1
+
+    write_bundle(Stateless(), (torch.randn(1, 4),), tmp_path,
+                 capture_regions=False, capture_trace=True)
+    assert load_file(str(tmp_path / "weights.safetensors")) == {}
+    receipt = capture_receipt(tmp_path)
+    assert receipt["artifacts"]["weights.safetensors"]["bytes"] > 0
+    assert receipt["materialized_abi"]["complete"] is True

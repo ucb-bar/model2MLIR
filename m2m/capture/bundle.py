@@ -1,8 +1,8 @@
-"""Write a self-contained Merlin capture bundle (mlir + weights + golden + inputs + extra +
+"""Write a self-contained capture bundle (mlir + weights + golden + inputs + extra +
 input_order) from ONE seeded model instance.
 
 Factored out of ``workloads/capture_consistent.py`` so any capture path (per-model loader, or the
-GGUF frontend) produces a byte-compatible bundle for the Merlin RVV runtime. It recovers the two
+GGUF frontend) produces a byte-compatible bundle for downstream compiler runtimes. It recovers the two
 argument classes m2m elides to the runtime — registered buffers and lifted get_attr constants — by
 type, plus quantized subclass inner tensors, exactly as the consistent-capture worker does.
 """
@@ -29,7 +29,8 @@ class _LogitsOnly(nn.Module):
 
 
 def capture_hf_bundle(model_dir, out, *, quant_scheme: str | None = None, seq_len: int = 8,
-                      dtype: "torch.dtype" = torch.float32) -> dict:
+                      dtype: "torch.dtype" = torch.float32, capture_trace: bool = False,
+                      metadata: dict | None = None) -> dict:
     """Capture a HuggingFace causal-LM (local dir or hub id) into a Merlin bundle via the torch path.
 
     ``quant_scheme`` is a torchAO scheme name (e.g. ``"int8_weight_only"``) or ``None`` for fp. This
@@ -46,7 +47,8 @@ def capture_hf_bundle(model_dir, out, *, quant_scheme: str | None = None, seq_le
     if quant_scheme:
         from m2m.capture.torchao_pipeline import QuantizationConfig
         quant = QuantizationConfig(scheme=quant_scheme)
-    summary = write_bundle(model, (input_ids,), out, quant=quant)
+    summary = write_bundle(model, (input_ids,), out, quant=quant,
+                           capture_trace=capture_trace, metadata=metadata)
     summary["hf"] = str(model_dir)
     summary["quant_scheme"] = quant_scheme
     return summary
@@ -71,16 +73,19 @@ def _flatten_subclass(obj: Any, prefix: str, out: dict) -> None:
         out[f"qinner::{prefix}"] = arr
 
 
-def _lifted_constants(mdl, inputs, extra: dict) -> None:
+def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> None:
     """Populate c_lifted_tensor_<i> from m2m's own export (graph order matches the importer)."""
     try:
-        from m2m.capture.torch_export import capture_frontend_artifact
-        from m2m.ir.torchmlir_decomps import torch_mlir_gap_decompositions
         from torch.export.graph_signature import InputKind
 
-        artifact = capture_frontend_artifact(
-            mdl, inputs, export_decomposition_table=torch_mlir_gap_decompositions())
-        ep = artifact.exported_program or artifact.original_exported_program
+        ep = exported_program
+        if ep is None:
+            from m2m.capture.torch_export import capture_frontend_artifact
+            from m2m.ir.torchmlir_decomps import torch_mlir_gap_decompositions
+
+            artifact = capture_frontend_artifact(
+                mdl, inputs, export_decomposition_table=torch_mlir_gap_decompositions())
+            ep = artifact.exported_program or artifact.original_exported_program
         consts = dict(getattr(ep, "constants", {}) or {})
         sd = dict(getattr(ep, "state_dict", {}) or {})
         li = 0
@@ -89,7 +94,7 @@ def _lifted_constants(mdl, inputs, extra: dict) -> None:
                 continue
             val = consts.get(str(spec.target), sd.get(str(spec.target)))
             if val is not None and hasattr(val, "detach"):
-                extra[f"c_lifted_tensor_{li}"] = val.detach().cpu().numpy()
+                extra[f"c_lifted_tensor_{li}"] = _numpy_safe(val)
             li += 1
     except Exception as exc:  # noqa: BLE001
         import traceback
@@ -421,7 +426,10 @@ def _numpy_safe(x):
 
 
 def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: bool = True,
-                 session: dict | None = None, quantization_preapplied: bool = False) -> dict:
+                 session: dict | None = None, quantization_preapplied: bool = False,
+                 source_path: str | Path | None = None, exported_program=None,
+                 capture_trace: bool = False, original_frontend_snapshot: dict | None = None,
+                 metadata: dict | None = None, conversion_result=None) -> dict:
     """Convert ``mdl`` and write the full bundle to ``out``. Returns a summary dict.
 
     ``quant`` is an m2m ``QuantizationConfig`` (or ``None`` for an unquantized/fp bundle). The golden
@@ -430,6 +438,11 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     ``capture_regions`` (default on) additionally records per-region boundary tensors to
     ``region_goldens.npz`` (keyed by the ``prov.fqn`` modules the export tagged) — the shared substrate
     for per-region equivalence + standalone-section profiling. Captured in the SAME golden forward.
+
+    ``capture_trace`` writes byte-bound frontend correspondence beside ``model.mlir``.
+    ``conversion_result`` reuses an existing conversion without exporting again; its
+    weights must already live in this output directory, and the caller must provide
+    the actual selected model (with quantization preapplied when ``quant`` is set).
     """
     import m2m
 
@@ -454,11 +467,64 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
                 "eager_fp32 quality.reference_values trajectory")
 
     weights_path = str(out / "weights.safetensors")
-    r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=quant,
-                    level="linalg-on-tensors", weights_path=weights_path,
-                    quantization_preapplied=quantization_preapplied)
+    eager_output = None
+    if conversion_result is not None:
+        if quant is not None and not quantization_preapplied:
+            raise ValueError("reusing a conversion requires the actual prequantized model")
+        r = conversion_result
+        from xdsl.dialects.builtin import StringAttr
+        weight_attr = r.module.attributes.get("prov.weights_file") if r.module is not None else None
+        if not isinstance(weight_attr, StringAttr) or Path(weight_attr.data).resolve() != Path(weights_path).resolve():
+            raise ValueError("reused conversion weights must be the output bundle's exact weights file")
+    else:
+        if quant is not None and not quantization_preapplied:
+            from m2m.capture.torchao_pipeline import apply_quantization
+            if capture_trace and original_frontend_snapshot is None:
+                original_frontend_snapshot = m2m.capture_frontend_snapshot(mdl, inputs)
+            # PT2E returns a new GraphModule; executing the old mdl would create
+            # a float golden for a quantized compiler payload.
+            mdl = apply_quantization(mdl, quant, example_inputs=inputs,
+                                     original_frontend_snapshot=original_frontend_snapshot)
+            quantization_preapplied = True
+            exported_program = None  # any supplied prequantized export is stale
+        if not capture_regions:
+            # Export can leave Python-side caches holding FakeTensors. Capture
+            # real reference outputs before tracing the selected model, after
+            # any requested quantization has actually been applied.
+            with torch.no_grad():
+                eager_output = mdl(*inputs)
+        r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=quant,
+                        level="linalg-on-tensors", weights_path=weights_path,
+                        quantization_preapplied=quantization_preapplied,
+                        capture_trace=capture_trace,
+                        original_frontend_snapshot=original_frontend_snapshot)
     assert r.ok, "m2m.convert failed"
-    (out / "model.mlir").write_text(r.mlir_text)
+    (out / "model.mlir").write_text(r.mlir_text, encoding="utf-8")
+    trace_pointer = None
+    if capture_trace:
+        import hashlib
+        if r.capture_trace is None:
+            raise ValueError("traced bundle requires a traced conversion result")
+        actual = r.mlir_text.encode("utf-8")
+        if r.capture_trace["mlir"]["sha256"] != hashlib.sha256(actual).hexdigest():
+            raise ValueError("conversion trace does not bind the exact bundle MLIR bytes")
+        trace_path = out / "frontend-trace.json"
+        trace_path.write_text(json.dumps(r.capture_trace, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        trace_pointer = {"path": trace_path.name, "sha256": hashlib.sha256(trace_path.read_bytes()).hexdigest(),
+                         "status": r.capture_trace["status"]}
+        meta_path = out / "meta.json"
+        merged = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        merged.update(metadata or {})
+        merged.update(frontend_trace=trace_pointer)
+        merged.setdefault("ok", r.ok)
+        merged.setdefault("capture_diagnostics", list(r.diagnostics))
+        merged.setdefault("path_taken", r.path_taken)
+        meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    elif metadata is not None:
+        meta_path = out / "meta.json"
+        merged = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        merged.update(metadata)
+        meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     n_regions = 0
     if capture_regions:
@@ -467,6 +533,8 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         if region_goldens:
             np.savez(out / "region_goldens.npz", **region_goldens)
         n_regions = len({k.split("::", 1)[0] for k in region_goldens})
+    elif eager_output is not None:
+        g = eager_output
     else:
         with torch.no_grad():
             g = mdl(*inputs)
@@ -482,7 +550,8 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     for pname, p in mdl.named_parameters():
         if type(p).__name__ not in ("Parameter", "Tensor") or hasattr(p, "__tensor_flatten__"):
             _flatten_subclass(p, pname, extra)
-    _lifted_constants(mdl, inputs, extra)
+    _lifted_constants(mdl, inputs, extra,
+                      exported_program=r.exported_program if r.exported_program is not None else exported_program)
     np.savez(out / "extra.npz", **extra)
 
     man = json.loads(Path(weights_path + ".manifest.json").read_text())
@@ -503,6 +572,10 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
             mdl, inputs, out, manifest=man, input_order=order, session=session,
             quality_reference=quality_reference)
 
+    from m2m.capture.provenance import write_capture_receipt
+
+    write_capture_receipt(out, source_path=source_path)
+
     return {
         "out": str(out), "n_inputs": len(inputs),
         "n_buffers": sum(1 for kk in extra if kk.startswith("buf::")),
@@ -510,11 +583,14 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         "n_qinner": sum(1 for kk in extra if kk.startswith("qinner::")),
         "golden_shape": list(golden.shape), "linalg": r.mlir_text.count("linalg."),
         "input_order": order, "n_regions": n_regions, **session_summary,
+        **({"frontend_trace": trace_pointer} if trace_pointer is not None else {}),
     }
 
 
 def write_multi_program_bundle(programs: list[dict], root_session: dict, out: str | Path, *,
-                               quant=None, quantization_preapplied: bool = False) -> dict:
+                               quant=None, quantization_preapplied: bool = False,
+                               capture_trace: bool = False, source_path: str | Path | None = None,
+                               metadata: dict | None = None) -> dict:
     """Write several fixed-shape compiled programs plus an ABI-resolved root session contract.
 
     Loader-authored bindings use stable tuple ``input_index`` values.  Each stage conversion can
@@ -539,7 +615,10 @@ def write_multi_program_bundle(programs: list[dict], root_session: dict, out: st
         summary = write_bundle(
             program["model"], tuple(program["inputs"]), stage_out, quant=quant,
             capture_regions=bool(program.get("capture_regions", False)),
-            session=program.get("session"), quantization_preapplied=quantization_preapplied)
+            session=program.get("session"), quantization_preapplied=quantization_preapplied,
+            capture_trace=capture_trace, source_path=source_path,
+            metadata={**(metadata or {}), **program.get("metadata", {})},
+            original_frontend_snapshot=program.get("original_frontend_snapshot"))
         manifest = json.loads((stage_out / "weights.safetensors.manifest.json").read_text())
         input_order = json.loads((stage_out / "input_order.json").read_text())
         stage_records[name] = {

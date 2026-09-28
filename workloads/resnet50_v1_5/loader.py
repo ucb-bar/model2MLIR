@@ -93,10 +93,45 @@ def _images() -> tuple[torch.Tensor, dict, bool]:
     return images, provenance, False
 
 
+def _calibration_images(measured_images: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    """Return a calibration stream distinct from the measured benchmark input.
+
+    ``M2M_RESNET_CALIBRATION_NPZ`` is optional so existing workload use remains
+    unchanged.  When present it is deliberately loaded independently of
+    ``M2M_RESNET_INPUT_NPZ``; a benchmark can therefore prove that its measured
+    sample was not also used as its calibration corpus.
+    """
+    source = os.environ.get("M2M_RESNET_CALIBRATION_NPZ", "")
+    if not source:
+        return measured_images, {"calibration_source": "measured_session_stream"}
+    source_path = Path(source).expanduser().resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"M2M_RESNET_CALIBRATION_NPZ is absent: {source_path}")
+    with np.load(source_path) as data:
+        key = "images" if "images" in data.files else data.files[0]
+        images = np.ascontiguousarray(data[key], dtype=np.float32)
+    if images.ndim == 4:
+        images = images[:, None, :, :, :]
+    if images.ndim != 5 or list(images.shape[1:]) != [1, 3, 224, 224]:
+        raise RuntimeError(
+            "M2M_RESNET_CALIBRATION_NPZ must contain "
+            "[steps,1,3,224,224] or [steps,3,224,224] images")
+    if images.shape[0] < 1 or not np.all(np.isfinite(images)):
+        raise RuntimeError("ResNet calibration stream is empty or contains non-finite values")
+    return torch.from_numpy(images), {
+        "calibration_source": os.environ.get(
+            "M2M_RESNET_CALIBRATION_SOURCE", "unattributed_external_npz"),
+        "calibration_path": str(source_path),
+        "calibration_sha256": _sha256(source_path),
+        "calibration_samples_available": int(images.shape[0]),
+    }
+
+
 def get_model_and_inputs() -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
     from torchvision.models import ResNet50_Weights, resnet50
 
     images, input_provenance, inputs_ready = _images()
+    calibration_images, calibration_provenance = _calibration_images(images)
     requested_ready = os.environ.get("M2M_RESNET_PAPER_READY", "0") == "1"
     random_model = os.environ.get("M2M_RESNET_RANDOM") == "1" and os.environ.get(
         "M2M_RESNET_PRETRAINED", "1") == "0"
@@ -112,9 +147,19 @@ def get_model_and_inputs() -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
     }
     wrapper = _Classifier(
         model, paper_ready=bool(requested_ready and weights is not None and inputs_ready),
-        provenance={**checkpoint_provenance, **input_provenance}).eval()
+        provenance={**checkpoint_provenance, **input_provenance,
+                    **calibration_provenance}).eval()
     wrapper.session_images = images
+    wrapper.calibration_images = calibration_images
     return wrapper, (images[0],)
+
+
+def get_calibration_inputs(model: nn.Module, _inputs: tuple[torch.Tensor, ...]):
+    """Yield the loader-declared calibration corpus as positional input tuples."""
+    images = getattr(model, "calibration_images", None)
+    if not isinstance(images, torch.Tensor) or images.shape[0] < 1:
+        raise RuntimeError("ResNet calibration stream was not attached by the loader")
+    return ((images[i],) for i in range(int(images.shape[0])))
 
 
 def get_session_spec(model: nn.Module, _inputs: tuple[torch.Tensor, ...]) -> dict:

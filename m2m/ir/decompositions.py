@@ -2271,10 +2271,16 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
 
 
 def _try_direct_conv2d(operands, meta, in_shape, w_shape):
-    """2-D conv as a single linalg.generic contraction (groups=1, no padding, dilation 1).
+    """2-D conv as one linalg.generic contraction, including grouped convolution.
 
     out[n,f,oh,ow] = sum_{ci,kh,kw} in[n,ci, oh*sh+kh, ow*sw+kw] * w[f,ci,kh,kw] (+ bias).
     Returns a DecompResult or None (caller -> im2col path). Verify-fallback covers mistakes.
+
+    For ``groups > 1`` the contraction's temporary result is ``[N,G,F/G,OH,OW]``.
+    Keeping group and within-group output channel as separate parallel dimensions makes the
+    output map an identity and keeps every input/weight access affine; a collapse_shape then
+    restores NCHW without moving bytes.  This is the direct counterpart of the grouped
+    batch-matmul path, but it never materializes the ``[G,C/G,KH,KW,N,OH,OW]`` im2col tensor.
     """
     val: Any = meta.get("val")
     if val is None or not hasattr(val, "shape"):
@@ -2286,12 +2292,28 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
     padding = _fx_arg(meta, 4, [0, 0]) or [0, 0]
     dilation = _fx_arg(meta, 5, [1, 1]) or [1, 1]
     transposed = _fx_arg(meta, 6, False)
-    groups = _fx_arg(meta, 8, 1)
-    if transposed or int(groups or 1) != 1:
+    groups = int(_fx_arg(meta, 8, 1) or 1)
+    if transposed or groups < 1:
         return None
-    if any(int(p) != 0 for p in padding) or any(int(d) != 1 for d in dilation):
+    if any(int(p) < 0 for p in padding):
         return None
     sh, sw = (int(stride[0]), int(stride[1])) if isinstance(stride, (list, tuple)) else (int(stride), int(stride))
+    ph, pw = int(padding[0]), int(padding[1])
+    dh, dw = ((int(dilation[0]), int(dilation[1]))
+              if isinstance(dilation, (list, tuple))
+              else (int(dilation), int(dilation)))
+    if min(sh, sw) < 1 or len(in_shape) != 4 or len(w_shape) != 4:
+        return None
+    n_in, c_in, h_in, w_in = (int(x) for x in in_shape)
+    f_out, c_per_g, kh, kw = (int(x) for x in w_shape)
+    n_out, f_chk, h_out, w_out = (int(x) for x in out_shape)
+    if min(dh, dw) < 1 or c_in % groups or f_out % groups:
+        return None
+    if (in_shape[0] != out_shape[0] or w_shape[0] != out_shape[1]
+            or c_per_g != c_in // groups
+            or (h_in + 2 * ph - dh * (kh - 1) - 1) // sh + 1 != h_out
+            or (w_in + 2 * pw - dw * (kw - 1) - 1) // sw + 1 != w_out):
+        return None
     elem = _t_elem(operands[0])
     if _t_elem(operands[1]) != elem:
         return None
@@ -2304,13 +2326,19 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
     from xdsl.ir.affine import AffineExpr, AffineMap
 
     inp, w = operands[0], operands[1]
+    pad_ops: list[Operation] = []
+    if ph or pw:
+        # Only pad the activation, never materialize its kh*kw-expanded im2col tensor.
+        # The im2col path performs the same padding; its size limit must not remove support
+        # for padded convolutions when it selects this direct fallback.
+        padded = _zero_pad_ops(inp, elem, list(in_shape),
+                               [(0, 0), (0, 0), (ph, ph), (pw, pw)])
+        if padded is None:
+            return None
+        pad_ops, inp, _padded_shape = padded
     result_type = TensorType(elem, out_shape)
     zero = ConstantOp(FloatAttr(0.0, elem), elem)
-    init = SplatOp(zero.result, [], result_type)
-    D = AffineExpr.dimension  # dims: n=0,f=1,oh=2,ow=3,ci=4,kh=5,kw=6
-    in_map = AffineMap(7, 0, (D(0), D(4), D(2) * sh + D(5), D(3) * sw + D(6)))
-    w_map = AffineMap(7, 0, (D(1), D(4), D(5), D(6)))
-    out_map = AffineMap(7, 0, (D(0), D(1), D(2), D(3)))
+    D = AffineExpr.dimension
     blk = Block(arg_types=[elem, elem, elem])
     prod = MulfOp(blk.args[0], blk.args[1])
     acc = AddfOp(blk.args[2], prod.results[0])
@@ -2318,16 +2346,49 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
     blk.add_op(acc)
     blk.add_op(YieldOp(acc.results[0]))
     par, red = IteratorType.PARALLEL, IteratorType.REDUCTION
-    gen = GenericOp(
-        inputs=[inp, w],
-        outputs=[init.results[0]],
-        body=Region(blk),
-        indexing_maps=[AffineMapAttr(in_map), AffineMapAttr(w_map), AffineMapAttr(out_map)],
-        iterator_types=[IteratorTypeAttr(par)] * 4 + [IteratorTypeAttr(red)] * 3,
-        result_types=[result_type],
-    )
-    ops: list[Operation] = [zero, init, gen]
-    res = gen.results[0]
+    if groups == 1:
+        # dims: n=0,f=1,oh=2,ow=3,ci=4,kh=5,kw=6
+        init = SplatOp(zero.result, [], result_type)
+        in_map = AffineMap(7, 0, (
+            D(0), D(4), D(2) * sh + D(5) * dh, D(3) * sw + D(6) * dw))
+        w_map = AffineMap(7, 0, (D(1), D(4), D(5), D(6)))
+        out_map = AffineMap(7, 0, (D(0), D(1), D(2), D(3)))
+        gen = GenericOp(
+            inputs=[inp, w],
+            outputs=[init.results[0]],
+            body=Region(blk),
+            indexing_maps=[AffineMapAttr(in_map), AffineMapAttr(w_map), AffineMapAttr(out_map)],
+            iterator_types=[IteratorTypeAttr(par)] * 4 + [IteratorTypeAttr(red)] * 3,
+            result_types=[result_type],
+        )
+        ops: list[Operation] = [*pad_ops, zero, init, gen]
+        res = gen.results[0]
+    else:
+        # dims: n=0,g=1,fg=2,oh=3,ow=4,cg=5,kh=6,kw=7
+        # The temporary's [G,F/G] axes are adjacent, so collapsing them to F is a view.
+        f_per_g = f_out // groups
+        grouped_shape = [n_out, groups, f_per_g, h_out, w_out]
+        grouped_type = TensorType(elem, grouped_shape)
+        init = SplatOp(zero.result, [], grouped_type)
+        in_map = AffineMap(8, 0, (
+            D(0), D(1) * c_per_g + D(5),
+            D(3) * sh + D(6) * dh, D(4) * sw + D(7) * dw))
+        w_map = AffineMap(8, 0, (
+            D(1) * f_per_g + D(2), D(5), D(6), D(7)))
+        out_map = AffineMap(8, 0, (D(0), D(1), D(2), D(3), D(4)))
+        gen = GenericOp(
+            inputs=[inp, w],
+            outputs=[init.results[0]],
+            body=Region(blk),
+            indexing_maps=[AffineMapAttr(in_map), AffineMapAttr(w_map), AffineMapAttr(out_map)],
+            iterator_types=[IteratorTypeAttr(par)] * 5 + [IteratorTypeAttr(red)] * 3,
+            result_types=[grouped_type],
+        )
+        collapsed = _emit_reshape(gen.results[0], out_shape, elem)
+        if collapsed is None:
+            return None
+        ops = [*pad_ops, zero, init, gen, *collapsed[0]]
+        res = collapsed[1]
     rid = _next_region_id("conv")
     # optional bias [F] over [N,F,Ho,Wo]
     if len(operands) >= 3 and isinstance(operands[2].type, TensorType):
@@ -2635,17 +2696,41 @@ def decompose_convolution(operands, meta, node_name):
         ops += t_ops
         stride, padding, output_padding = [1, 1], [0, 0], [0, 0]
 
-    built = _conv_im2col_matmul(
-        cur_in, cur_w, bias_v, in_shape=in_shape, w_shape=w_shape, out_shape=out_shape,
-        stride=stride, padding=padding, dilation=dilation, groups=groups, elem=elem)
-    conv_path = "im2col_matmul"
-    if built is None:
-        # Memory-bounded or unhandled: the fused direct contraction is still correct IR.
+    import os
+
+    lowering = os.environ.get("M2M_CONV_LOWERING", "auto").strip().lower()
+    if lowering not in {"auto", "direct", "grouped_direct", "im2col"}:
+        raise ValueError(
+            "M2M_CONV_LOWERING must be auto/direct/grouped_direct/im2col, "
+            f"got {lowering!r}"
+        )
+
+    def _direct():
         m = dict(meta)
+        # Normalize both aten.conv2d and aten.convolution to convolution's
+        # complete positional layout for the direct helper.
         m["_fx_args"] = (cur_in, cur_w, bias_v, stride, padding, dilation, False,
                          output_padding, groups)
-        direct = _try_direct_conv2d([cur_in, cur_w] + ([bias_v] if bias_v is not None else []),
-                                    m, in_shape, w_shape)
+        return _try_direct_conv2d(
+            [cur_in, cur_w] + ([bias_v] if bias_v is not None else []),
+            m,
+            in_shape,
+            w_shape,
+        )
+
+    direct = (_direct() if (lowering == "direct"
+                            or (lowering == "grouped_direct" and groups > 1))
+              else None)
+    built = None if direct is not None else _conv_im2col_matmul(
+        cur_in, cur_w, bias_v, in_shape=in_shape, w_shape=w_shape, out_shape=out_shape,
+        stride=stride, padding=padding, dilation=dilation, groups=groups, elem=elem)
+    conv_path = "direct_contraction" if direct is not None else "im2col_matmul"
+    if direct is not None:
+        ops += direct.ops
+        res = direct.result
+    elif built is None:
+        # Memory-bounded or unhandled: the fused direct contraction is still correct IR.
+        direct = _direct()
         if direct is None:
             return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
                                   pattern_hint="convolution")
@@ -2672,7 +2757,8 @@ def decompose_convolution(operands, meta, node_name):
         op.attributes["prov.family"] = StringAttr("conv")
         op.attributes["prov.conv_path"] = StringAttr(conv_path)
     return DecompResult(ops=ops, result=res, region_ids=[rid],
-                        pattern_hint="convolution_im2col_matmul")
+                        pattern_hint=("conv2d" if conv_path == "direct_contraction"
+                                      else "convolution_im2col_matmul"))
 
 
 # ---------------------------------------------------------------------------
@@ -3837,6 +3923,46 @@ def decompose_view(operands, meta, node_name):
     return _reshape_decomp(operands, meta, node_name, hint="view", prefix="view")
 
 
+def decompose_as_strided_identity(operands, meta, node_name):
+    """Forward an as_strided view only when it has identical element mapping.
+
+    Arbitrary strides can alias/reorder elements and cannot be represented by
+    forwarding a value-semantics MLIR tensor.  This narrow case removes a
+    real exported-model identity view without claiming general as_strided
+    support; all other geometries remain opaque for the coverage gate.
+    """
+    source = _fx_arg(meta, 0)
+    source_value = getattr(source, "meta", {}).get("val")
+    size = _fx_arg(meta, 1)
+    strides = _fx_arg(meta, 2)
+    offset = _fx_arg(meta, 3, None)
+    if operands and source_value is not None and isinstance(size, (tuple, list)) and isinstance(strides, (tuple, list)):
+        try:
+            source_shape = tuple(int(x) for x in source_value.shape)
+            source_strides = tuple(int(x) for x in source_value.stride())
+            source_offset = int(source_value.storage_offset())
+            requested_shape = tuple(int(x) for x in size)
+            requested_strides = tuple(int(x) for x in strides)
+            requested_offset = source_offset if offset is None else int(offset)
+            result_shape = tuple(int(x) for x in meta["val"].shape)
+            if (
+                requested_shape == source_shape == result_shape
+                and len(requested_strides) == len(source_strides)
+                and all(
+                    extent == 1 or requested == original
+                    for extent, requested, original in zip(
+                        requested_shape, requested_strides, source_strides
+                    )
+                )
+                and requested_offset == source_offset
+                and operands[0].type == TensorType(_element_type_from_meta(meta), requested_shape)
+            ):
+                return DecompResult(ops=[], result=operands[0], pattern_hint="as_strided_identity")
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
+
+
 def decompose_unsqueeze(operands, meta, node_name):
     """aten.unsqueeze.default(input, dim) -> tensor.reshape inserting a size-1 dim."""
     return _reshape_decomp(operands, meta, node_name, hint="unsqueeze", prefix="unsqueeze")
@@ -3951,6 +4077,35 @@ def decompose_split_with_sizes(operands, meta, node_name):
         results.append(op.results[0])
         off += sz
     return DecompResult(ops=ops, result=results[0], results=results, region_ids=[rid], pattern_hint="split")
+
+
+def decompose_split_tensor(operands, meta, node_name):
+    """aten.split.Tensor(input, chunk_size, dim) via the validated multi-slice writer."""
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+    shape = _shape_of(operands[0])
+    pieces = meta.get("val")
+    chunk = _fx_arg(meta, 1, None)
+    raw_dim = _fx_arg(meta, 2, 0)
+    if (shape is None or not shape or any(d < 0 for d in shape)
+            or not isinstance(chunk, int) or isinstance(chunk, bool) or chunk <= 0
+            or not isinstance(raw_dim, int) or isinstance(raw_dim, bool)
+            or not isinstance(pieces, (tuple, list)) or not pieces):
+        return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+    dim = raw_dim % len(shape)
+    sizes = []
+    for piece in pieces:
+        part_shape = _static_shape(getattr(piece, "shape", []))
+        if len(part_shape) != len(shape) or any(
+            part_shape[axis] != extent for axis, extent in enumerate(shape) if axis != dim
+        ):
+            return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+        sizes.append(part_shape[dim])
+    if sum(sizes) != shape[dim] or any(size != chunk for size in sizes[:-1]) or not 0 <= sizes[-1] <= chunk:
+        return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+    sliced_meta = dict(meta)
+    sliced_meta["_fx_args"] = (None, sizes, dim)
+    return decompose_split_with_sizes(operands, sliced_meta, node_name)
 
 
 def decompose_unbind(operands, meta, node_name):
@@ -4522,6 +4677,24 @@ def decompose_bucketize(operands, meta, node_name):
 
     right = bool(meta.get("_fx_kwargs", {}).get("right", False) or _fx_arg(meta, 3, False))
     in_elem = x.type.element_type
+    boundary_elem = bnd.type.element_type
+    comparison_elem = in_elem
+    if boundary_elem != in_elem:
+        # bucketize promotes the two search operands, not its integer result.
+        # Preserve each linalg block argument's actual operand type and cast
+        # scalars to PyTorch's common comparison dtype inside the body.
+        from types import SimpleNamespace
+
+        import torch
+
+        values = [getattr(_fx_arg(meta, index), "meta", {}).get("val") for index in (0, 1)]
+        if any(not isinstance(value, torch.Tensor) for value in values) or any(
+            _element_type_from_meta({"val": value}) != operand.type.element_type
+            for value, operand in zip(values, (x, bnd), strict=True)
+        ):
+            return _opaque_decomp("aten_bucketize", operands[:2], meta, "search", pattern_hint="bucketize")
+        dtype = torch.promote_types(values[0].dtype, values[1].dtype)
+        comparison_elem = _element_type_from_meta({"val": SimpleNamespace(dtype=dtype)})
     out_elem = _element_type_from_meta(meta)
     if not isinstance(out_elem, IntegerType):
         out_elem = IntegerType(64)
@@ -4536,12 +4709,15 @@ def decompose_bucketize(operands, meta, node_name):
     bnd_map = AffineMap(rank + 1, 0, (AffineExpr.dimension(rank),))
     out_map = in_map
 
-    is_int = isinstance(in_elem, IntegerType)
+    is_int = isinstance(comparison_elem, IntegerType)
     # predicate: boundaries[b] < input (right=False) or <= input (right=True)
     pred_kind = ("sle" if right else "slt") if is_int else ("ole" if right else "olt")
-    blk = Block(arg_types=[in_elem, in_elem, out_elem])
-    pred = CmpiOp(blk.args[1], blk.args[0], pred_kind) if is_int \
-        else CmpfOp(blk.args[1], blk.args[0], pred_kind)   # arg0=input, arg1=boundary
+    blk = Block(arg_types=[in_elem, boundary_elem, out_elem])
+    x_casts, x_value = _cast_scalar_arg(blk.args[0], comparison_elem)
+    b_casts, b_value = _cast_scalar_arg(blk.args[1], comparison_elem)
+    blk.add_ops([*x_casts, *b_casts])
+    pred = CmpiOp(b_value, x_value, pred_kind) if is_int \
+        else CmpfOp(b_value, x_value, pred_kind)   # arg0=input, arg1=boundary
     inc = SelectOp(pred.results[0], one.result, zero.result)
     acc = AddiOp(blk.args[2], inc.results[0])
     for op in (pred, inc, acc):
@@ -5221,6 +5397,40 @@ def _torch_dtype_tag(val: Any) -> str:
     return str(val.dtype).replace("torch.", "")
 
 
+def _pt2e_per_tensor_operands(operands, meta):
+    """Return input/scale/zero-point SSA values for a PT2E per-tensor Q/DQ op.
+
+    PT2E encodes calibrated activation qparams as Python scalar arguments, not
+    graph nodes.  The old importer consequently saw only the input operand and
+    emitted an opaque external call.  Materialize those literals as rank-0
+    tensors here; get_attr/tensor qparams continue to use their original SSA.
+    """
+    from xdsl.dialects.builtin import Float32Type, IntegerType
+
+    by_position = meta.get("_fx_ssa_args") or {}
+    built_ops: list[Operation] = []
+    resolved = []
+    for index, typ in ((0, None), (1, TensorType(Float32Type(), [])),
+                       (2, TensorType(IntegerType(64), []))):
+        value = by_position.get(index)
+        if value is None and index < len(operands) and not by_position:
+            # Direct decomposition unit tests predate positional SSA metadata.
+            value = operands[index]
+        if value is None and typ is not None:
+            raw = _fx_arg(meta, index)
+            if not isinstance(raw, (int, float)):
+                raise IndexError(f"PT2E qparam argument {index} is not materializable: {raw!r}")
+            made = _splat_scalar(raw, typ)
+            if made is None:
+                raise TypeError(f"could not materialize PT2E qparam argument {index}")
+            built_ops.extend(made[0])
+            value = made[1]
+        if value is None:
+            raise IndexError(f"missing PT2E Q/DQ operand at argument {index}")
+        resolved.append(value)
+    return built_ops, resolved
+
+
 def decompose_quantize_per_tensor(operands, meta, node_name):
     """torch.ops.quantized_decomposed.quantize_per_tensor.default.
 
@@ -5234,13 +5444,7 @@ def decompose_quantize_per_tensor(operands, meta, node_name):
     elem = _element_type_from_meta(meta)
     result_type = TensorType(elem, _static_shape(val.shape))
 
-    # Require at least input + scale + zero_point as SSA operands. In
-    # the real FX path these all exist; in unit tests the caller passes
-    # three tensor placeholders which we accept as-is.
-    if len(operands) < 3:
-        raise IndexError(
-            f"decompose_quantize_per_tensor expects input + scale + zero_point (3 operands), got {len(operands)}"
-        )
+    qparam_ops, qoperands = _pt2e_per_tensor_operands(operands, meta)
 
     properties: dict[str, Any] = {}
     qmin = _fx_arg(meta, 3)
@@ -5255,13 +5459,13 @@ def decompose_quantize_per_tensor(operands, meta, node_name):
 
     rid = _next_region_id("quantize")
     op = QuantizePerTensorOp(
-        operands=[operands[0], operands[1], operands[2]],
+        operands=qoperands,
         result_types=[result_type],
         properties=properties,
     )
     _attach_region_id(op, rid)
     return DecompResult(
-        ops=[op],
+        ops=[*qparam_ops, op],
         result=op.results[0],
         region_ids=[rid],
         pattern_hint="quantize_per_tensor",
@@ -5276,8 +5480,7 @@ def decompose_dequantize_per_tensor(operands, meta, node_name):
     elem = _element_type_from_meta(meta)
     result_type = TensorType(elem, _static_shape(val.shape))
 
-    if len(operands) < 3:
-        raise IndexError(f"decompose_dequantize_per_tensor expects input + scale + zero_point, got {len(operands)}")
+    qparam_ops, qoperands = _pt2e_per_tensor_operands(operands, meta)
 
     properties: dict[str, Any] = {}
     qmin = _fx_arg(meta, 3)
@@ -5289,13 +5492,13 @@ def decompose_dequantize_per_tensor(operands, meta, node_name):
 
     rid = _next_region_id("dequantize")
     op = DequantizePerTensorOp(
-        operands=[operands[0], operands[1], operands[2]],
+        operands=qoperands,
         result_types=[result_type],
         properties=properties,
     )
     _attach_region_id(op, rid)
     return DecompResult(
-        ops=[op],
+        ops=[*qparam_ops, op],
         result=op.results[0],
         region_ids=[rid],
         pattern_hint="dequantize_per_tensor",
@@ -5733,6 +5936,29 @@ def decompose_where_scalar(operands, meta, node_name):
     return _opaque_decomp("aten_where", operands[:1], meta, "select", pattern_hint="where")
 
 
+def decompose_where_scalar_other(operands, meta, node_name):
+    """aten.where.ScalarOther(condition, tensor, scalar) -> typed pointwise select."""
+    from xdsl.dialects.arith import ConstantOp, SelectOp
+    from xdsl.dialects.builtin import FloatAttr, IntegerAttr, IntegerType
+
+    other = _fx_arg(meta, 2, None)
+    if len(operands) < 2 or not isinstance(other, (bool, int, float)):
+        return _opaque_decomp("aten_where", operands[:2], meta, "select", pattern_hint="where")
+
+    def build(args, out_elem):
+        cast_ops, value = _cast_scalar_arg(args[1], out_elem)
+        attr = (IntegerAttr(int(other), out_elem) if isinstance(out_elem, IntegerType)
+                else FloatAttr(float(other), out_elem))
+        scalar = ConstantOp(attr, out_elem)
+        selected = SelectOp(args[0], value, scalar.results[0])
+        return [*cast_ops, scalar, selected], selected.results[0]
+
+    real = _pointwise(operands[:2], meta, build, family="select")
+    return real if real is not None else _opaque_decomp(
+        "aten_where", operands[:2], meta, "select", pattern_hint="where"
+    )
+
+
 def decompose_ones(operands, meta, node_name):
     """aten.ones[.default](size, ...) -> splat of 1 (family fill)."""
     val: Any = meta["val"]
@@ -6082,6 +6308,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.expand.default": decompose_expand,
     "aten.cat.default": decompose_cat,
     "aten.split_with_sizes.default": decompose_split_with_sizes,
+    "aten.split.Tensor": decompose_split_tensor,
     "aten.clone.default": decompose_clone,
     # production-readiness fill-ins:
     "aten.contiguous.default": decompose_contiguous,
@@ -6130,8 +6357,10 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.__and__.Tensor": decompose_bitwise_and,
     "aten.arange.start": decompose_arange,            # arange(start, end)
     "aten.ones.default": decompose_ones,
+    "aten.new_ones.default": decompose_ones,
     "aten.linspace.default": decompose_linspace,
     "aten.where.Scalar": decompose_where_scalar,
+    "aten.where.ScalarOther": decompose_where_scalar_other,
     "aten.conv2d.padding": decompose_conv2d_padding,
     "aten.where.self": decompose_where_self,
     "aten.scalar_tensor.default": decompose_scalar_tensor,
@@ -6195,6 +6424,7 @@ DECOMPOSITION_TABLE.update(
         "aten.any.default": decompose_any_real,
         "aten.any.dims": decompose_any_real,
         "aten.reshape.default": decompose_view,
+        "aten.as_strided.default": decompose_as_strided_identity,
         "aten._unsafe_view.default": decompose_view,
         "aten.sum.dim_IntList": decompose_sum_dim,
         "aten.reciprocal.default": decompose_reciprocal,

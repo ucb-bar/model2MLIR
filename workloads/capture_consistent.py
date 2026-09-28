@@ -170,6 +170,10 @@ def _bundle(model: str, fmt: str, out: Path) -> None:
             session_summary = write_session_artifacts(
                 mdl, inputs, out, manifest=man, input_order=order, session=session)
 
+    from m2m.capture.provenance import write_capture_receipt
+
+    write_capture_receipt(out, source_path=WORKLOADS / model / "loader.py")
+
     print("__BUNDLE_OK__ " + json.dumps({
         "model": model, "fmt": fmt, "out": str(out), "n_inputs": len(inputs),
         "n_buffers": sum(1 for k in extra if k.startswith("buf::")),

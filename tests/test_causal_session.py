@@ -27,6 +27,23 @@ def test_fixed_cache_prefill_is_functional_and_exports_fixed_capacity_state():
     assert len(exported.graph_signature.output_specs) == 3
 
 
+def test_actual_causal_bundle_materializes_real_goldens_before_cache_export(tmp_path):
+    from m2m.capture.bundle import write_multi_program_bundle
+    from m2m.capture.provenance import capture_receipt
+
+    capture = CausalMultiProgramCapture(
+        _tiny_llama(), torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long),
+        checkpoint="unit/tiny", full_checkpoint=False, paper_ready=False,
+        provenance={}, prefill_tokens=4, decode_tokens=2)
+    session = external_runtime_session(capture, ())
+    write_multi_program_bundle(session.bundle_programs(), dict(session.metadata), tmp_path,
+                               capture_trace=True)
+    for name in ("prefill", "decode"):
+        stage = tmp_path / "stages" / name
+        assert np.isfinite(np.load(stage / "golden.npy")).all()
+        assert capture_receipt(stage)["materialized_abi"]["complete"]
+
+
 def _tiny_llama():
     transformers = pytest.importorskip("transformers")
     config = transformers.LlamaConfig(
