@@ -9,7 +9,7 @@ Because models need conflicting torch/transformers/torchao versions, each gets a
 venv (default ``workloads/<model>/.venv``). This driver:
   1. ensures that venv exists (creates it + installs deps from capture.toml, idempotent);
   2. runs the capture INSIDE that venv (subprocess) for each requested datatype/level;
-  3. writes ``<model>{,_int8,_fp8}.mlir`` and asserts 0 opaque ops;
+  3. writes a single MLIR or a loader-authored multi-program session bundle, and checks 0 opaque ops;
   4. prints a summary.
 
 Usage:
@@ -109,8 +109,98 @@ def _quant_for(cfg: dict, fmt: str):
     return QuantizationConfig(scheme=scheme) if scheme else None
 
 
+def _capture_multi_program(mdl, model_dir: Path, stem: str, quant) -> dict:
+    """Use a loader's generic deferred-session writer and check its stage artifacts."""
+    import hashlib
+    import yaml
+    from m2m.coverage import family_histogram, opaque_report
+
+    out = model_dir / f"{stem}_session"
+    if out.is_symlink() or (out.exists() and any(path.is_symlink() for path in out.rglob("*"))):
+        raise ValueError("multi-program output already contains a symlink")
+    summary = mdl.write_bundle(out, quant=quant)
+    if not isinstance(summary, dict) or summary.get("out") != str(out):
+        raise ValueError("multi-program writer did not return its exact output directory")
+    contract_path = out / "session_contract.yaml"
+    if out.is_symlink() or contract_path.is_symlink():
+        raise ValueError("multi-program output or session contract is a symlink")
+    if not contract_path.is_file():
+        raise ValueError("multi-program writer omitted session_contract.yaml")
+    contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+    programs = contract.get("programs", ()) if isinstance(contract, dict) else ()
+    names = [str(row.get("name")) for row in programs if isinstance(row, dict)]
+    if (not names or len(names) != len(programs) or len(set(names)) != len(names)
+            or names != [str(name) for name in contract.get("stages", ())]
+            or len(names) != summary.get("n_programs")):
+        raise ValueError("multi-program writer returned an inconsistent stage roster")
+
+    stages = []
+    families = set()
+    for row in programs:
+        relative = Path(str(row.get("bundle", "")))
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise ValueError(f"multi-program stage {row['name']} has an unsafe bundle path")
+        for index in range(1, len(relative.parts) + 1):
+            if (out / Path(*relative.parts[:index])).is_symlink():
+                raise ValueError(f"multi-program stage {row['name']} bundle path contains a symlink")
+        stage = out / relative
+        receipt_path = stage / "capture_receipt.json"
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            raise ValueError(f"multi-program stage {row['name']} omitted a plain capture receipt")
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        artifacts = receipt.get("artifacts") if isinstance(receipt, dict) else None
+        required = {"model.mlir", "weights.safetensors",
+                    "weights.safetensors.manifest.json", "inputs.npz",
+                    "golden.npy", "extra.npz", "input_order.json"}
+        if (not isinstance(receipt, dict)
+                or receipt.get("schema") != "m2m.capture-receipt.v1"
+                or not isinstance(artifacts, dict) or not required.issubset(artifacts)):
+            raise ValueError(f"multi-program stage {row['name']} has an incomplete capture receipt")
+        for name, record in artifacts.items():
+            if (not isinstance(name, str) or name in {".", ".."}
+                    or Path(name).parts != (name,)):
+                raise ValueError(f"multi-program stage {row['name']} has an unsafe receipt artifact name")
+            artifact = stage / name
+            if artifact.is_symlink() or not artifact.is_file():
+                raise ValueError(f"multi-program stage {row['name']} omitted plain artifact {name}")
+            if not isinstance(record, dict) or type(record.get("bytes")) is not int:
+                raise ValueError(f"multi-program stage {row['name']} has malformed receipt for {name}")
+            digest = hashlib.sha256()
+            with artifact.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if (record["bytes"] != artifact.stat().st_size
+                    or record.get("sha256") != digest.hexdigest()):
+                raise ValueError(f"multi-program stage {row['name']} receipt does not bind {name}")
+        mlir_bytes = (stage / "model.mlir").read_bytes()
+        if not mlir_bytes:
+            raise ValueError(f"multi-program stage {row['name']} has empty MLIR")
+        mlir = mlir_bytes.decode("utf-8")
+        opaque = opaque_report(mlir)
+        stage_families = set(family_histogram(mlir))
+        families.update(stage_families)
+        stages.append({
+            "name": row["name"], "path": str(stage / "model.mlir"),
+            "receipt": str(stage / "capture_receipt.json"),
+            "opaque": sum(opaque.values()), "linalg": mlir.count("linalg."),
+            "families": len(stage_families), "bytes": len(mlir_bytes),
+        })
+
+    return {
+        "ok": all(row["opaque"] == 0 for row in stages),
+        "opaque": sum(row["opaque"] for row in stages),
+        "linalg": sum(row["linalg"] for row in stages),
+        "families": len(families),
+        "sections": 0, "path": str(out), "bytes": sum(row["bytes"] for row in stages),
+        "session_contract": str(contract_path), "n_programs": len(stages),
+        "programs": stages,
+        "qualification": "receipt-listed capture artifacts byte-verified; no source-closure or execution proof",
+        "source_closure_verified": False,
+    }
+
+
 def _inner_capture(model: str, formats: list[str], level: str) -> None:
-    """Runs INSIDE the model's venv: capture each format, write .mlir, emit a JSON summary."""
+    """Runs inside the model's venv: capture each format and emit a JSON summary."""
     import m2m
     from m2m.coverage import family_histogram, opaque_report
 
@@ -127,10 +217,21 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
             # re-build the model per format: torchao quantize_ mutates in place, so reusing
             # one instance across formats would double-quantize.
             mdl, inputs = get_model_and_inputs()
+            q = _quant_for(cfg, fmt)
+            if callable(getattr(mdl, "write_bundle", None)):
+                if fmt in DTYPE_CAST:
+                    raise ValueError(
+                        f"multi-program capture does not support the {fmt} dtype-cast format")
+                if level != "linalg-on-tensors":
+                    raise ValueError("multi-program capture only supports linalg-on-tensors")
+                if os.environ.get("M2M_EMIT_SECTIONS"):
+                    raise ValueError("multi-program capture does not support --sections")
+                results[fmt] = _capture_multi_program(
+                    mdl, model_dir, f"{model}{suffix[fmt]}", q)
+                continue
             if fmt in DTYPE_CAST:  # base-weight dtype cast (bf16/fp16); no torchao
                 import torch
                 mdl = mdl.to(getattr(torch, DTYPE_CAST[fmt]))
-            q = _quant_for(cfg, fmt)
             weights_path = str(model_dir / f"{model}{suffix[fmt]}.safetensors")
             r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=q, level=level,
                             weights_path=weights_path)

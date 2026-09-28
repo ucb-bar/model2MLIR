@@ -35,6 +35,13 @@ print(output, result.path_taken)
 PY
 ```
 
+The generic workload driver can instead invoke the loader's three-program
+session contract: `python workloads/capture.py smolvla --formats fp32`.
+It reads `capture.toml`, writes `workloads/smolvla/smolvla_session/` with separate
+stage MLIR and capture receipts. This is the loader's three-stage capture path,
+not the small smoke command above. The command has not yet been qualified on a
+complete SmolVLA capture and does not execute compiled programs.
+
 ## Status
 
 Merlin's separate session capture treats `prefix_encode`, recurrent `flow_denoise`, and
