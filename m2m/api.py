@@ -164,6 +164,12 @@ def convert(
             actual = snapshot_exported_program(raw, stage="quantized")
             attach_original_identity(raw, trace_graphs["original"], actual)
             trace_graphs["quantized"] = snapshot_exported_program(raw, stage="quantized")
+            # Inline captured higher-order regions while their inner FX nodes still
+            # carry their own identities. Decomposition otherwise attributes every
+            # operation in a region to its outer wrapper and loses the per-op proof.
+            for _ in range(8):
+                if not inline_set_grad_hops(raw.graph_module):
+                    break
             if decompose:
                 exported_program, _ = _prepare_exported_program(
                     raw, run_default_decompositions=True,

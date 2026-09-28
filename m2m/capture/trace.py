@@ -74,6 +74,11 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
         ids = {n: f"{graph_id}:n{i}" for i, n in enumerate(module.graph.nodes)}
         for ordinal, node in enumerate(module.graph.nodes):
             node_id = ids[node]
+            # Export can share the mutable metadata dictionary of an outer
+            # getitem with the inner node it selects. Stamp node-local metadata
+            # before writing an identity, or the later inner snapshot silently
+            # replaces the outer call's provenance.
+            node.meta = dict(node.meta)
             custom = dict(node.meta.get("custom") or {})
             prior = list(custom.get("m2m_lineage") or ())
             if node_id not in prior:
@@ -549,7 +554,7 @@ def _dead_forward_value_relations(source: dict[str, Any], consumed: set[str]) ->
 
 
 def _inlined_parameter_relations(source: dict[str, Any], dest: dict[str, Any],
-                                 relations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                                 relations: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], set[str]]:
     """Bind a uniquely invoked grad-disabled body's inputs to its caller values."""
     src_nodes = {node["id"]: node for node in source["nodes"]}
     dst_nodes = {node["id"]: node for node in dest["nodes"]}
@@ -563,6 +568,7 @@ def _inlined_parameter_relations(source: dict[str, Any], dest: dict[str, Any],
                 for result in node.get("results") or []]
 
     result = []
+    verified_scopes = set()
     scopes = {node["graph_id"].split(":", 2)[-1] for node in source["nodes"]
               if isinstance(node.get("graph_id"), str)
               and node["graph_id"] != f"g:{source['stage']}:root"}
@@ -604,7 +610,8 @@ def _inlined_parameter_relations(source: dict[str, Any], dest: dict[str, Any],
                                        "submodule": scope, "argument_result_index": selected}})
         if len(bindings) == len(placeholders):
             result.extend(bindings)
-    return result
+            verified_scopes.add(scope)
+    return result, verified_scopes
 
 
 def _no_op_dtype_aliases(source: dict[str, Any], dest: dict[str, Any],
@@ -782,12 +789,25 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
         return {"from_stage": (source or {}).get("stage"), "to_stage": (dest or {}).get("stage"),
                 "status": "diagnostic", "relations": [], "reason": "graph unavailable"}
     src_ids = {n["id"] for n in source["nodes"]}
+    src_nodes = {n["id"]: n for n in source["nodes"]}
+    def scope(node: dict[str, Any], stage: str) -> str:
+        return str(node.get("graph_id") or f"g:{stage}:root").split(":", 2)[-1]
+
     relations, consumed, unknown = [], set(), []
+    pending_inlined = []
     for node in dest["nodes"]:
         origins = sorted(src_ids.intersection(node.get("origin_node_ids", ())))
-        if origins:
-            consumed.update(origins)
-            relations.append({"source_ids": origins, "destination_ids": [node["id"]],
+        # A nested origin can be copied into a flat graph only after the
+        # enclosing HOP's actual operands have been bound to its placeholders.
+        # Otherwise a changed caller could inherit a stale inner-node tag.
+        direct = [identity for identity in origins
+                  if scope(src_nodes[identity], source["stage"]) == scope(node, dest["stage"])]
+        inlined = [identity for identity in origins if identity not in direct]
+        if inlined:
+            pending_inlined.append((node, inlined))
+        if direct:
+            consumed.update(direct)
+            relations.append({"source_ids": direct, "destination_ids": [node["id"]],
                               "kind": "introduced" if node.get("transformation") else "transformation"})
         elif node["op"] not in {"placeholder", "output", "get_attr"}:
             unknown.append(node["id"])
@@ -803,8 +823,19 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
             if proved is not None:
                 consumed.add(node["id"])
                 relations.append(proved)
-    bindings = _inlined_parameter_relations(source, dest, relations)
+    bindings, verified_scopes = _inlined_parameter_relations(source, dest, relations)
     relations.extend(bindings)
+    for node, identities in pending_inlined:
+        accepted = [identity for identity in identities
+                    if scope(src_nodes[identity], source["stage"]) in verified_scopes]
+        if accepted:
+            consumed.update(accepted)
+            relations.append({"source_ids": accepted, "destination_ids": [node["id"]],
+                              "kind": "inlined_origin",
+                              "proof": {"exact_caller_bindings": True,
+                                        "scopes": sorted({scope(src_nodes[identity], source["stage"])
+                                                          for identity in accepted})}})
+            unknown = [identity for identity in unknown if identity != node["id"]]
     while True:
         inferred = _anchored_guard_relations(source, dest, relations, consumed)
         aliases = _no_op_dtype_aliases(source, dest, [*relations, *inferred], consumed)

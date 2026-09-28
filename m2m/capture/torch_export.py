@@ -205,7 +205,9 @@ def _prepare_exported_program(
     )
     if not table:
         return exported_program, targets
-    eliminations: list[dict[str, Any]] = []
+    eliminations: list[dict[str, Any]] = list(
+        getattr(exported_program.graph_module, "_m2m_trace_eliminations", ())
+    ) if capture_trace else []
     if capture_trace:
         from m2m.capture.trace import tuple_selection_trace_program
 

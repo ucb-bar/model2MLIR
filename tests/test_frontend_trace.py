@@ -274,7 +274,8 @@ def test_grad_disabled_inline_binding_requires_exact_caller_value():
     relation = graph_relation(source, dest)
     assert nested["id"] not in relation["unresolved_source_ids"]
     assert any(row["kind"] == "inlined_parameter_binding" for row in relation["relations"])
-    assert any(row["kind"] == "structural_call_equivalence" and row["source_ids"] == [nested["id"]]
+    assert any(row["kind"] == "inlined_origin" and row["source_ids"] == [nested["id"]]
+               and row["proof"]["exact_caller_bindings"]
                for row in relation["relations"])
 
     mismatched = copy.deepcopy(source)
@@ -282,6 +283,45 @@ def test_grad_disabled_inline_binding_requires_exact_caller_value():
                    and len(node["args"]) == 3)
     wrapper["args"][2] = wrapper["args"][1]
     assert nested["id"] in graph_relation(mismatched, dest)["unresolved_source_ids"]
+
+
+def test_nested_matmul_decomposition_retains_the_inner_call_identity():
+    class Nested(torch.nn.Module):
+        def forward(self, x, y):
+            with torch.set_grad_enabled(False):
+                value = torch.matmul(x.to(torch.float32), y)
+                return value.transpose(0, 1).cos()
+
+    trace = _check_trace(m2m.convert(
+        Nested(), (torch.arange(6).reshape(2, 3), torch.randn(3, 4)),
+        backend="fx_importer", capture_trace=True))
+    source = trace["graphs"]["quantized"]
+    inner = next(node for node in source["nodes"]
+                 if node["target"] == "aten.matmul.default"
+                 and node["graph_id"] != "g:quantized:root")
+    relation = trace["transformations"][1]
+    assert relation["status"] == "complete"
+    assert any(inner["id"] in row["source_ids"] and row["kind"] == "inlined_origin"
+               and row["proof"]["exact_caller_bindings"] for row in relation["relations"])
+
+
+def test_nested_tuple_outputs_keep_outer_getitem_identities():
+    class Pair(torch.nn.Module):
+        def forward(self, x):
+            with torch.set_grad_enabled(False):
+                return torch.cos(x).to(x.dtype), torch.sin(x).to(x.dtype)
+
+    trace = _check_trace(m2m.convert(
+        Pair(), (torch.randn(1, 3),), backend="fx_importer", capture_trace=True))
+    source = trace["graphs"]["quantized"]
+    selected = {node["id"] for node in source["nodes"]
+                if node["graph_id"] == "g:quantized:root"
+                and node["target"] == "<built-in function getitem>"}
+    assert len(selected) == 2
+    relation = trace["transformations"][1]
+    assert relation["status"] == "complete"
+    assert selected <= {identity for row in relation["relations"]
+                        for identity in row["source_ids"]}
 
 
 def test_identity_dtype_cast_requires_exact_typed_bypass():

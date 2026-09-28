@@ -90,6 +90,47 @@ def inline_set_grad_hops(gm) -> bool:
 
     new_g = fx.Graph()
 
+    def _same_tensor_value(left, right) -> bool:
+        if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+            return False
+        return (left.dtype == right.dtype
+                and tuple(map(str, left.shape)) == tuple(map(str, right.shape))
+                and left.device == right.device and left.layout == right.layout
+                and (left.layout != torch.strided or
+                     tuple(map(str, left.stride())) == tuple(map(str, right.stride()))))
+
+    def _carry_inlined_origin(source, result, *, value=None) -> bool:
+        """Record an actual, exactly typed FX value substitution for trace mode."""
+        source_value = source.meta.get("val") if value is None else value
+        if not isinstance(result, fx.Node) or not _same_tensor_value(
+                source_value, result.meta.get("val")):
+            return False
+        source_id = (source.meta.get("custom") or {}).get("m2m_node_id")
+        if not source_id:
+            return False
+        carriers = [result]
+        # A default decomposition may erase a same-dtype, no-copy `to`. Its
+        # forward tensor value is the input's value, so bind the substitution
+        # to that exact typed input too; do not infer this for a real cast.
+        alias_proven = (result.op == "call_function" and str(result.target) == "aten.to.dtype"
+                and len(result.args) == 2 and isinstance(result.args[0], fx.Node)
+                and result.args[1] == getattr(result.args[0].meta.get("val"), "dtype", None)
+                and set(result.kwargs) <= {"non_blocking", "copy", "memory_format"}
+                and result.kwargs.get("non_blocking", False) is False
+                and result.kwargs.get("copy", False) is False
+                and result.kwargs.get("memory_format") is None
+                and _same_tensor_value(result.meta.get("val"), result.args[0].meta.get("val")))
+        if alias_proven:
+            carriers.append(result.args[0])
+        for carrier in carriers:
+            custom = dict(carrier.meta.get("custom") or {})
+            lineage = list(custom.get("m2m_lineage") or ())
+            if source_id not in lineage:
+                lineage.append(source_id)
+            custom["m2m_lineage"] = lineage
+            carrier.meta["custom"] = custom
+        return True
+
     def _submod_idx(owner, n):
         return next((k for k, a in enumerate(n.args)
                      if isinstance(a, fx.Node) and a.op == "get_attr"
@@ -128,7 +169,9 @@ def inline_set_grad_hops(gm) -> bool:
                 # getitem on a HOP's output list
                 if (sn.target is operator.getitem and isinstance(sn.args[0], fx.Node)
                         and isinstance(local_env.get(sn.args[0]), list)):
-                    local_env[sn] = local_env[sn.args[0]][sn.args[1]]
+                    selected = local_env[sn.args[0]][sn.args[1]]
+                    _carry_inlined_origin(sn, selected)
+                    local_env[sn] = selected
                     continue
                 if "wrap_with_" in str(sn.target):
                     si = _submod_idx(owner, sn)
@@ -137,7 +180,25 @@ def inline_set_grad_hops(gm) -> bool:
                         operands = [_remap(a) for a in sn.args[si + 1:] if isinstance(a, fx.Node)]
                         phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
                         child = dict(zip(phs, operands))
-                        local_env[sn] = emit(sub, list(sub.graph.nodes), child) or []
+                        outputs = emit(sub, list(sub.graph.nodes), child) or []
+                        values = sn.meta.get("val")
+                        values = list(values) if isinstance(values, (tuple, list)) else [values]
+                        if len(values) == len(outputs):
+                            for value, output in zip(values, outputs, strict=True):
+                                if isinstance(output, fx.Node):
+                                    _carry_inlined_origin(sn, output, value=value)
+                        if not outputs and all(n.op in {"placeholder", "output", "get_attr"}
+                                               for n in sub.graph.nodes):
+                            lineage = list((sn.meta.get("custom") or {}).get("m2m_lineage") or ())
+                            if lineage:
+                                gm._m2m_trace_eliminations = [
+                                    *getattr(gm, "_m2m_trace_eliminations", ()),
+                                    {"source_ids": lineage, "kind": "eliminated",
+                                     "reason": "inlined empty higher-order region with no call nodes",
+                                     "proof": {"submodule": sn.args[si].target,
+                                               "body_nodes": len(list(sub.graph.nodes))}},
+                                ]
+                        local_env[sn] = outputs
                         continue
             # ordinary node (or unhandled HOP): copy with remapped args
             new_node = new_g.node_copy(sn, _remap)
