@@ -87,6 +87,50 @@ def test_original_and_quantized_graphs_pt2e_and_expansion():
     assert any(e["dtype"] == "int8" for e in trace["graphs"]["quantized"]["edges"])
 
 
+def test_pt2e_conv_batch_norm_fold_carries_exact_original_lineage():
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv2d(3, 4, 3, padding=1)
+            self.bn = torch.nn.BatchNorm2d(4)
+
+        def forward(self, x):
+            return self.bn(self.conv(x)).relu()
+
+    result = m2m.convert(Model().eval(), (torch.randn(1, 3, 8, 8),),
+                         backend="fx_importer", capture_trace=True,
+                         quantization=QuantizationConfig(scheme="int8_static_act_int8_weight"))
+    trace = _check_trace(result)
+    original_bn = next(node for node in trace["graphs"]["original"]["nodes"]
+                       if node["target"] == "aten.batch_norm.default")
+    fused_convs = [node for node in trace["graphs"]["quantized"]["nodes"]
+                   if node["target"] == "aten.conv2d.default"
+                   and original_bn["id"] in node["origin_node_ids"]]
+    assert len(fused_convs) == 1
+
+
+def test_pt2e_batch_norm_without_direct_conv_edge_has_no_fusion_lineage():
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv2d(3, 3, 3, padding=1)
+            self.bn = torch.nn.BatchNorm2d(3)
+
+        def forward(self, x):
+            return self.bn(self.conv(x) + x)
+
+    result = m2m.convert(Model().eval(), (torch.randn(1, 3, 8, 8),),
+                         backend="fx_importer", capture_trace=True,
+                         quantization=QuantizationConfig(scheme="int8_static_act_int8_weight"))
+    assert result.ok, result.diagnostics
+    trace = result.capture_trace
+    original_bn = next(node for node in trace["graphs"]["original"]["nodes"]
+                       if node["target"] == "aten.batch_norm.default")
+    quantized_nodes = trace["graphs"]["quantized"]["nodes"]
+    assert not any(node["target"] == "aten.conv2d.default"
+                   and original_bn["id"] in node["origin_node_ids"] for node in quantized_nodes)
+
+
 def test_exact_aliases_and_unknown_original_remain_distinct():
     class Model(torch.nn.Module):
         def forward(self, x):

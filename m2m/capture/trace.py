@@ -318,6 +318,65 @@ def attach_quantization_boundaries(quantized: Any, contraction_targets: Any) -> 
     return len(attributed)
 
 
+def pt2e_conv_bn_fold_candidates(
+    graph_module: Any, original: dict[str, Any]
+) -> list[tuple[Any, Any, tuple[Any, ...], str]]:
+    """Remember exact live Conv -> BatchNorm edges before PT2E preparation.
+
+    The returned FX nodes are object identities, not graph names. PT2E's fold
+    mutates the Conv and erases the BatchNorm; the candidates are only attributed
+    after that rewrite has actually happened.
+    """
+    import torch
+
+    original_ids = {node["id"] for node in original.get("nodes", ())}
+    candidates = []
+    for bn in graph_module.graph.nodes:
+        if bn.op != "call_function" or bn.target != torch.ops.aten.batch_norm.default:
+            continue
+        if not bn.args or not isinstance(bn.args[0], torch.fx.Node):
+            continue
+        conv = bn.args[0]
+        if conv.op != "call_function" or conv.target != torch.ops.aten.conv2d.default:
+            continue
+        origins = original_ids.intersection((bn.meta.get("custom") or {}).get("m2m_lineage") or ())
+        if len(origins) != 1 or not bn.users:
+            continue
+        conv_val, bn_val = conv.meta.get("val"), bn.meta.get("val")
+        if (getattr(conv_val, "shape", None) != getattr(bn_val, "shape", None)
+                or getattr(conv_val, "dtype", None) != getattr(bn_val, "dtype", None)):
+            continue
+        candidates.append((conv, bn, tuple(bn.users), next(iter(origins))))
+    return candidates
+
+
+def attach_pt2e_conv_bn_folds(
+    graph_module: Any, candidates: list[tuple[Any, Any, tuple[Any, ...], str]]
+) -> int:
+    """Carry BN ancestry onto a Conv only after PT2E's exact fold is observed.
+
+    Called by Quantizer.transform_for_annotation, immediately after torchao's
+    `_fuse_conv_bn_` and before observer insertion. A dead BN, a different
+    replacement, or an incomplete rewrite cannot certify a fusion.
+    """
+    live = set(graph_module.graph.nodes)
+    attributed = 0
+    for conv, bn, users, origin in candidates:
+        if conv not in live or bn in live or not bn._erased:
+            continue
+        surviving_users = [user for user in users if user in live]
+        if not surviving_users or any(
+            bn in user.all_input_nodes or conv not in user.all_input_nodes
+            for user in surviving_users
+        ):
+            continue
+        custom = dict(conv.meta.get("custom") or {})
+        custom["m2m_lineage"] = list(dict.fromkeys([*custom.get("m2m_lineage", ()), origin]))
+        conv.meta["custom"] = custom
+        attributed += 1
+    return attributed
+
+
 def tuple_selection_trace_program(exported: Any) -> Any:
     """Instrument exact tuple-result aliases on a detached captured graph.
 

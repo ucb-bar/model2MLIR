@@ -164,7 +164,7 @@ def _apply_pt2e_static_w8a8(
         raise RuntimeError("TorchAO PT2E quantization is unavailable") from exc
 
     class _PortableW8A8Quantizer(Quantizer):
-        def __init__(self) -> None:
+        def __init__(self, fold_candidates: list | None = None) -> None:
             eps = float(config.extra_args.get("eps", 2**-12))
             self.activation = QuantizationSpec(
                 dtype=torch.int8,
@@ -182,6 +182,16 @@ def _apply_pt2e_static_w8a8(
                 ch_axis=0,
             )
             self.annotated = 0
+            self.fold_candidates = fold_candidates or []
+
+        def transform_for_annotation(self, graph_module: Any) -> Any:
+            # torchao invokes this immediately after its Conv+BN fold, while
+            # the original FX node objects and rewired users are observable.
+            if self.fold_candidates:
+                from m2m.capture.trace import attach_pt2e_conv_bn_folds
+
+                attach_pt2e_conv_bn_folds(graph_module, self.fold_candidates)
+            return graph_module
 
         def annotate(self, graph_module: Any) -> Any:
             supported = {torch.ops.aten.conv2d.default, torch.ops.aten.linear.default}
@@ -216,7 +226,12 @@ def _apply_pt2e_static_w8a8(
         actual = snapshot_exported_program(exported, stage="quantization_input")
         attach_original_identity(exported, original_frontend_snapshot, actual)
     exported_module = exported.module()
-    quantizer = _PortableW8A8Quantizer()
+    fold_candidates = []
+    if original_frontend_snapshot is not None:
+        from m2m.capture.trace import pt2e_conv_bn_fold_candidates
+
+        fold_candidates = pt2e_conv_bn_fold_candidates(exported_module, original_frontend_snapshot)
+    quantizer = _PortableW8A8Quantizer(fold_candidates)
     prepared = prepare_pt2e(exported_module, quantizer)
 
     samples: Iterable[Any]
