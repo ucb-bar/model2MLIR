@@ -256,6 +256,27 @@ def test_mx_capture_trace_reports_missing_external_quantizer_lineage():
     assert result.capture_trace["graphs"]["quantized"]["status"] == "complete"
 
 
+def test_mx_coverage_report_quantizes_once_with_example_inputs():
+    pytest.importorskip("torchao")
+    from m2m.api import coverage_report
+    from m2m.capture.torchao_pipeline import QuantizationConfig
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(32, 32)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    report = coverage_report(
+        Tiny().eval(), (torch.ones(32, 32),),
+        quantization=QuantizationConfig(scheme="mx_gemmini_fp8"),
+    )
+    assert report["valid"] is True
+    assert report["num_ops"] > 0
+
+
 def test_preapplied_mx_capture_is_not_quantized_twice(monkeypatch):
     pytest.importorskip("torchao")
     import m2m.api as api
