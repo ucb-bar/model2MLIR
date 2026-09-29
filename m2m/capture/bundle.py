@@ -8,9 +8,10 @@ type, plus quantized subclass inner tensors, exactly as the consistent-capture w
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
@@ -674,3 +675,143 @@ def write_multi_program_bundle(programs: list[dict], root_session: dict, out: st
     return {"out": str(out), "session_kind": contract["kind"], "paper_ready": contract["paper_ready"],
             "n_programs": len(programs), "programs": summaries,
             "n_bindings": len(bindings), "bundle_integrity": str(integrity_path)}
+
+
+def _shared_tensor_inventory(model: nn.Module) -> list[dict]:
+    """Hash the actual shared tensor bytes without serializing another model copy."""
+    inventory = []
+    for name, value in sorted(model.state_dict().items()):
+        if not isinstance(value, torch.Tensor) or value.layout != torch.strided:
+            raise ValueError(f"shared tensor {name!r} cannot be byte-bound")
+        try:
+            tensor = value.detach().cpu().contiguous()
+            raw = memoryview(tensor.view(torch.uint8).numpy()).cast("B")
+            digest = hashlib.sha256(raw).hexdigest()
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError(f"shared tensor {name!r} cannot be byte-bound") from exc
+        inventory.append({"name": name, "shape": list(value.shape),
+                          "dtype": str(value.dtype), "sha256": digest})
+    if not inventory:
+        raise ValueError("quantized multi-program capture has no shared model tensors")
+    return inventory
+
+
+def _program_output_tensors(program) -> tuple[torch.Tensor, ...]:
+    from torch.utils._pytree import tree_flatten
+
+    with torch.no_grad():
+        result = program.module(*program.inputs)
+    values, _ = tree_flatten(result)
+    if not values or any(not isinstance(value, torch.Tensor) for value in values):
+        raise ValueError(f"program {program.name!r} has a non-tensor output ABI")
+    return tuple(values)
+
+
+def write_quantized_multi_program_bundle(
+    shared_model: nn.Module,
+    transform_shared: Callable[[nn.Module], nn.Module],
+    make_session: Callable[[nn.Module], Any],
+    out: str | Path,
+    *,
+    shared_programs: Sequence[str],
+    quantization: dict,
+    quant=None,
+    capture_trace: bool = True,
+    source_path: str | Path | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Capture a quantized v2 session derived from one transformed shared model.
+
+    ``transform_shared`` runs exactly once. ``make_session`` must construct every
+    weight-sharing stage around its returned model. The caller owns the numeric
+    transformation; this API verifies identity, typed state routes, stable shared
+    weight bytes, and the same-conversion stage receipts before publishing the
+    root binding. It never applies quantization independently to stage wrappers.
+    """
+    import yaml
+
+    from m2m.capture.bundle_integrity import write_bundle_integrity
+    from m2m.capture.external_runtime import ExternalRuntimeSession
+
+    if not isinstance(shared_model, nn.Module) or not callable(transform_shared) or not callable(make_session):
+        raise TypeError("quantized session requires a shared nn.Module and two callables")
+    if not isinstance(quantization, dict) or not quantization:
+        raise ValueError("quantized session requires an explicit quantization policy record")
+    if quant is None:
+        raise ValueError("quantized session requires the selected M2M quantization config")
+    selected = transform_shared(shared_model)
+    if not isinstance(selected, nn.Module):
+        raise TypeError("shared transform must return an nn.Module")
+    session = make_session(selected)
+    if not isinstance(session, ExternalRuntimeSession) or session.version != 2:
+        raise ValueError("quantized capture requires an explicit version-2 session")
+    by_name = {program.name: program for program in session.programs}
+    shared_names = tuple(shared_programs)
+    if not shared_names or len(set(shared_names)) != len(shared_names) or any(name not in by_name for name in shared_names):
+        raise ValueError("shared_programs must name distinct captured programs")
+    for name in shared_names:
+        if not any(module is selected for module in by_name[name].module.modules()):
+            raise ValueError(f"program {name!r} does not reference the transformed shared model")
+
+    outputs = {program.name: _program_output_tensors(program) for program in session.programs}
+    program_abis = {
+        program.name: {
+            "inputs": [{"dtype": str(value.dtype), "shape": list(value.shape)}
+                       for value in program.inputs],
+            "outputs": [{"dtype": str(value.dtype), "shape": list(value.shape)}
+                        for value in outputs[program.name]],
+        }
+        for program in session.programs
+    }
+    route_abis = []
+    for route in session.routes:
+        source = outputs[route.source.program]
+        if route.source.output_index >= len(source):
+            raise ValueError(f"route {route.name!r} selects an absent output")
+        value = source[route.source.output_index]
+        target = by_name[route.target.program].inputs[route.target.input_index]
+        if value.dtype != target.dtype or tuple(value.shape) != tuple(target.shape):
+            raise ValueError(f"route {route.name!r} has a post-quantization dtype/shape mismatch")
+        route_abis.append({"name": route.name,
+                           "from": {"program": route.source.program, "output_index": route.source.output_index},
+                           "to": {"program": route.target.program, "input_index": route.target.input_index},
+                           "dtype": str(value.dtype), "shape": list(value.shape)})
+    tensors = _shared_tensor_inventory(selected)
+    out = Path(out)
+    summary = write_multi_program_bundle(
+        session.bundle_programs(), dict(session.metadata), out, quant=quant,
+        quantization_preapplied=True, capture_trace=capture_trace,
+        source_path=source_path, metadata=metadata)
+    if _shared_tensor_inventory(selected) != tensors:
+        raise ValueError("shared model tensors changed during multi-program conversion")
+
+    stage_receipts = {}
+    for name in by_name:
+        stage = out / "stages" / name
+        saved = json.loads((stage / "capture_receipt.json").read_text(encoding="utf-8"))
+        if saved.get("materialized_abi", {}).get("complete") is not True:
+            raise ValueError(f"program {name!r} lacks a complete materialized ABI")
+        stage_receipts[name] = hashlib.sha256((stage / "capture_receipt.json").read_bytes()).hexdigest()
+    binding = {
+        "schema": "m2m.quantized-multi-program-binding.v1",
+        "scope": "one_transformed_shared_model_with_stage_receipts",
+        "source_closure_verified": False,
+        "quantization": quantization,
+        "shared_programs": list(shared_names),
+        "shared_tensors": tensors,
+        "program_abis": program_abis,
+        "routes": route_abis,
+        "stage_receipts": stage_receipts,
+    }
+    binding_path = out / "quantized-session-binding.json"
+    binding_path.write_text(json.dumps(binding, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    contract_path = out / "session_contract.yaml"
+    contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+    contract["quantized_session_binding"] = {
+        "path": binding_path.name,
+        "sha256": hashlib.sha256(binding_path.read_bytes()).hexdigest(),
+    }
+    contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+    summary["quantized_session_binding"] = str(binding_path)
+    summary["bundle_integrity"] = str(write_bundle_integrity(out))
+    return summary
