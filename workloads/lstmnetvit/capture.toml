@@ -2,3 +2,9 @@ venv = "/scratch/agustin/projects/model2MLIR/.venv"
 python = "3.12"
 deps = []
 upstream = "/scratch/agustin/projects/vitfly"
+
+[env]
+M2M_SESSION_STEPS = "256"
+# Paper capture additionally requires VITFLY_CKPT, VITFLY_SESSION_NPZ,
+# VITFLY_SESSION_SOURCE, and VITFLY_PAPER_READY=1. Paths and dataset attribution
+# are intentionally not supplied by this repository-local smoke configuration.

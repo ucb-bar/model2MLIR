@@ -11,3 +11,4 @@ HF_HOME = "/scratch2/agustin/hf_cache"
 # same architecture (every op family, both attention variants) at a size that compiles in seconds.
 # Unset = the full 26-layer model with its real pretrained weights.
 M2M_GEMMA_LAYERS = "2"
+M2M_GEMMA_SESSION = "e2e"

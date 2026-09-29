@@ -155,15 +155,23 @@ def _count_graph_partitions(graphs: tuple[torch.fx.GraphModule, ...]) -> int:
 
 
 def _serialize_range_constraints(exported_program: Any) -> tuple[RangeConstraint, ...]:
+    import math
+
+    def finite_bound(raw: Any) -> int | None:
+        if raw is None:
+            return None
+        try:
+            if not math.isfinite(float(raw)):
+                return None
+            return int(raw)
+        except (OverflowError, TypeError, ValueError):
+            return None
+
     constraints = []
     raw_constraints = getattr(exported_program, "range_constraints", {}) or {}
     for symbol, value in raw_constraints.items():
-        minimum = getattr(value, "lower", None)
-        maximum = getattr(value, "upper", None)
-        if minimum is not None:
-            minimum = int(minimum)
-        if maximum is not None:
-            maximum = int(maximum)
+        minimum = finite_bound(getattr(value, "lower", None))
+        maximum = finite_bound(getattr(value, "upper", None))
         constraints.append(RangeConstraint(symbol=str(symbol), minimum=minimum, maximum=maximum))
     return tuple(constraints)
 
@@ -189,6 +197,7 @@ def _prepare_exported_program(
     *,
     run_default_decompositions: bool,
     export_decomposition_table: dict[Any, Any] | None,
+    capture_trace: bool = False,
 ) -> tuple[Any, tuple[str, ...]]:
     table, targets = _build_decomposition_table(
         run_default_decompositions=run_default_decompositions,
@@ -196,7 +205,42 @@ def _prepare_exported_program(
     )
     if not table:
         return exported_program, targets
-    return exported_program.run_decompositions(table), targets
+    eliminations: list[dict[str, Any]] = list(
+        getattr(exported_program.graph_module, "_m2m_trace_eliminations", ())
+    ) if capture_trace else []
+    if capture_trace:
+        from m2m.capture.trace import tuple_selection_trace_program
+
+        exported_program = tuple_selection_trace_program(exported_program)
+        import functools
+        from torch.fx.traceback import get_current_meta
+
+        # Only certify an identity elimination at its exact source operation,
+        # not an arbitrary nested decomposition that happens to return an input.
+        source_targets = {
+            n.meta.get("custom", {}).get("m2m_node_id"): str(n.target)
+            for n in exported_program.graph.nodes
+        }
+        def wrap(target, function):
+            @functools.wraps(function)
+            def traced(*args, **kwargs):
+                custom = get_current_meta().get("custom") or {}
+                source_id = custom.get("m2m_node_id")
+                result = function(*args, **kwargs)
+                if source_targets.get(source_id) == str(target):
+                    for index, arg in enumerate(args):
+                        if isinstance(arg, torch.Tensor) and result is arg:
+                            eliminations.append({"source_ids": list(custom.get("m2m_lineage") or ()),
+                                                 "kind": "eliminated", "reason": "identity decomposition",
+                                                 "argument_index": index})
+                            break
+                return result
+            return traced
+        table = {target: wrap(target, function) for target, function in table.items()}
+    prepared = exported_program.run_decompositions(table)
+    if capture_trace:
+        prepared._m2m_trace_eliminations = eliminations
+    return prepared, targets
 
 
 def capture_model(

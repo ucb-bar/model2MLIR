@@ -13,6 +13,7 @@ Invariants:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -79,8 +80,209 @@ def _rematerialize_parameters(model: Any) -> None:
                 )
 
 
+def _as_input_tuple(sample: Any) -> tuple[Any, ...]:
+    """Normalize one calibration sample to the positional-input tuple torch expects."""
+    if isinstance(sample, tuple):
+        return sample
+    if isinstance(sample, list):
+        return tuple(sample)
+    return (sample,)
+
+
+def _drop_unused_graph_state(graph_module: Any) -> int:
+    """Remove parameters/buffers that no live FX ``get_attr`` reads.
+
+    PT2E's frozen-weight conversion adds an int8 ``_frozen_param*`` but leaves
+    the original fp32 module parameter registered.  A subsequent torch.export
+    lifts every registered parameter into its signature even when the graph no
+    longer reads it, causing deployment bundles to contain both copies.  This
+    is graph DCE for state: only attributes absent from the live graph are
+    removed, so it cannot alter execution.
+    """
+    live = {
+        str(node.target)
+        for node in graph_module.graph.nodes
+        if node.op == "get_attr"
+    }
+    removed = 0
+    for kind in ("_parameters", "_buffers"):
+        names = [name for name, _ in (
+            graph_module.named_parameters(recurse=True)
+            if kind == "_parameters"
+            else graph_module.named_buffers(recurse=True)
+        )]
+        for qualified_name in names:
+            if qualified_name in live:
+                continue
+            parent = graph_module
+            parts = qualified_name.split(".")
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            registry = getattr(parent, kind)
+            if parts[-1] in registry:
+                del registry[parts[-1]]
+                removed += 1
+    return removed
+
+
+def _apply_pt2e_static_w8a8(
+    model: Any,
+    config: QuantizationConfig,
+    *,
+    example_inputs: tuple[Any, ...] | None,
+    calibration_inputs: Iterable[Any] | None,
+    original_frontend_snapshot: dict[str, Any] | None = None,
+) -> Any:
+    """Calibrate and freeze a portable Conv/Linear W8A8 graph with TorchAO PT2E.
+
+    TorchAO's unified ``quantize_`` API intentionally defaults to ``nn.Linear``.
+    Applying ``Int8StaticActivationInt8WeightConfig`` through that API therefore
+    leaves every Conv2d in a CNN at f32 while still allowing callers to stamp the
+    artifact "int8". PT2E is the graph-level TorchAO path: it can observe tensor
+    edges, fold inference BatchNorm into Conv, and freeze weights as actual int8
+    tensors. The emitted Q/DQ graph is backend-neutral and is deliberately not
+    tied to Gemmini (or any other target).
+
+    The small quantizer below annotates aten Conv2d and Linear directly instead of
+    importing a CPU backend recipe. This keeps the capture contract about numeric
+    format, not about the host used to perform capture.
+    """
+    if not example_inputs:
+        raise ValueError(
+            "int8_static_act_int8_weight requires example_inputs for PT2E export"
+        )
+
+    try:
+        from torchao.quantization.pt2e import HistogramObserver, PerChannelMinMaxObserver
+        from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
+        from torchao.quantization.pt2e.quantizer import (
+            QuantizationAnnotation,
+            QuantizationSpec,
+            Quantizer,
+        )
+    except ImportError as exc:
+        raise RuntimeError("TorchAO PT2E quantization is unavailable") from exc
+
+    class _PortableW8A8Quantizer(Quantizer):
+        def __init__(self, fold_candidates: list | None = None) -> None:
+            eps = float(config.extra_args.get("eps", 2**-12))
+            self.activation = QuantizationSpec(
+                dtype=torch.int8,
+                observer_or_fake_quant_ctr=HistogramObserver.with_args(eps=eps),
+                quant_min=-128,
+                quant_max=127,
+                qscheme=torch.per_tensor_symmetric,
+            )
+            self.weight = QuantizationSpec(
+                dtype=torch.int8,
+                observer_or_fake_quant_ctr=PerChannelMinMaxObserver.with_args(eps=eps),
+                quant_min=-127,
+                quant_max=127,
+                qscheme=torch.per_channel_symmetric,
+                ch_axis=0,
+            )
+            self.annotated = 0
+            self.fold_candidates = fold_candidates or []
+
+        def transform_for_annotation(self, graph_module: Any) -> Any:
+            # torchao invokes this immediately after its Conv+BN fold, while
+            # the original FX node objects and rewired users are observable.
+            if self.fold_candidates:
+                from m2m.capture.trace import attach_pt2e_conv_bn_folds
+
+                attach_pt2e_conv_bn_folds(graph_module, self.fold_candidates)
+            return graph_module
+
+        def annotate(self, graph_module: Any) -> Any:
+            supported = {torch.ops.aten.conv2d.default, torch.ops.aten.linear.default}
+            for node in graph_module.graph.nodes:
+                if node.target not in supported or len(node.args) < 2:
+                    continue
+                activation, weight = node.args[:2]
+                # Quantize each contraction's two inputs. Its result stays f32;
+                # a later contraction observes/quantizes its own input edge. This
+                # is a portable W8A8 core with an explicit requant/dequant boundary,
+                # and does not assume a target can keep arbitrary epilogues in i8.
+                node.meta["quantization_annotation"] = QuantizationAnnotation(
+                    input_qspec_map={activation: self.activation, weight: self.weight},
+                    _annotated=True,
+                )
+                self.annotated += 1
+            return graph_module
+
+        def validate(self, graph_module: Any) -> None:
+            del graph_module
+            if self.annotated == 0:
+                raise ValueError(
+                    "int8_static_act_int8_weight found no supported Conv2d/Linear ops"
+                )
+
+    # PT2E consumes an exported aten graph. prepare_pt2e also performs the
+    # inference Conv+BatchNorm fold before observer insertion.
+    exported = torch.export.export(model.eval(), tuple(example_inputs))
+    if original_frontend_snapshot is not None:
+        from m2m.capture.trace import attach_original_identity, snapshot_exported_program
+
+        actual = snapshot_exported_program(exported, stage="quantization_input")
+        attach_original_identity(exported, original_frontend_snapshot, actual)
+    exported_module = exported.module()
+    fold_candidates = []
+    if original_frontend_snapshot is not None:
+        from m2m.capture.trace import pt2e_conv_bn_fold_candidates
+
+        fold_candidates = pt2e_conv_bn_fold_candidates(exported_module, original_frontend_snapshot)
+    quantizer = _PortableW8A8Quantizer(fold_candidates)
+    prepared = prepare_pt2e(exported_module, quantizer)
+
+    samples: Iterable[Any]
+    if calibration_inputs is None:
+        samples = (tuple(example_inputs),)
+    else:
+        samples = calibration_inputs
+    calibrated = 0
+    with torch.no_grad():
+        for sample in samples:
+            if calibrated >= config.calibration_samples:
+                break
+            prepared(*_as_input_tuple(sample))
+            calibrated += 1
+    if calibrated == 0:
+        raise ValueError("static W8A8 calibration requires at least one input sample")
+
+    # fold_quantize freezes weight Q nodes to int8 buffers. Keeping float
+    # originals in an unused module attribute is harmless: export/externalize
+    # follows the live graph and stores the frozen int8 parameter.
+    quantized = convert_pt2e(prepared, use_reference_representation=False, fold_quantize=True)
+    if original_frontend_snapshot is not None:
+        from m2m.capture.trace import attach_quantization_boundaries
+
+        attach_quantization_boundaries(quantized, {torch.ops.aten.conv2d.default,
+                                                  torch.ops.aten.linear.default})
+    pruned_state = _drop_unused_graph_state(quantized)
+    try:
+        # Exported graph modules reject ordinary eval()/train() unless this shim
+        # is installed; model2MLIR's capture boundary calls eval() defensively.
+        from torch.ao.quantization import allow_exported_model_train_eval
+
+        allow_exported_model_train_eval(quantized)
+    except (ImportError, AttributeError):  # pragma: no cover - version-dependent API
+        pass
+    quantized._m2m_quantization_stats = {  # type: ignore[attr-defined]
+        "scheme": config.scheme,
+        "annotated_contractions": quantizer.annotated,
+        "calibration_samples": calibrated,
+        "pruned_dead_state_tensors": pruned_state,
+    }
+    return quantized
+
+
 def apply_quantization(
-    model: Any, config: QuantizationConfig, *, example_inputs: tuple[Any, ...] | None = None
+    model: Any,
+    config: QuantizationConfig,
+    *,
+    example_inputs: tuple[Any, ...] | None = None,
+    calibration_inputs: Iterable[Any] | None = None,
+    original_frontend_snapshot: dict[str, Any] | None = None,
 ) -> Any:
     """Apply TorchAO quantization to a model.
 
@@ -154,6 +356,14 @@ def apply_quantization(
             "numeric_status": "operand_fake_quant_only",
         }
         return graph_module
+    if config.scheme == "int8_static_act_int8_weight" and not config.per_module:
+        return _apply_pt2e_static_w8a8(
+            model,
+            config,
+            example_inputs=example_inputs,
+            calibration_inputs=calibration_inputs,
+            original_frontend_snapshot=original_frontend_snapshot,
+        )
 
     # NOTE: CompGen's NPU-custom FP8 schemes ("fp8_e4m3_po2[_npu]") were dropped
     # during extraction (they depended on NPU-specific modules). Reintroduce them

@@ -77,6 +77,352 @@ def test_true_int_matmul_present():
     assert "i32" in r.mlir_text  # int32 accumulation
 
 
+def test_static_w8a8_pt2e_quantizes_conv_and_uses_calibration():
+    """Static W8A8 is graph quantization, not a Linear-only quantize_ label."""
+    from m2m.capture.torchao_pipeline import apply_quantization
+
+    class ConvNet(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = nn.Conv2d(3, 8, 3)
+            self.fc = nn.Linear(8, 4)
+
+        def forward(self, x):
+            return self.fc(torch.relu(self.conv(x)).mean((2, 3)))
+
+    x = (torch.randn(1, 3, 16, 16),)
+    cfg = QuantizationConfig(
+        scheme="int8_static_act_int8_weight", calibration_samples=2
+    )
+    quantized = apply_quantization(
+        ConvNet().eval(), cfg, example_inputs=x, calibration_inputs=[x, x, x]
+    )
+    stats = quantized._m2m_quantization_stats
+    assert stats["annotated_contractions"] == 2
+    assert stats["calibration_samples"] == 2
+    assert stats["pruned_dead_state_tensors"] == 2
+    frozen = [v for k, v in quantized.state_dict().items() if k.startswith("_frozen_param")]
+    assert len(frozen) == 2 and all(v.dtype is torch.int8 for v in frozen)
+    assert not any(k.endswith(".weight") for k in quantized.state_dict())
+
+    r = m2m.convert(
+        quantized,
+        x,
+        backend="fx_importer",
+        decompose=False,
+        quantization=cfg,
+        quantization_preapplied=True,
+    )
+    assert r.ok
+    assert "0 opaque" in " ".join(r.diagnostics)
+    assert r.mlir_text.count("quant_ext.dequantize_per_channel") == 2
+    assert r.mlir_text.count("quant_ext.quantize_per_tensor") == 2
+    assert "tensor<8x3x3x3xi8>" in r.mlir_text
+
+
+def test_pt2e_integer_reference_executes_conv_and_linear():
+    """The integer oracle uses frozen PT2E qparams and accounts for every contraction."""
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+    from m2m.capture.torchao_pipeline import apply_quantization
+
+    class ConvNet(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = nn.Conv2d(4, 4, 3, padding=1, groups=2)
+            self.fc = nn.Linear(4, 3)
+
+        def forward(self, x):
+            return self.fc(torch.relu(self.conv(x)).mean((2, 3)))
+
+    inputs = (torch.randn(1, 4, 8, 8),)
+    quantized = apply_quantization(
+        ConvNet().eval(),
+        QuantizationConfig(scheme="int8_static_act_int8_weight", calibration_samples=1),
+        example_inputs=inputs,
+        calibration_inputs=[inputs],
+    )
+    result = run_pt2e_integer_reference(quantized, inputs, expected_contractions=2)
+    assert result.conv2d_count == 1
+    assert result.linear_count == 1
+    assert result.output.shape == (1, 3)
+    assert torch.isfinite(result.output).all()
+
+
+def test_pt2e_integer_reference_matches_rewrite_with_per_tensor_weights():
+    """A full exported Conv/Linear graph uses the same frozen integer semantics."""
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    class PerTensorWeights(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("conv_weight", torch.randint(-8, 8, (4, 3, 3, 3), dtype=torch.int8))
+            self.register_buffer("linear_weight", torch.randint(-8, 8, (5, 8), dtype=torch.int8))
+            self.register_buffer("conv_bias", torch.randn(4))
+            self.register_buffer("linear_bias", torch.randn(5))
+
+        def forward(self, image, features):
+            image_q = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                image, 0.125, 0, -128, 127, torch.int8
+            )
+            image_dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                image_q, 0.125, 0, -128, 127, torch.int8
+            )
+            conv_weight = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.conv_weight, 0.25, 0, -127, 127, torch.int8
+            )
+            conv = torch.ops.aten.conv2d.default(
+                image_dq, conv_weight, self.conv_bias, [1, 1], [1, 1], [1, 1]
+            )
+            features_q = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                features, 0.125, 0, -128, 127, torch.int8
+            )
+            features_dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                features_q, 0.125, 0, -128, 127, torch.int8
+            )
+            linear_weight = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.linear_weight, 0.25, 0, -127, 127, torch.int8
+            )
+            linear = torch.ops.aten.linear.default(features_dq, linear_weight, self.linear_bias)
+            return conv, linear
+
+    torch.manual_seed(0)
+    inputs = (torch.randn(1, 3, 6, 6), torch.randn(2, 8))
+    captured = torch.export.export(PerTensorWeights().eval(), inputs).module()
+    reference = run_pt2e_integer_reference(captured, inputs, expected_contractions=2)
+    rewritten, receipt = integerize_pt2e(captured, inputs)
+    assert receipt["quantized_contractions_remaining"] == 0
+    assert (reference.conv2d_count, reference.linear_count) == (1, 1)
+    for observed, expected in zip(reference.output, rewritten(*inputs), strict=True):
+        torch.testing.assert_close(observed, expected, atol=0, rtol=0)
+
+
+def test_pt2e_scalar_qparams_are_materialized_before_import():
+    """PT2E calibration stores per-tensor scale and zero point as FX scalars."""
+
+    class QDQ(nn.Module):
+        def forward(self, x):
+            q = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                x, 0.125, 0, -128, 127, torch.int8
+            )
+            return torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                q, 0.125, 0, -128, 127, torch.int8
+            )
+
+    result = m2m.convert(QDQ().eval(), (torch.randn(2, 8),), backend="fx_importer", decompose=False)
+    assert result.ok
+    assert opaque_report(result.mlir_text) == {}
+    assert "quant_ext.quantize_per_tensor" in result.mlir_text
+    assert "quant_ext.dequantize_per_tensor" in result.mlir_text
+
+
+def test_pt2e_linear_integerization_preserves_frozen_qparams_and_bias():
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    class QDQLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("qweight", torch.randint(-8, 8, (16, 32), dtype=torch.int8))
+            self.register_buffer("bias", torch.randn(16))
+
+        def forward(self, x):
+            qx = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                x, 0.125, 0, -128, 127, torch.int8
+            )
+            dx = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                qx, 0.125, 0, -128, 127, torch.int8
+            )
+            dw = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.qweight, 0.25, 0, -127, 127, torch.int8
+            )
+            return torch.ops.aten.linear.default(dx, dw, self.bias)
+
+    inputs = (torch.randn(2, 3, 32),)
+    original = QDQLinear().eval()
+    captured = torch.export.export(original, inputs).module()
+    expected = captured(*inputs)
+    rewritten, receipt = integerize_pt2e(captured, inputs)
+    assert receipt["linear_integerized"] == receipt["linear_seen"] == 1
+    assert receipt["refusals"] == []
+    torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
+    from torch.ao.quantization import allow_exported_model_train_eval
+
+    allow_exported_model_train_eval(rewritten)
+    lowered = m2m.convert(rewritten, inputs, backend="fx_importer")
+    assert lowered.ok and opaque_report(lowered.mlir_text) == {}
+    assert 'prov.aten = "aten._int_mm.default"' in lowered.mlir_text
+
+
+def test_pt2e_linear_integerization_refuses_nonzero_zero_point():
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    class Asymmetric(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("qweight", torch.ones((8, 8), dtype=torch.int8))
+
+        def forward(self, x):
+            qx = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                x, 0.125, 1, -128, 127, torch.int8
+            )
+            dx = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                qx, 0.125, 1, -128, 127, torch.int8
+            )
+            dw = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.qweight, 0.25, 0, -127, 127, torch.int8
+            )
+            return torch.ops.aten.linear.default(dx, dw, None)
+
+    inputs = (torch.randn(2, 8),)
+    captured = torch.export.export(Asymmetric().eval(), inputs).module()
+    with pytest.raises(ValueError, match="zero point 0"):
+        run_pt2e_integer_reference(captured, inputs, expected_contractions=1)
+    _, receipt = integerize_pt2e(captured, inputs)
+    assert receipt["linear_seen"] == 1
+    assert receipt["linear_integerized"] == 0
+    assert "zero point 0" in receipt["refusals"][0]["reason"]
+
+
+def test_pt2e_conv_integerization_preserves_window_scales_and_bias():
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    class QDQConv(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("qweight", torch.randint(-8, 8, (5, 3, 3, 3), dtype=torch.int8))
+            self.register_buffer("bias", torch.randn(5))
+
+        def forward(self, x):
+            qx = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                x, 0.125, 0, -128, 127, torch.int8
+            )
+            dx = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                qx, 0.125, 0, -128, 127, torch.int8
+            )
+            dw = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.qweight, 0.25, 0, -127, 127, torch.int8
+            )
+            return torch.ops.aten.conv2d.default(dx, dw, self.bias, [2, 2], [1, 1], [2, 2])
+
+    inputs = (torch.randn(2, 3, 8, 8),)
+    captured = torch.export.export(QDQConv().eval(), inputs).module()
+    expected = captured(*inputs)
+    rewritten, receipt = integerize_pt2e(captured, inputs)
+    assert receipt["conv2d_seen"] == receipt["conv2d_integerized"] == 1
+    assert receipt["refusals"] == []
+    torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
+
+    from torch.ao.quantization import allow_exported_model_train_eval
+
+    allow_exported_model_train_eval(rewritten)
+    lowered = m2m.convert(rewritten, inputs, backend="fx_importer")
+    assert lowered.ok and opaque_report(lowered.mlir_text) == {}
+    assert 'prov.aten = "aten._int_mm.default"' in lowered.mlir_text
+
+
+def test_pt2e_grouped_conv_is_explicitly_refused():
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    class Grouped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("qweight", torch.ones((4, 2, 3, 3), dtype=torch.int8))
+
+        def forward(self, x):
+            qx = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                x, 0.125, 0, -128, 127, torch.int8
+            )
+            dx = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                qx, 0.125, 0, -128, 127, torch.int8
+            )
+            dw = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.qweight, 0.25, 0, -127, 127, torch.int8
+            )
+            return torch.ops.aten.conv2d.default(dx, dw, None, [1, 1], [1, 1], [1, 1], 2)
+
+    inputs = (torch.randn(1, 4, 8, 8),)
+    model = torch.export.export(Grouped().eval(), inputs).module()
+    _, receipt = integerize_pt2e(model, inputs)
+    assert receipt["quantized_by_kind"]["conv2d"] == {"seen": 1, "integerized": 0, "remaining": 1}
+    assert receipt["quantized_contractions_remaining"] == 1
+    assert "grouped convolution" in receipt["refusals"][0]["reason"]
+
+
+def test_pt2e_census_excludes_unquantized_float_island():
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    class Mixed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("qweight", torch.ones((8, 8), dtype=torch.int8))
+            self.float_weight = nn.Parameter(torch.randn(8, 8))
+
+        def forward(self, x):
+            qx = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                x, 0.125, 0, -128, 127, torch.int8
+            )
+            dx = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                qx, 0.125, 0, -128, 127, torch.int8
+            )
+            dw = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.qweight, 0.25, 0, -127, 127, torch.int8
+            )
+            return torch.ops.aten.linear.default(dx, dw, None) + torch.ops.aten.linear.default(
+                x, self.float_weight, None
+            )
+
+    inputs = (torch.randn(2, 8),)
+    model = torch.export.export(Mixed().eval(), inputs).module()
+    expected = model(*inputs)
+    rewritten, receipt = integerize_pt2e(model, inputs)
+    assert receipt["linear_seen"] == 2
+    assert receipt["quantized_by_kind"]["linear"] == {"seen": 1, "integerized": 1, "remaining": 0}
+    assert receipt["quantized_contractions_remaining"] == 0
+    torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
+
+
+def test_pt2e_batched_matmul_integerizes_each_static_batch():
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    class QDQBatch(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("qweight", torch.randint(-8, 8, (1, 2, 8, 6), dtype=torch.int8))
+
+        def forward(self, x):
+            qx = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                x, 0.125, 0, -128, 127, torch.int8
+            )
+            dx = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                qx, 0.125, 0, -128, 127, torch.int8
+            )
+            dw = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.qweight, 0.25, 0, -127, 127, torch.int8
+            )
+            return torch.ops.aten.matmul.default(dx, dw)
+
+    inputs = (torch.randn(1, 2, 4, 8),)
+    captured = torch.export.export(QDQBatch().eval(), inputs).module()
+    expected = captured(*inputs)
+    reference = run_pt2e_integer_reference(captured, inputs, expected_contractions=1)
+    rewritten, receipt = integerize_pt2e(captured, inputs)
+    assert receipt["matmul_seen"] == receipt["matmul_integerized"] == 1
+    assert receipt["integer_mm_emitted"] == 2
+    assert receipt["quantized_contractions_remaining"] == 0
+    assert receipt["remaining_dequant_count"] == 0
+    torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(rewritten(*inputs), reference.output, atol=0, rtol=0)
+
+    from torch.ao.quantization import allow_exported_model_train_eval
+
+    allow_exported_model_train_eval(rewritten)
+    lowered = m2m.convert(rewritten, inputs, backend="fx_importer")
+    assert lowered.ok and opaque_report(lowered.mlir_text) == {}
+    assert lowered.mlir_text.count('prov.aten = "aten._int_mm.default"') >= 2
+
+
 def test_fp8_type_renders_native_spelling():
     """The shim fp8 type prints with the MLIR-native spelling (f8E4M3FN) on text emission,
     so an artifact carrying f8 storage parses in a standard MLIR toolchain."""

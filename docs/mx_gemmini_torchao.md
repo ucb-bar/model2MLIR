@@ -149,3 +149,10 @@ functional compiler certificate. The Merlin Phase 0 software spec remains
 bounded contraction vectors in each format, including one element-subnormal
 vector per format. They do not establish general numerical behavior,
 whole-model host semantics, or an admitted Phase 0 capsule corpus.
+
+With `capture_trace=True`, the frontend records the original, quantized, and
+prepared graphs and binds the prepared graph to the returned MLIR. The current
+MX TorchAO module replacement does not preserve complete original-node lineage
+through the quantized graph. The trace therefore reports `diagnostic` with an
+original-to-quantized correspondence blocker; it is not an admitted source
+capture even when the MLIR has no opaque calls.
