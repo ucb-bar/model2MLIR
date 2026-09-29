@@ -44,6 +44,21 @@ functional attention matmuls for each format, with no skipped contractions and
 logits shape `[1, 32, 32000]`. This is one randomly initialized decoder layer,
 not a whole-checkpoint accuracy result.
 
+For a full-checkpoint diagnostic, run the reproducible probe with an explicit
+artifact directory:
+
+```sh
+python -m workloads.tiny_llama.mx_gemmini_probe \
+  --out /configured/out/artifacts/probes/mx-gemmini-tinyllama-full-1
+```
+
+It writes `input_ids.npy` and `report.json` with the checkpoint revision and
+SHA-256, source-file digests, library versions, fixed token input hash, three
+contraction censuses, logit hashes, and
+FP32-relative RMSE, maximum absolute error, and cosine similarity. The input
+is random tokens, so these metrics are a numerical diagnostic rather than a
+task-accuracy result.
+
 TorchAO's handler converts eligible `nn.Linear` modules into
 `MXGemminiLinear`. It stores quantized static weights, unsigned element codes,
 and E8M0 scale bytes. Its forward quantizes each activation dynamically. An
