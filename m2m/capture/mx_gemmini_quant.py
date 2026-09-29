@@ -67,8 +67,9 @@ def quantize_mx_gemmini(value: Tensor, format: str = "mxfp8", axis: int = -1) ->
     """
     if format not in _FORMATS:
         raise ValueError(f"unsupported MX format: {format}")
-    if value.ndim < 1 or not -value.ndim <= axis < value.ndim or value.shape[axis] % GROUP:
-        raise ValueError("MX contraction K must be a multiple of 32")
+    if (value.ndim < 1 or not -value.ndim <= axis < value.ndim
+            or value.shape[axis] < GROUP or value.shape[axis] % GROUP):
+        raise ValueError("MX contraction K must be a nonempty multiple of 32")
     bf16 = value.to(torch.bfloat16).movedim(axis, -1)
     if not torch.compiler.is_compiling() and not bool(torch.isfinite(bf16).all()):
         raise ValueError("nonfinite MX blocks require RTL-verified poisoning")
@@ -113,8 +114,8 @@ class MXGemminiLinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         tile = 16 if self.format == "mxfp8" else 32
-        if x.ndim < 2 or x.shape[-2] % tile:
-            raise ValueError(f"MX {self.format} Linear M must be a multiple of {tile}")
+        if x.ndim < 2 or x.shape[-2] < tile or x.shape[-2] % tile:
+            raise ValueError(f"MX {self.format} Linear M must contain a full tile of {tile}")
         activation = _dequant_operand_for_graph(x, self.format, -1).to(torch.bfloat16)
         bias = self.bias.to(torch.bfloat16) if self.bias is not None else None
         return F.linear(activation, self.weight.to(torch.bfloat16), bias).to(x.dtype)
@@ -148,8 +149,8 @@ def linear_contraction_operands(module: MXGemminiLinear, activation: Tensor) -> 
     if not isinstance(module, MXGemminiLinear):
         raise TypeError("expected an MXGemminiLinear module")
     tile = 16 if module.format == "mxfp8" else 32
-    if activation.ndim != 2 or activation.shape[0] % tile:
-        raise ValueError(f"MX {module.format} Linear activation M must be a multiple of {tile}")
+    if activation.ndim != 2 or activation.shape[0] < tile or activation.shape[0] % tile:
+        raise ValueError(f"MX {module.format} Linear activation M must contain a full tile of {tile}")
     if activation.shape[1] != module.weight_codes.shape[1]:
         raise ValueError("Linear activation K differs from the static weight K")
     _, activation_codes, activation_scales = quantize_mx_gemmini(activation, module.format)
@@ -178,7 +179,7 @@ def functional_contraction_operands(
     m, k = lhs.shape[-2:]
     rhs_k, n = rhs.shape[-2:]
     tile = 16 if format == "mxfp8" else 32
-    if k != rhs_k or k % GROUP or m % tile or n % tile:
+    if k != rhs_k or k < GROUP or k % GROUP or m < tile or n < tile or m % tile or n % tile:
         raise ValueError(f"MX {format} matmul needs matching K/32 and M/N tile {tile}")
     _, activation_codes, activation_scales = quantize_mx_gemmini(lhs, format, axis=-1)
     _, weight_codes, weight_scales = quantize_mx_gemmini(rhs, format, axis=-2)

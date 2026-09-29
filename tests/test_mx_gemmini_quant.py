@@ -35,6 +35,8 @@ def test_mx_operand_rounding_scale_floor_and_fp4_intermediate():
     assert zero_scale.tolist() == [104]  # 127 - 23
     with pytest.raises(ValueError, match="multiple of 32"):
         quantize_mx_gemmini(torch.zeros(31))
+    with pytest.raises(ValueError, match="nonempty multiple of 32"):
+        quantize_mx_gemmini(torch.zeros(0))
     bad = torch.zeros(32)
     bad[0] = float("nan")
     with pytest.raises(ValueError, match="nonfinite"):
@@ -102,6 +104,8 @@ def test_functional_matmul_handoff_matches_linear_and_preserves_batch_axes(forma
         functional_contraction_operands(activation.expand(2, 32, 32), source.weight.T, format)
     with pytest.raises(ValueError, match="matching K/32"):
         functional_contraction_operands(activation[:, :-1], source.weight.T, format)
+    with pytest.raises(ValueError, match="matching K/32"):
+        functional_contraction_operands(activation[:0], source.weight.T, format)
 
 
 @pytest.mark.parametrize("format,expected_negative_zero", [
