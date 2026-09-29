@@ -815,3 +815,101 @@ def write_quantized_multi_program_bundle(
     summary["quantized_session_binding"] = str(binding_path)
     summary["bundle_integrity"] = str(write_bundle_integrity(out))
     return summary
+
+
+def write_stagewise_pt2e_multi_program_bundle(
+    converted: "StagewisePT2ESession",
+    out: str | Path,
+    *,
+    quantization: dict | None = None,
+    capture_trace: bool = True,
+    source_path: str | Path | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Write independently converted PT2E stages with verified source-weight binding.
+
+    Unlike :func:`write_quantized_multi_program_bundle`, the stage GraphModules
+    do not contain one transformed Python module.  The binding describes one
+    source model, byte-verified frozen encodings, and separate stage storage.
+    No source-closure or physical weight aliasing claim is made.
+    """
+    import yaml
+    from dataclasses import asdict
+
+    from m2m.capture.bundle_integrity import write_bundle_integrity
+    from m2m.capture.stagewise_pt2e import (
+        StagewisePT2ESession, _frozen_weights, _stage_abis, _tensor_sha256,
+    )
+
+    if not isinstance(converted, StagewisePT2ESession):
+        raise TypeError("stage-wise writer needs a verified PT2E session")
+    selected_policy = asdict(converted.quant)
+    if quantization is not None and quantization != selected_policy:
+        raise ValueError("stage-wise quantization metadata differs from the selected PT2E policy")
+    if tuple(_shared_tensor_inventory(converted.shared_model)) != converted.source_inventory:
+        raise ValueError("stage-wise source weights changed after PT2E")
+    if converted.quant.scheme != "int8_static_act_int8_weight":
+        raise ValueError("stage-wise writer requires static W8A8 PT2E")
+    current_abis, current_routes = _stage_abis(converted.session)
+    if current_abis != converted.program_abis or tuple(current_routes) != converted.routes:
+        raise ValueError("stage-wise ABI or routes changed after PT2E")
+    by_name = {program.name: program for program in converted.session.programs}
+
+    def verify_weights() -> None:
+        for record in converted.frozen_weights:
+            module = by_name[record["stage"]].module
+            frozen = {name: (tensor, scale, zero) for _, name, tensor, scale, zero, _ in
+                      _frozen_weights(record["stage"], module)}
+            values = frozen.get(record["frozen_buffer"])
+            if values is None or tuple(_tensor_sha256(value) for value in values) != (
+                    record["frozen_sha256"], record["scale_sha256"],
+                    record["zero_point_sha256"]):
+                raise ValueError("stage-wise frozen weight encoding changed after PT2E")
+            source = converted.shared_model.get_parameter(record["source_parameter"])
+            if _tensor_sha256(source) != record["source_sha256"]:
+                raise ValueError("stage-wise source parameter changed after PT2E")
+
+    verify_weights()
+    out = Path(out)
+    summary = write_multi_program_bundle(
+        converted.session.bundle_programs(), dict(converted.session.metadata), out,
+        quant=converted.quant, quantization_preapplied=True,
+        capture_trace=capture_trace, source_path=source_path, metadata=metadata)
+    if tuple(_shared_tensor_inventory(converted.shared_model)) != converted.source_inventory:
+        raise ValueError("stage-wise source weights changed during conversion")
+    verify_weights()
+    after_abis, after_routes = _stage_abis(converted.session)
+    if after_abis != converted.program_abis or tuple(after_routes) != converted.routes:
+        raise ValueError("stage-wise ABI or routes changed during conversion")
+    stage_receipts = {}
+    for name in by_name:
+        receipt = (out / "stages" / name / "capture_receipt.json").read_bytes()
+        if json.loads(receipt).get("materialized_abi", {}).get("complete") is not True:
+            raise ValueError(f"stage {name!r} lacks a complete materialized ABI")
+        stage_receipts[name] = hashlib.sha256(receipt).hexdigest()
+    binding = {
+        "schema": "m2m.stagewise-pt2e-binding.v1",
+        "scope": "one_source_model_verified_semantic_weights_separate_stage_storage",
+        "source_closure_verified": False,
+        "physical_weight_aliasing": False,
+        "quantization": selected_policy,
+        "shared_programs": list(converted.shared_programs),
+        "source_tensors": converted.source_inventory,
+        "frozen_weights": converted.frozen_weights,
+        "calibration_counts": converted.calibration_counts,
+        "program_abis": converted.program_abis,
+        "routes": converted.routes,
+        "stage_receipts": stage_receipts,
+    }
+    binding_path = out / "quantized-session-binding.json"
+    binding_path.write_text(json.dumps(binding, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    contract_path = out / "session_contract.yaml"
+    contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+    contract["quantized_session_binding"] = {
+        "path": binding_path.name,
+        "sha256": hashlib.sha256(binding_path.read_bytes()).hexdigest(),
+    }
+    contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+    summary["quantized_session_binding"] = str(binding_path)
+    summary["bundle_integrity"] = str(write_bundle_integrity(out))
+    return summary
