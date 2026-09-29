@@ -120,6 +120,18 @@ def test_static_w8a8_pt2e_quantizes_conv_and_uses_calibration():
     assert "tensor<8x3x3x3xi8>" in r.mlir_text
 
 
+def test_pt2e_converted_model_accepts_eval_at_bundle_boundary():
+    from m2m.capture.torchao_pipeline import apply_quantization
+
+    inputs = (torch.ones(1, 2),)
+    quantized = apply_quantization(
+        nn.Linear(2, 2).eval(), QuantizationConfig(scheme="int8_static_act_int8_weight"),
+        example_inputs=inputs)
+    quantized.eval()
+    with torch.no_grad():
+        assert torch.isfinite(quantized(*inputs)).all()
+
+
 def test_pt2e_integer_reference_executes_conv_and_linear():
     """The integer oracle uses frozen PT2E qparams and accounts for every contraction."""
     from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference

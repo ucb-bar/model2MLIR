@@ -98,8 +98,6 @@ def test_stagewise_pt2e_supports_method_only_shared_model():
 
 
 def test_stagewise_snapshot_is_bound_and_independently_rechecked(tmp_path, monkeypatch):
-    import m2m.capture.bundle as bundle_module
-
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     loader = tmp_path / "loader.py"
     loader.write_text("# tiny fixture loader\n")
@@ -111,35 +109,6 @@ def test_stagewise_snapshot_is_bound_and_independently_rechecked(tmp_path, monke
         package_root=Path(__file__).resolve().parents[1] / "m2m",
         loader=loader, model_roots={"checkpoint": model_source},
         support_roots={"runtime": runtime_source})
-
-    def tiny_stage_artifacts(programs, _session, out, **kwargs):
-        import yaml
-
-        assert kwargs["source_path"] == str(loader)
-        out = Path(out)
-        out.mkdir()
-        (out / "session_contract.yaml").write_text(yaml.safe_dump({"version": 2}))
-        sources = {
-            f"m2m/{member['path']}": member["sha256"]
-            for member in snapshot["owners"][0]["members"]
-            if member["kind"] == "file" and member["path"].endswith(".py")
-            and "__pycache__" not in Path(member["path"]).parts
-        }
-        for program in programs:
-            stage = out / "stages" / program["name"]
-            stage.mkdir(parents=True)
-            receipt = {
-                "schema": "m2m.capture-receipt.v1", "source_closure_verified": False,
-                "source": {"path": str(loader), "bytes": loader.stat().st_size,
-                           "sha256": hashlib.sha256(loader.read_bytes()).hexdigest()},
-                "tool": {"source_inventory_scope": "m2m_package_python_sources_only",
-                         "source_inventory_status": "complete", "source_sha256": sources},
-                "materialized_abi": {"complete": True},
-            }
-            (stage / "capture_receipt.json").write_text(json.dumps(receipt))
-        return {"n_programs": len(programs)}
-
-    monkeypatch.setattr(bundle_module, "write_multi_program_bundle", tiny_stage_artifacts)
     shared = Shared().eval()
     converted = _convert(shared, _session(shared), source_snapshot=snapshot)
     out = tmp_path / "fresh-stagewise"
