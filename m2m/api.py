@@ -241,6 +241,26 @@ def convert(
 
             scheme = getattr(quantization, "scheme", None) or str(quantization)
             result.module.attributes["prov.quantization"] = StringAttr(str(scheme))
+            if scheme in {"mx_gemmini_fp8", "mx_gemmini_fp6", "mx_gemmini_fp4"}:
+                import json
+                from m2m.capture.mx_gemmini_quant import RTL_COMMIT
+
+                census = getattr(model, "_m2m_quantization_stats", None)
+                if not isinstance(census, dict) or census.get("numeric_status") != "operand_fake_quant_only":
+                    result.diagnostics.append("MX graph lacks an operand quantization census")
+                    result.path_taken = "failed"
+                else:
+                    contract = {
+                        "schema": "m2m.mx_gemmini_capture.v1",
+                        "rtl_commit": RTL_COMMIT,
+                        "format": scheme.removeprefix("mx_gemmini_"),
+                        "block_size": 32,
+                        "scale_encoding": "e8m0",
+                        **census,
+                    }
+                    result.module.attributes["prov.mx_capture_contract"] = StringAttr(
+                        json.dumps(contract, sort_keys=True)
+                    )
             per_module = getattr(quantization, "per_module", None)
             if per_module:
                 # serialize the mixed-precision map as "pattern=scheme;pattern=scheme"

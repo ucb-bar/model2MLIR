@@ -6241,12 +6241,14 @@ def _make_math_unary(op_cls_name: str, hint: str):
 DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     # --- pointwise unary math (linalg.generic{math.*}) ---
     "aten.exp.default": _make_math_unary("ExpOp", "exp"),
+    "aten.exp2.default": _make_math_unary("Exp2Op", "exp2"),
     "aten.sqrt.default": _make_math_unary("SqrtOp", "sqrt"),
     "aten.tanh.default": _make_math_unary("TanhOp", "tanh"),
     "aten.abs.default": decompose_abs,
     "aten.floor.default": _make_math_unary("FloorOp", "floor"),
     "aten.ceil.default": _make_math_unary("CeilOp", "ceil"),
     "aten.log.default": _make_math_unary("LogOp", "log"),
+    "aten.log2.default": _make_math_unary("Log2Op", "log2"),
     # --- pre-wave-6 entries (kept) ---
     "aten.addmm.default": decompose_addmm,
     "aten.linear.default": decompose_linear,

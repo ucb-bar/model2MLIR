@@ -303,6 +303,65 @@ def apply_quantization(
             original_frontend_snapshot=original_frontend_snapshot,
         )
 
+    mx_formats = {
+        "mx_gemmini_fp8": "mxfp8",
+        "mx_gemmini_fp6": "mxfp6",
+        "mx_gemmini_fp4": "mxfp4",
+    }
+    if config.per_module and (
+        config.scheme in mx_formats or any(scheme in mx_formats for scheme in config.per_module.values())
+    ):
+        raise ValueError("per_module MX selection needs a whole-graph contraction policy")
+    if config.scheme in mx_formats and not config.per_module:
+        if not example_inputs:
+            raise ValueError("MX Gemmini graph quantization requires example_inputs")
+        from m2m.capture.mx_gemmini_quant import (
+            MXGemminiFakeQuantConfig, quantize_functional_contractions_,
+        )
+        from torchao.quantization import quantize_
+
+        format = mx_formats[config.scheme]
+        tile = 16 if format == "mxfp8" else 32
+        eligible = [module for module in model.modules()
+                    if isinstance(module, torch.nn.Linear)
+                    and module.in_features % 32 == 0
+                    and module.out_features % tile == 0]
+        quantize_(model, MXGemminiFakeQuantConfig(format=format),
+                  filter_fn=lambda module, _fqn: module in eligible)
+        exported = torch.export.export(model.eval(), tuple(example_inputs))
+        if original_frontend_snapshot is not None:
+            from m2m.capture.trace import attach_original_identity, snapshot_exported_program
+
+            actual = snapshot_exported_program(exported, stage="quantization_input")
+            attach_original_identity(exported, original_frontend_snapshot, actual)
+        graph_module = exported.module()
+        coverage = quantize_functional_contractions_(graph_module, format)
+        try:
+            from torch.ao.quantization import allow_exported_model_train_eval
+
+            allow_exported_model_train_eval(graph_module)
+        except (ImportError, AttributeError):
+            # PyTorch versions that removed the exported-model shim still
+            # install throwing train()/eval() methods on ExportedProgram.module().
+            # Capture calls eval() defensively; this graph is already frozen.
+            import types
+
+            def _set_frozen_training(self, mode=True):
+                if mode:
+                    raise ValueError("MX exported graph is inference-only")
+                self.training = False
+                return self
+
+            graph_module.train = types.MethodType(_set_frozen_training, graph_module)
+            graph_module.eval = types.MethodType(lambda self: self.train(False), graph_module)
+        graph_module._m2m_quantization_stats = {
+            "scheme": config.scheme,
+            "torchao_linear_modules": len(eligible),
+            **coverage,
+            "numeric_status": "operand_fake_quant_only",
+        }
+        return graph_module
+
     # NOTE: CompGen's NPU-custom FP8 schemes ("fp8_e4m3_po2[_npu]") were dropped
     # during extraction (they depended on NPU-specific modules). Reintroduce them
     # as a m2m.quant extension if needed.

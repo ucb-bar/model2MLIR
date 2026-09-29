@@ -328,6 +328,11 @@ def capture_frontend_artifact(
                 example_inputs=tuple(sample_inputs),
             )
         except Exception:
+            mx_schemes = {"mx_gemmini_fp8", "mx_gemmini_fp6", "mx_gemmini_fp4"}
+            if (quantization_config.scheme in mx_schemes or
+                    any(scheme in mx_schemes for scheme in
+                        (quantization_config.per_module or {}).values())):
+                raise
             active_model = model
 
     diagnostics = collect_diagnostics(active_model, sample_inputs)
