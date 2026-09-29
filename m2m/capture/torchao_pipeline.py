@@ -322,10 +322,17 @@ def apply_quantization(
 
         format = mx_formats[config.scheme]
         tile = 16 if format == "mxfp8" else 32
-        eligible = [module for module in model.modules()
-                    if isinstance(module, torch.nn.Linear)
-                    and module.in_features % 32 == 0
-                    and module.out_features % tile == 0]
+        eligible = []
+        skipped_linear = []
+        for name, module in model.named_modules():
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            if module.in_features % 32:
+                skipped_linear.append({"module": name, "reason": "K outside MX block size 32"})
+            elif module.out_features % tile:
+                skipped_linear.append({"module": name, "reason": f"N outside MX tile {tile}"})
+            else:
+                eligible.append(module)
         quantize_(model, MXGemminiFakeQuantConfig(format=format),
                   filter_fn=lambda module, _fqn: module in eligible)
         exported = torch.export.export(model.eval(), tuple(example_inputs))
@@ -356,7 +363,9 @@ def apply_quantization(
             graph_module.eval = types.MethodType(lambda self: self.train(False), graph_module)
         graph_module._m2m_quantization_stats = {
             "scheme": config.scheme,
+            "linear_modules_total": len(eligible) + len(skipped_linear),
             "torchao_linear_modules": len(eligible),
+            "linear_modules_skipped": skipped_linear,
             **coverage,
             "numeric_status": "operand_fake_quant_only",
         }
