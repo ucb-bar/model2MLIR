@@ -14,12 +14,13 @@ APIs and requires no TorchAO fork. The selected formats are
 ```python
 from m2m.capture.torchao_pipeline import QuantizationConfig, apply_quantization
 
-model = apply_quantization(
-    model.eval(),
+source_model = model.eval()
+captured = apply_quantization(
+    source_model,
     QuantizationConfig(scheme="mx_gemmini_fp8"),
     example_inputs=(sample_input,),
 )
-print(model._m2m_quantization_stats)
+print(captured._m2m_quantization_stats)
 ```
 
 For the one-layer TinyLlama architecture smoke test, set
@@ -91,11 +92,14 @@ For one eligible rank-2 Linear site, the operand handoff is explicit:
 ```python
 from m2m.capture.mx_gemmini_quant import linear_contraction_operands
 
-operands = linear_contraction_operands(captured.project, activation)
+operands = linear_contraction_operands(source_model.project, activation)
 # A codes [M, K], B codes [K, N], activation scales [M, K/32],
 # weight scales [N, K/32]; all code and scale tensors are uint8.
 ```
 
+`apply_quantization` replaces eligible modules in `source_model` and returns an
+exported graph for whole-model capture. Use the transformed source module for
+this operand handoff; use `captured` for the contraction census and MLIR import.
 `MXGemminiLinear` stores weights in PyTorch's [N, K] order. This helper presents
 their codes as B[K, N] while retaining weight scales by output channel. It
 quantizes the actual activation dynamically and leaves bias outside the
