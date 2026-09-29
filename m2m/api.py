@@ -18,6 +18,7 @@ from xdsl.dialects.builtin import ModuleOp
 
 from m2m.capture.torch_mlir_bridge import bridge_fx_graph, module_to_text
 from m2m.capture.torchao_pipeline import QuantizationConfig, apply_quantization
+from m2m.capture.external_quantization import ExternalQuantizationConfig, manifest_digest, validate_manifest
 
 
 @dataclass
@@ -40,6 +41,7 @@ class ConversionResult:
     diagnostics: list[str] = field(default_factory=list)
     capture_trace: dict[str, Any] | None = None
     exported_program: Any | None = field(default=None, repr=False)
+    quantization_manifest: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -52,7 +54,7 @@ def convert(
     example_inputs: tuple[Any, ...],
     *,
     output_type: str = "linalg-on-tensors",
-    quantization: QuantizationConfig | None = None,
+    quantization: QuantizationConfig | ExternalQuantizationConfig | None = None,
     func_name: str = "forward",
     allow_fallback: bool = True,
     decompose: bool = True,
@@ -243,28 +245,6 @@ def convert(
 
             scheme = getattr(quantization, "scheme", None) or str(quantization)
             result.module.attributes["prov.quantization"] = StringAttr(str(scheme))
-            if scheme in {"mx_gemmini_fp8", "mx_gemmini_fp6", "mx_gemmini_fp4"}:
-                import json
-                from m2m.capture.mx_gemmini_quant import RTL_COMMIT, RTL_CONFIG, RTL_CONFIG_CLASS
-
-                census = getattr(model, "_m2m_quantization_stats", None)
-                if not isinstance(census, dict) or census.get("numeric_status") != "operand_fake_quant_only":
-                    result.diagnostics.append("MX graph lacks an operand quantization census")
-                    result.path_taken = "failed"
-                else:
-                    contract = {
-                        "schema": "m2m.mx_gemmini_capture.v1",
-                        "rtl_commit": RTL_COMMIT,
-                        "rtl_config": RTL_CONFIG,
-                        "rtl_config_class": RTL_CONFIG_CLASS,
-                        "format": scheme.removeprefix("mx_gemmini_"),
-                        "block_size": 32,
-                        "scale_encoding": "e8m0",
-                        **census,
-                    }
-                    result.module.attributes["prov.mx_capture_contract"] = StringAttr(
-                        json.dumps(contract, sort_keys=True)
-                    )
             per_module = getattr(quantization, "per_module", None)
             if per_module:
                 # serialize the mixed-precision map as "pattern=scheme;pattern=scheme"
@@ -272,6 +252,19 @@ def convert(
                 result.module.attributes["prov.quantization_mixed"] = StringAttr(mixed)
         except Exception:  # noqa: BLE001
             pass
+
+    external_manifest = None
+    if isinstance(quantization, ExternalQuantizationConfig):
+        # This is a selected input boundary. A missing or altered manifest is an
+        # error, including for a caller-supplied prequantized model.
+        manifest = getattr(model, "_m2m_external_quantization_manifest", None)
+        validate_manifest(manifest, quantization)
+        if result.module is None:
+            raise ValueError("external quantization requires a parsed MLIR module")
+        from xdsl.dialects.builtin import StringAttr
+
+        external_manifest = manifest
+        result.module.attributes["prov.quantization_manifest_sha256"] = StringAttr(manifest_digest(manifest))
 
     # Preserve QDQ: fold the implicit weight-dequant (dtype_cast -> mul scale) into an
     # explicit quant_ext.dequantize op so the quantization is first-class/matchable. Only
@@ -339,8 +332,12 @@ def convert(
         except Exception:  # noqa: BLE001
             pass
 
-    mlir_text = result.mlir_text or (module_to_text(result.module, generic=capture_trace)
-                                   if result.module is not None else "")
+    mlir_text = (
+        module_to_text(result.module, generic=capture_trace)
+        if isinstance(quantization, ExternalQuantizationConfig) and result.module is not None
+        else result.mlir_text or (module_to_text(result.module, generic=capture_trace)
+                                  if result.module is not None else "")
+    )
     trace = None
     if capture_trace:
         from m2m.capture.trace import finalize_trace
@@ -357,6 +354,7 @@ def convert(
         diagnostics=list(result.diagnostics),
         capture_trace=trace,
         exported_program=exported_program,
+        quantization_manifest=external_manifest,
     )
 
 

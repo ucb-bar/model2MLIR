@@ -293,38 +293,7 @@ _QAT: tuple[TorchAOScheme, ...] = (
 # Local TorchAO extension configs (registered through public TorchAO API)
 # ---------------------------------------------------------------------------
 
-_COMPGEN_CUSTOM: tuple[TorchAOScheme, ...] = (
-    TorchAOScheme(
-        name="mx_gemmini_fp8",
-        config_class_path="m2m.capture.mx_gemmini_quant.MXGemminiFakeQuantConfig",
-        weight_dtype="mxfp8_e4m3",
-        activation_dtype="mxfp8_e4m3",
-        granularity="per_block",
-        stability="compgen_custom",
-        target_hardware="gemmini_mx",
-        params={"format": "mxfp8", "group_size": 32, "scale_dtype": "e8m0", "rounding": "rne"},
-        notes="BF16-to-MX E4M3 operand fake quant; TorchAO module handler plus graph pass. "
-              "RTL arithmetic and memory behavior require separate qualification.",
-    ),
-    TorchAOScheme(
-        name="mx_gemmini_fp6",
-        config_class_path="m2m.capture.mx_gemmini_quant.MXGemminiFakeQuantConfig",
-        weight_dtype="mxfp6_e3m2",
-        activation_dtype="mxfp6_e3m2",
-        granularity="per_block", stability="compgen_custom", target_hardware="gemmini_mx",
-        params={"format": "mxfp6", "group_size": 32, "scale_dtype": "e8m0", "rounding": "rne"},
-        notes="BF16-to-MX E3M2 operand fake quant; requires RTL arithmetic qualification.",
-    ),
-    TorchAOScheme(
-        name="mx_gemmini_fp4",
-        config_class_path="m2m.capture.mx_gemmini_quant.MXGemminiFakeQuantConfig",
-        weight_dtype="mxfp4_e2m1",
-        activation_dtype="mxfp4_e2m1",
-        granularity="per_block", stability="compgen_custom", target_hardware="gemmini_mx",
-        params={"format": "mxfp4", "group_size": 32, "scale_dtype": "e8m0", "rounding": "rne"},
-        notes="BF16-to-E3M1-to-E2M1 operand fake quant; requires RTL arithmetic qualification.",
-    ),
-)
+_COMPGEN_CUSTOM: tuple[TorchAOScheme, ...] = ()
 
 
 # ---------------------------------------------------------------------------

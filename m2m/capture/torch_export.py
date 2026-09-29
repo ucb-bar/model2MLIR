@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 
 from m2m.capture.dynamo_baseline import DynamoReport, collect_diagnostics
+from m2m.capture.external_quantization import ExternalQuantizationConfig
 from m2m.capture.torchao_pipeline import QuantizationConfig, apply_quantization
 from m2m.capture.unsupported import UnsupportedOpResolution, recover_unsupported_operators
 from m2m.capture.unsupported.introspect import runtime_versions
@@ -89,7 +90,7 @@ class CaptureArtifact:
     analysis_success: bool = False
     range_constraints: tuple[RangeConstraint, ...] = ()
     decomposition_targets: tuple[str, ...] = ()
-    quantization_config: QuantizationConfig | None = None
+    quantization_config: QuantizationConfig | ExternalQuantizationConfig | None = None
     runtime_versions: dict[str, str] = field(default_factory=dict)
     unsupported_resolutions: list[UnsupportedOpResolution] = field(default_factory=list)
     synthesized_payload_translations: dict[str, Any] = field(default_factory=dict)
@@ -304,7 +305,7 @@ def capture_frontend_artifact(
     sample_inputs: Any,
     dynamic_shapes: dict[str, Any] | None = None,
     *,
-    quantization_config: QuantizationConfig | None = None,
+    quantization_config: QuantizationConfig | ExternalQuantizationConfig | None = None,
     run_default_decompositions: bool = True,
     export_decomposition_table: dict[Any, Any] | None = None,
 ) -> CaptureArtifact:
@@ -325,10 +326,7 @@ def capture_frontend_artifact(
             inputs = tuple(sample_inputs) if isinstance(sample_inputs, (tuple, list)) else (sample_inputs,)
             active_model = apply_quantization(model, quantization_config, example_inputs=inputs)
         except Exception:
-            mx_schemes = {"mx_gemmini_fp8", "mx_gemmini_fp6", "mx_gemmini_fp4"}
-            if (quantization_config.scheme in mx_schemes or
-                    any(scheme in mx_schemes for scheme in
-                        (quantization_config.per_module or {}).values())):
+            if isinstance(quantization_config, ExternalQuantizationConfig):
                 raise
             active_model = model
 
