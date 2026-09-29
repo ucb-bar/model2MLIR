@@ -59,6 +59,7 @@ def convert(
     preserve_qdq: bool = True,
     fully_standard: bool = False,
     weights_path: str | None = None,
+    quantization_preapplied: bool = False,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -76,7 +77,11 @@ def convert(
             only, no fallback), or "fx_importer" (skip torch-mlir entirely). Use
             "fx_importer" for models whose torch-mlir lowering OOMs (e.g. the
             vision-heavy VLAs) -- an OOM SIGKILL can't be caught for fallback.
+        quantization_preapplied: the supplied model already contains the named
+            quantization. Keep its provenance without applying the transform twice.
     """
+    if quantization_preapplied and quantization is None:
+        raise ValueError("quantization_preapplied requires a quantization config")
     if backend == "torch_mlir":
         allow_fallback = False
 
@@ -100,7 +105,7 @@ def convert(
             return convert_jax(model, example_inputs)
         except ImportError:
             pass  # no jax; fall through and let the torch path try (will error clearly)
-    if quantization is not None:
+    if quantization is not None and not quantization_preapplied:
         # Quantized (tensor-subclass) weights are swapped by .to()/.eval() during
         # capture; disable swap-on-conversion process-wide so capture uses copy
         # semantics and doesn't trip the weakref guard.

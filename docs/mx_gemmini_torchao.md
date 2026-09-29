@@ -46,6 +46,20 @@ functional attention matmuls for each format, with no skipped contractions and
 logits shape `[1, 32, 32000]`. This is one randomly initialized decoder layer,
 not a whole-checkpoint accuracy result.
 
+When a caller applies `apply_quantization` before conversion to retain the
+quantization census and its own eager reference, pass the returned model to
+`m2m.convert` with the same config and `quantization_preapplied=True`. This
+records the selected scheme without running the TorchAO transform twice:
+
+```python
+import m2m
+
+config = QuantizationConfig(scheme="mx_gemmini_fp8")
+captured = apply_quantization(model.eval(), config, example_inputs=inputs)
+result = m2m.convert(captured, inputs, quantization=config,
+                     quantization_preapplied=True, backend="fx_importer")
+```
+
 For a full-checkpoint diagnostic, run the reproducible probe with an explicit
 artifact directory:
 

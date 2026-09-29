@@ -165,3 +165,32 @@ def test_mx_capture_import_has_explicit_contract_and_no_opaque_calls(scheme):
     assert "GemminiMxFPConfigs.standaloneMxFPConfig" in result.mlir_text
     assert 'operand_fake_quant_only' in result.mlir_text
     assert 'func.func private' not in result.mlir_text
+
+
+def test_preapplied_mx_capture_is_not_quantized_twice(monkeypatch):
+    pytest.importorskip("torchao")
+    import m2m.api as api
+    from m2m.capture.torchao_pipeline import QuantizationConfig, apply_quantization
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(32, 32)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    inputs = (torch.randn(32, 32),)
+    config = QuantizationConfig(scheme="mx_gemmini_fp8")
+    captured = apply_quantization(Tiny().eval(), config, example_inputs=inputs)
+
+    def fail_requantization(*_args, **_kwargs):
+        raise AssertionError("preapplied quantization was applied again")
+
+    monkeypatch.setattr(api, "apply_quantization", fail_requantization)
+    result = api.convert(captured, inputs, quantization=config,
+                         quantization_preapplied=True, backend="fx_importer")
+    assert result.ok, result.diagnostics
+    assert 'prov.mx_capture_contract' in result.mlir_text
+    with pytest.raises(ValueError, match="requires a quantization config"):
+        api.convert(captured, inputs, quantization_preapplied=True)
