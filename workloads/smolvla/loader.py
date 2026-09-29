@@ -130,7 +130,7 @@ class SmolVLAActionDecodeStage(nn.Module):
 
 
 class SmolVLAMultiProgramCapture:
-    """Deferred capture that quantizes shared SmolVLA weights once before all three programs."""
+    """Deferred capture over one shared SmolVLA model and three named programs."""
 
     def __init__(self, model, inputs, *, paper_ready: bool, full_checkpoint: bool,
                  provenance: dict) -> None:
@@ -223,6 +223,27 @@ class SmolVLAMultiProgramCapture:
     def external_runtime_session(self):
         """Public model-agnostic capability consumed by external runtime exporters."""
         return self._external_runtime_session()
+
+    @property
+    def shared_model(self):
+        """The one source object used by both quantizable stage wrappers."""
+        return self.model
+
+    def stagewise_pt2e_session(self, quant, *, calibration_inputs):
+        """Opt-in named PT2E capture with caller-supplied stage calibration.
+
+        PT2E converts ``forward`` on the prefix and flow wrappers separately;
+        it cannot replace ``VLAFlowMatching`` with one transformed GraphModule.
+        The generic primitive verifies both frozen encodings against this source
+        model and keeps independent stage storage explicit. No paper-readiness or
+        source-closure claim is granted by this capability.
+        """
+        from m2m.capture.stagewise_pt2e import quantize_stagewise_pt2e_session
+
+        return quantize_stagewise_pt2e_session(
+            self.shared_model, self.external_runtime_session(), quant=quant,
+            shared_programs=("prefix_encode", "flow_denoise"),
+            calibration_inputs=calibration_inputs)
 
     def write_bundle(self, out: str | Path, *, quant=None) -> dict:
         # Capture FP32 quality before optional in-place torchAO conversion.
