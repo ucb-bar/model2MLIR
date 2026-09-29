@@ -86,6 +86,22 @@ by 32, and M/N divisible by 16 (MXFP8) or 32 (MXFP6/MXFP4).
 The capture stats also report the total `nn.Linear` count and list each module
 left unquantized because its K or N dimension fails that policy.
 
+For one eligible rank-2 Linear site, the operand handoff is explicit:
+
+```python
+from m2m.capture.mx_gemmini_quant import linear_contraction_operands
+
+operands = linear_contraction_operands(captured.project, activation)
+# A codes [M, K], B codes [K, N], activation scales [M, K/32],
+# weight scales [N, K/32]; all code and scale tensors are uint8.
+```
+
+`MXGemminiLinear` stores weights in PyTorch's [N, K] order. This helper presents
+their codes as B[K, N] while retaining weight scales by output channel. It
+quantizes the actual activation dynamically and leaves bias outside the
+contraction payload. The out-of-tree compiler still owns operand packing,
+scale-bank mapping, FP6 codebook selection, transfer scheduling, and commands.
+
 Operand conversion begins with BF16, uses a per-32-element scale
 `2^floor(log2(max(amax, 2^-23)))`, E8M0 exponent encoding, and RNE element
 rounding. FP8 uses OCP E4M3; FP6 uses E3M2; FP4 rounds through E3M1 then

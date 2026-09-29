@@ -120,6 +120,47 @@ class MXGemminiLinear(nn.Module):
         return F.linear(activation, self.weight.to(torch.bfloat16), bias).to(x.dtype)
 
 
+@dataclass(frozen=True)
+class MXGemminiContractionOperands:
+    """Logical matrices and E8M0 scales before target-specific packing.
+
+    ``activation_codes`` is A[M, K], ``weight_codes`` is B[K, N],
+    ``activation_scales`` is [M, K/32], and ``weight_scales`` is [N, K/32].
+    This is an operand handoff, not an executable or numerically certified
+    accelerator contraction. Bias is intentionally outside the payload.
+    """
+
+    format: str
+    activation_codes: Tensor
+    weight_codes: Tensor
+    activation_scales: Tensor
+    weight_scales: Tensor
+
+
+def linear_contraction_operands(module: MXGemminiLinear, activation: Tensor) -> MXGemminiContractionOperands:
+    """Prepare one rank-2 Linear site for an out-of-tree MX layout compiler.
+
+    A Linear stores weights as [N, K]. A contraction compiler consumes B[K, N],
+    while E8M0 weight scales remain grouped by output channel [N, K/32].
+    Dynamic activations are quantized from the caller's actual input.
+    """
+    if not isinstance(module, MXGemminiLinear):
+        raise TypeError("expected an MXGemminiLinear module")
+    tile = 16 if module.format == "mxfp8" else 32
+    if activation.ndim != 2 or activation.shape[0] % tile:
+        raise ValueError(f"MX {module.format} Linear activation M must be a multiple of {tile}")
+    if activation.shape[1] != module.weight_codes.shape[1]:
+        raise ValueError("Linear activation K differs from the static weight K")
+    _, activation_codes, activation_scales = quantize_mx_gemmini(activation, module.format)
+    return MXGemminiContractionOperands(
+        module.format,
+        activation_codes,
+        module.weight_codes.transpose(0, 1),
+        activation_scales,
+        module.weight_scale_e8m0,
+    )
+
+
 try:
     from torchao.core.config import AOBaseConfig
     from torchao.quantization.transform_module import register_quantize_module_handler

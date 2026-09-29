@@ -3,7 +3,12 @@
 import pytest
 import torch
 
-from m2m.capture.mx_gemmini_quant import _dequant_operand_for_graph, quantize_mx_gemmini
+from m2m.capture.mx_gemmini_quant import (
+    MXGemminiLinear,
+    _dequant_operand_for_graph,
+    linear_contraction_operands,
+    quantize_mx_gemmini,
+)
 
 
 def test_mx_operand_rounding_scale_floor_and_fp4_intermediate():
@@ -44,6 +49,30 @@ def test_rhs_matmul_groups_scales_on_k_axis():
     assert scales.shape == (2, 32)
     assert torch.all(scales[0] == 127)
     assert torch.all(scales[1] == 129)
+
+
+@pytest.mark.parametrize("format", ["mxfp8", "mxfp6", "mxfp4"])
+def test_linear_handoff_preserves_k_axis_and_weight_scale_orientation(format):
+    source = torch.nn.Linear(64, 32, bias=False)
+    with torch.no_grad():
+        source.weight.zero_()
+        source.weight[0, :] = 1.0
+        source.weight[1, :] = 4.0
+    module = MXGemminiLinear(source, format)
+    activation = torch.cat((torch.ones(32, 32), 4.0 * torch.ones(32, 32)), dim=1)
+    operand = linear_contraction_operands(module, activation)
+    assert operand.format == format
+    assert operand.activation_codes.shape == (32, 64)
+    assert operand.weight_codes.shape == (64, 32)
+    assert operand.activation_scales.shape == (32, 2)
+    assert operand.weight_scales.shape == (32, 2)
+    assert operand.activation_scales[0].tolist() == [127, 129]
+    assert operand.weight_scales[0].tolist() == [127, 127]
+    assert operand.weight_scales[1].tolist() == [129, 129]
+    assert torch.equal(operand.weight_codes[:, 0], module.weight_codes[0, :])
+    assert torch.equal(operand.weight_codes[:, 1], module.weight_codes[1, :])
+    with pytest.raises(ValueError, match="activation K differs"):
+        linear_contraction_operands(module, torch.zeros(32, 32))
 
 
 @pytest.mark.parametrize("format,expected_negative_zero", [
