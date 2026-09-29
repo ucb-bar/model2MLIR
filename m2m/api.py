@@ -294,7 +294,8 @@ def coverage_report(
     """
     from m2m.capture.torch_export import capture_frontend_artifact
 
-    if quantization is not None and not str(quantization.scheme).startswith("mx_gemmini_"):
+    mx_schemes = {"mx_gemmini_fp8", "mx_gemmini_fp6", "mx_gemmini_fp4"}
+    if quantization is not None and quantization.scheme not in mx_schemes:
         model = apply_quantization(model, quantization)
 
     artifact = capture_frontend_artifact(model, example_inputs, quantization_config=quantization)
