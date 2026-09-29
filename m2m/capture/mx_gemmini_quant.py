@@ -50,8 +50,12 @@ def _round_grid(x: Tensor, fmt: str) -> tuple[Tensor, Tensor]:
     code = torch.where(choose_upper, upper, lower).to(torch.uint8)
     code = code | (torch.signbit(x).to(torch.uint8) << (_FORMATS[fmt][0] + _FORMATS[fmt][1]))
     unsigned_code = code.to(torch.int32) & ((1 << (_FORMATS[fmt][0] + _FORMATS[fmt][1])) - 1)
+    if fmt == "mxfp4":
+        # E3M1Tofp4 emits code 0 for underflow, independent of the input sign.
+        code = torch.where(unsigned_code == 0, torch.zeros_like(code), code)
     magnitude = grid[unsigned_code]
-    return torch.where(torch.signbit(x), -magnitude, magnitude), code
+    sign = torch.signbit(x) & ((unsigned_code != 0) if fmt == "mxfp4" else True)
+    return torch.where(sign, -magnitude, magnitude), code
 
 
 def quantize_mx_gemmini(value: Tensor, format: str = "mxfp8", axis: int = -1) -> tuple[Tensor, Tensor, Tensor]:
@@ -183,7 +187,15 @@ def _round_grid_arithmetic(value: Tensor, format: str) -> Tensor:
                            torch.full_like(normal_exponent, float(emin)), normal_exponent)
     quantum = torch.exp2(exponent - fraction_bits)
     rounded = (torch.round(magnitude / quantum) * quantum).clamp(max=_MAX_MAGNITUDE[format])
-    return torch.where(value < 0, -rounded, rounded)
+    signed = torch.where(value < 0, -rounded, rounded)
+    if format == "mxfp4":
+        # The RTL's E3M1-to-E2M1 conversion canonicalizes every zero to +0.
+        signed = torch.where(rounded == 0, torch.zeros_like(signed), signed)
+    else:
+        # A comparison treats -0 as zero. Multiplication by +0 retains its sign
+        # and uses ops that the generic MLIR importer can lower.
+        signed = torch.where(value == 0, value * 0.0, signed)
+    return signed
 
 
 def quantize_functional_contractions_(graph_module: torch.fx.GraphModule, format: str) -> dict:
