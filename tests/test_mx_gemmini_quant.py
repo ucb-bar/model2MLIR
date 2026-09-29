@@ -117,6 +117,32 @@ def test_fused_attention_refused_when_contractions_are_hidden():
                            example_inputs=(torch.randn(1, 2, 32, 32),))
 
 
+def test_mx_capture_reports_linear_modules_left_unquantized():
+    pytest.importorskip("torchao")
+    from m2m.capture.torchao_pipeline import QuantizationConfig, apply_quantization
+
+    class Mixed(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.supported = torch.nn.Linear(32, 32)
+            self.unsupported = torch.nn.Linear(32, 31)
+
+        def forward(self, x):
+            return self.supported(x), self.unsupported(x)
+
+    captured = apply_quantization(
+        Mixed().eval(), QuantizationConfig(scheme="mx_gemmini_fp8"),
+        example_inputs=(torch.randn(32, 32),),
+    )
+    stats = captured._m2m_quantization_stats
+    assert stats["linear_modules_total"] == 2
+    assert stats["torchao_linear_modules"] == 1
+    assert stats["linear_modules_skipped"] == [
+        {"module": "unsupported", "reason": "N outside MX tile 16"},
+    ]
+    assert len(stats["functional_contractions_skipped"]) == 1
+
+
 @pytest.mark.parametrize("scheme", ["mx_gemmini_fp8", "mx_gemmini_fp6", "mx_gemmini_fp4"])
 def test_mx_capture_import_has_explicit_contract_and_no_opaque_calls(scheme):
     pytest.importorskip("torchao")

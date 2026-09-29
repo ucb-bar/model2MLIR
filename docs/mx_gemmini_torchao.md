@@ -69,6 +69,8 @@ exported-graph pass inserts operand Q/DQ at eligible functional `linear`,
 matmuls. The pass reports skipped sites. It rejects fused SDPA because that op
 hides both contractions. The current first-pass tile policy requires K divisible
 by 32, and M/N divisible by 16 (MXFP8) or 32 (MXFP6/MXFP4).
+The capture stats also report the total `nn.Linear` count and list each module
+left unquantized because its K or N dimension fails that policy.
 
 Operand conversion begins with BF16, uses a per-32-element scale
 `2^floor(log2(max(amax, 2^-23)))`, E8M0 exponent encoding, and RNE element
