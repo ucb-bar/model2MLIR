@@ -124,8 +124,9 @@ class MXGemminiLinear(nn.Module):
 class MXGemminiContractionOperands:
     """Logical matrices and E8M0 scales before target-specific packing.
 
-    ``activation_codes`` is A[M, K], ``weight_codes`` is B[K, N],
-    ``activation_scales`` is [M, K/32], and ``weight_scales`` is [N, K/32].
+    ``activation_codes`` is A[..., M, K], ``weight_codes`` is B[..., K, N],
+    ``activation_scales`` is [..., M, K/32], and ``weight_scales`` is
+    [..., N, K/32]. The leading batch axes, if any, match exactly.
     This is an operand handoff, not an executable or numerically certified
     accelerator contraction. Bias is intentionally outside the payload.
     """
@@ -158,6 +159,32 @@ def linear_contraction_operands(module: MXGemminiLinear, activation: Tensor) -> 
         module.weight_codes.transpose(0, 1),
         activation_scales,
         module.weight_scale_e8m0,
+    )
+
+
+def functional_contraction_operands(
+    lhs: Tensor, rhs: Tensor, format: str = "mxfp8"
+) -> MXGemminiContractionOperands:
+    """Prepare visible matmul operands with independent rank-2 to rank-4 batches.
+
+    The LHS groups along its last axis and the RHS groups along its K axis.
+    This exposes element codes and E8M0 bytes only; it does not identify the
+    site in an exported graph or schedule the hardware contraction.
+    """
+    if format not in ("mxfp8", "mxfp6", "mxfp4"):
+        raise ValueError(f"unsupported MX format: {format}")
+    if lhs.ndim not in (2, 3, 4) or rhs.ndim != lhs.ndim or lhs.shape[:-2] != rhs.shape[:-2]:
+        raise ValueError("MX functional matmul needs matching rank-2 to rank-4 batch axes")
+    m, k = lhs.shape[-2:]
+    rhs_k, n = rhs.shape[-2:]
+    tile = 16 if format == "mxfp8" else 32
+    if k != rhs_k or k % GROUP or m % tile or n % tile:
+        raise ValueError(f"MX {format} matmul needs matching K/32 and M/N tile {tile}")
+    _, activation_codes, activation_scales = quantize_mx_gemmini(lhs, format, axis=-1)
+    _, weight_codes, weight_scales = quantize_mx_gemmini(rhs, format, axis=-2)
+    return MXGemminiContractionOperands(
+        format, activation_codes, weight_codes,
+        activation_scales, weight_scales.transpose(-2, -1),
     )
 
 

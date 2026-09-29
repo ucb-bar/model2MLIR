@@ -106,6 +106,22 @@ quantizes the actual activation dynamically and leaves bias outside the
 contraction payload. The out-of-tree compiler still owns operand packing,
 scale-bank mapping, FP6 codebook selection, transfer scheduling, and commands.
 
+Visible functional matmuls can use the same logical handoff, including the
+independent batch axes in eager attention QK and PV:
+
+```python
+from m2m.capture.mx_gemmini_quant import functional_contraction_operands
+
+operands = functional_contraction_operands(lhs, rhs, "mxfp8")
+# A codes [..., M, K], B codes [..., K, N],
+# activation scales [..., M, K/32], weight scales [..., N, K/32].
+```
+
+The helper requires rank 2 to 4, identical batch axes, K divisible by 32,
+and aligned M/N tiles. It prepares tensors from the actual operands; the
+compiler must still identify each graph site, pack each batch, and schedule
+its transfers and commands on the selected RTL.
+
 Operand conversion begins with BF16, uses a per-32-element scale
 `2^floor(log2(max(amax, 2^-23)))`, E8M0 exponent encoding, and RNE element
 rounding. FP8 uses OCP E4M3; FP6 uses E3M2; FP4 rounds through E3M1 then

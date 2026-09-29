@@ -6,6 +6,7 @@ import torch
 from m2m.capture.mx_gemmini_quant import (
     MXGemminiLinear,
     _dequant_operand_for_graph,
+    functional_contraction_operands,
     linear_contraction_operands,
     quantize_mx_gemmini,
 )
@@ -73,6 +74,34 @@ def test_linear_handoff_preserves_k_axis_and_weight_scale_orientation(format):
     assert torch.equal(operand.weight_codes[:, 1], module.weight_codes[1, :])
     with pytest.raises(ValueError, match="activation K differs"):
         linear_contraction_operands(module, torch.zeros(32, 32))
+
+
+@pytest.mark.parametrize("format", ["mxfp8", "mxfp6", "mxfp4"])
+def test_functional_matmul_handoff_matches_linear_and_preserves_batch_axes(format):
+    source = torch.nn.Linear(32, 32, bias=False)
+    with torch.no_grad():
+        source.weight[:16].fill_(1.0)
+        source.weight[16:].fill_(2.0)
+    activation = torch.ones(32, 32)
+    activation[16:].fill_(2.0)
+    expected = linear_contraction_operands(MXGemminiLinear(source, format), activation)
+    actual = functional_contraction_operands(activation, source.weight.T, format)
+    for name in ("activation_codes", "weight_codes", "activation_scales", "weight_scales"):
+        assert torch.equal(getattr(actual, name), getattr(expected, name))
+
+    batched = functional_contraction_operands(
+        activation.expand(2, 3, 32, 32), source.weight.T.expand(2, 3, 32, 32), format
+    )
+    assert batched.activation_codes.shape == (2, 3, 32, 32)
+    assert batched.weight_codes.shape == (2, 3, 32, 32)
+    assert batched.activation_scales.shape == (2, 3, 32, 1)
+    assert batched.weight_scales.shape == (2, 3, 32, 1)
+    assert torch.equal(batched.weight_scales[1, 2], actual.weight_scales)
+
+    with pytest.raises(ValueError, match="matching rank-2 to rank-4 batch axes"):
+        functional_contraction_operands(activation.expand(2, 32, 32), source.weight.T, format)
+    with pytest.raises(ValueError, match="matching K/32"):
+        functional_contraction_operands(activation[:, :-1], source.weight.T, format)
 
 
 @pytest.mark.parametrize("format,expected_negative_zero", [
