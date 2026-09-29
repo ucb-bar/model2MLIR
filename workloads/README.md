@@ -67,6 +67,17 @@ The driver always also installs `xdsl structlog ml_dtypes torchao` and the `m2m`
 3. For each format, calls `m2m.convert(model, inputs, backend="fx_importer",
    quantization=..., level=...)`, writes the `.mlir`, and checks 0 opaque ops.
 
+For a deferred multi-program loader that implements `write_bundle(out, quant=...)`,
+the same generic CLI instead writes `<model>[_format]_session/` with a root
+`session_contract.yaml` and separate `stages/<name>/model.mlir` plus
+`capture_receipt.json` for each program. It checks the stage roster, byte/hash
+binding of every receipt-listed artifact, required bundle members, and opaque-op
+count before reporting success. Session captures only support
+`linalg-on-tensors`; `bf16`/`fp16` dtype-cast formats and `--sections` are refused
+rather than silently captured as FP32. These are capture artifacts, not
+source-closure or execution proof; the driver reports
+`source_closure_verified: false`.
+
 The two output levels (see `docs/OP_TAXONOMY.md`): `linalg-on-tensors` (default, portable
 standard dialects) and `high-level` (opt-in `linalg_ext.*` named ops; `m2m.expand_to_linalg`
 lowers it back). Quantization is QDQ-preserved by default (`quant_ext.dequantize` on the

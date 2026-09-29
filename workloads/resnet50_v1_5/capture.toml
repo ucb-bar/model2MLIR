@@ -1,0 +1,9 @@
+venv = "/scratch/agustin/projects/model2MLIR/.venv"
+python = "3.12"
+deps = ["torchvision"]
+
+[env]
+M2M_SESSION_STEPS = "256"
+# Paper capture additionally requires M2M_RESNET_INPUT_NPZ,
+# M2M_RESNET_INPUT_SOURCE, M2M_RESNET_PREPROCESSING=IMAGENET1K_V2,
+# and M2M_RESNET_PAPER_READY=1.

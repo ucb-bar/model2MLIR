@@ -229,6 +229,33 @@ def test_mx_capture_import_has_explicit_contract_and_no_opaque_calls(scheme):
     assert 'func.func private' not in result.mlir_text
 
 
+def test_mx_capture_trace_reports_missing_external_quantizer_lineage():
+    pytest.importorskip("torchao")
+    from m2m.api import convert
+    from m2m.capture.torchao_pipeline import QuantizationConfig
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(32, 32, bias=False)
+
+        def forward(self, x):
+            return self.linear(x) @ x.transpose(-1, -2)
+
+    result = convert(
+        Tiny().eval(), (torch.ones(32, 32),),
+        quantization=QuantizationConfig(scheme="mx_gemmini_fp8"),
+        backend="fx_importer", capture_trace=True,
+    )
+    assert result.ok, result.diagnostics
+    assert "prov.mx_capture_contract" in result.mlir_text
+    assert result.capture_trace is not None
+    assert result.capture_trace["status"] == "diagnostic"
+    assert "original -> quantized correspondence incomplete" in result.capture_trace["blockers"]
+    assert result.capture_trace["graphs"]["original"]["status"] == "complete"
+    assert result.capture_trace["graphs"]["quantized"]["status"] == "complete"
+
+
 def test_preapplied_mx_capture_is_not_quantized_twice(monkeypatch):
     pytest.importorskip("torchao")
     import m2m.api as api

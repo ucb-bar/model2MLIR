@@ -157,6 +157,11 @@ def get_model_and_inputs():
         "num_attention_heads": 8,
         "num_key_value_heads": 4,
         "max_position_embeddings": 2048,
+        # Pin semantic configuration rather than inheriting a Transformers-version default.
+        # BitVLA's vendored 4.51 BitNetConfig defaults to SiLU, while upstream 5.0 defaults to
+        # ReLU-squared; omitting this made the same captured weights instantiate different math in
+        # downstream compiler environments.
+        "hidden_act": "silu",
         "tie_word_embeddings": False,
     }
     vision_config = {

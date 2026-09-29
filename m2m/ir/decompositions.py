@@ -819,6 +819,272 @@ def decompose_permute(
     return _opaque_decomp("aten_permute", operands[:1], meta, "layout", pattern_hint="permute")
 
 
+def decompose_pixel_shuffle(operands, meta, node_name):
+    """aten.pixel_shuffle(input, r): (N, C*r*r, H, W) -> (N, C, H*r, W*r).
+
+    Pure data movement, so it lowers to reshape / transpose / reshape and costs no arithmetic:
+
+        (N, C*r*r, H, W) -> (N, C, r, r, H, W) -> (N, C, H, r, W, r) -> (N, C, H*r, W*r)
+
+    The middle permutation is the whole content of the op: the two upscale axes have to be
+    interleaved with H and W rather than left adjacent to C, which is exactly the step a plain
+    reshape would get wrong while still producing a tensor of the right SHAPE. Emitting it as a
+    transpose keeps that visible to a reader and to the verifier.
+    """
+    if not operands:
+        return _opaque_decomp("aten_pixel_shuffle", [], meta, "layout", pattern_hint="pixel_shuffle")
+    in_shape = _shape_of(operands[0])
+    r = _fx_arg(meta, 1, None)
+    val: Any = meta.get("val")
+    out_shape = _static_shape(val.shape) if val is not None and hasattr(val, "shape") else None
+    if (in_shape is None or out_shape is None or r is None or len(in_shape) != 4
+            or len(out_shape) != 4 or any(d <= 0 for d in (*in_shape, *out_shape))):
+        return _opaque_decomp("aten_pixel_shuffle", operands[:1], meta, "layout",
+                              pattern_hint="pixel_shuffle")
+    r = int(r)
+    n, cr2, h, w = (int(x) for x in in_shape)
+    if r <= 0 or cr2 % (r * r):
+        return _opaque_decomp("aten_pixel_shuffle", operands[:1], meta, "layout",
+                              pattern_hint="pixel_shuffle")
+    c = cr2 // (r * r)
+    if [n, c, h * r, w * r] != [int(x) for x in out_shape]:
+        # torch and this derivation disagree about the result; say so rather than emit a tensor of
+        # the right shape computed the wrong way, which no shape check downstream would catch.
+        return _opaque_decomp("aten_pixel_shuffle", operands[:1], meta, "layout",
+                              pattern_hint="pixel_shuffle")
+
+    elem = _t_elem(operands[0])
+    ops: list[Operation] = []
+    split = _emit_reshape(operands[0], [n, c, r, r, h, w], elem)
+    if split is None:
+        return _opaque_decomp("aten_pixel_shuffle", operands[:1], meta, "layout",
+                              pattern_hint="pixel_shuffle")
+    ops += split[0]
+    mid_shape = [n, c, h, r, w, r]
+    mid_type = TensorType(elem, mid_shape)
+    empty = _make_empty(mid_type)
+    rid = _next_region_id("pixel_shuffle")
+    # (n, c, r, r, h, w) -> (n, c, h, r, w, r): source dim order 0,1,4,2,5,3.
+    perm = DenseArrayBase.from_list(i64, [0, 1, 4, 2, 5, 3])
+    transpose = TransposeOp(input=split[1], init=empty.results[0], permutation=perm,
+                            result=mid_type)
+    _attach_region_id(transpose, rid)
+    ops += [empty, transpose]
+    merge = _emit_reshape(transpose.results[0], [n, c, h * r, w * r], elem)
+    if merge is None:
+        return _opaque_decomp("aten_pixel_shuffle", operands[:1], meta, "layout",
+                              pattern_hint="pixel_shuffle")
+    ops += merge[0]
+    return DecompResult(ops=ops, result=merge[1], region_ids=[rid],
+                        pattern_hint="pixel_shuffle")
+
+
+#: An LSTM is UNROLLED over layers and timesteps, so the emitted IR grows with their product.
+#: Past this many cells the unroll stops being a lowering and starts being a denial-of-service on the
+#: verifier, so it is refused with a reason rather than attempted -- an opaque call a reader can see
+#: beats a capture that never finishes.
+_LSTM_MAX_CELLS = 256
+
+
+def _tanh_scalar(x, out_elem):
+    from xdsl.dialects.math import TanhOp
+
+    t = TanhOp(x)
+    return [t], t.results[0]
+
+
+def decompose_lstm(operands, meta, node_name):
+    """aten.lstm.input(input, (h0, c0), params, has_biases, num_layers, dropout, train,
+    bidirectional, batch_first) -> (output, h_n, c_n).
+
+    Unrolled into the textbook cell, per layer and timestep:
+
+        z      = x_t @ W_ih^T + h @ W_hh^T + b_ih + b_hh        (B, 4H)
+        i,f,g,o = z chunked along the gate axis, in torch's i,f,g,o order
+        c'     = sigmoid(f) * c + sigmoid(i) * tanh(g)
+        h'     = sigmoid(o) * tanh(c')
+
+    MULTI-OUTPUT, and that is the point of doing it at all. The op returns three tensors, and while it
+    stayed opaque the stub carried only the first: every ``getitem(node, 1|2)`` consumer of h_n/c_n had
+    no producer, so those consumers went opaque too. One opaque LSTM was three opaque ops in the
+    capture, and a model with an LSTM head could not be captured at any dtype.
+    """
+    if len(operands) < 3:
+        return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+    has_biases = bool(_fx_arg(meta, 3, True))
+    num_layers = int(_fx_arg(meta, 4, 1) or 1)
+    dropout = float(_fx_arg(meta, 5, 0.0) or 0.0)
+    train = bool(_fx_arg(meta, 6, False))
+    bidirectional = bool(_fx_arg(meta, 7, False))
+    batch_first = bool(_fx_arg(meta, 8, False))
+    val: Any = meta.get("val")
+    if bidirectional or (train and dropout > 0.0):
+        # Both change the MATH, not just the shape: a reverse pass is a second set of weights, and
+        # training dropout is stochastic. Refuse rather than emit the unidirectional/eval answer.
+        return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+    if not isinstance(val, (list, tuple)) or len(val) != 3:
+        return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+
+    per_layer = 4 if has_biases else 2
+    params = list(operands[3:])
+    if len(params) != per_layer * num_layers:
+        # A projected LSTM (proj_size) ships a fifth weight per layer; its recurrence is not this one.
+        return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+
+    in_shape = _shape_of(operands[0])
+    h0_shape = _shape_of(operands[1])
+    out_shape = _static_shape(val[0].shape)
+    if in_shape is None or h0_shape is None or len(in_shape) != 3 or len(h0_shape) != 3:
+        return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+    seq = int(in_shape[1] if batch_first else in_shape[0])
+    batch = int(in_shape[0] if batch_first else in_shape[1])
+    hidden = int(h0_shape[2])
+    if any(d <= 0 for d in (*in_shape, *h0_shape, *out_shape)) or seq * num_layers > _LSTM_MAX_CELLS:
+        return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+
+    from xdsl.dialects.tensor import ExtractSliceOp, InsertSliceOp
+
+    elem = _t_elem(operands[0])
+    ops: list[Operation] = []
+    rid = _next_region_id("lstm")
+
+    def _slice(src, offsets, sizes):
+        op = ExtractSliceOp.from_static_parameters(src, offsets, sizes, [1] * len(sizes))
+        ops.append(op)
+        _attach_region_id(op, rid)
+        return op.results[0]
+
+    def _reshape(src, shape):
+        r = _emit_reshape(src, shape, elem)
+        if r is None:
+            return None
+        ops.extend(r[0])
+        return r[1]
+
+    def _ew(inputs, shape, build, maps=None):
+        r = _elementwise(inputs, TensorType(elem, shape), build, input_maps=maps)
+        if r is None:
+            return None
+        for o in r[0]:
+            _attach_region_id(o, rid)
+        ops.extend(r[0])
+        return r[1]
+
+    def _mm_t(x, w, m, n, k):
+        """x[m,k] @ w[n,k]^T -> [m,n]; torch stores both weights output-major."""
+        wt_type = TensorType(elem, [k, n])
+        empty_t = _make_empty(wt_type)
+        tr = TransposeOp(input=w, init=empty_t.results[0],
+                         permutation=DenseArrayBase.from_list(i64, [1, 0]), result=wt_type)
+        rt = TensorType(elem, [m, n])
+        empty_m = _make_empty(rt)
+        mm = MatmulOp(inputs=[x, tr.results[0]], outputs=[empty_m.results[0]], res=[rt])
+        for o in (empty_t, tr, empty_m, mm):
+            _attach_region_id(o, rid)
+        ops.extend([empty_t, tr, empty_m, mm])
+        return mm.results[0]
+
+    # x_t for every timestep, as (B, In) -- independent of the batch_first layout.
+    xs = []
+    for t in range(seq):
+        off = [0, t, 0] if batch_first else [t, 0, 0]
+        siz = [batch, 1, int(in_shape[2])] if batch_first else [1, batch, int(in_shape[2])]
+        cut = _reshape(_slice(operands[0], off, siz), [batch, int(in_shape[2])])
+        if cut is None:
+            return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+        xs.append(cut)
+
+    def _cell_c(args, oe):
+        zi, zf, zg, c_prev = args
+        so, si = _sigmoid_build([zf], oe)
+        so2, ii = _sigmoid_build([zi], oe)
+        so3, gg = _tanh_scalar(zg, oe)
+        from xdsl.dialects.arith import AddfOp, MulfOp
+        keep = MulfOp(si, c_prev)
+        write = MulfOp(ii, gg)
+        tot = AddfOp(keep.results[0], write.results[0])
+        return [*so, *so2, *so3, keep, write, tot], tot.results[0]
+
+    def _cell_h(args, oe):
+        zo, c_new = args
+        so, oo = _sigmoid_build([zo], oe)
+        st, tc = _tanh_scalar(c_new, oe)
+        from xdsl.dialects.arith import MulfOp
+        r = MulfOp(oo, tc)
+        return [*so, *st, r], r.results[0]
+
+    h_finals, c_finals = [], []
+    for layer in range(num_layers):
+        w_ih = params[layer * per_layer + 0]
+        w_hh = params[layer * per_layer + 1]
+        biases = [params[layer * per_layer + 2], params[layer * per_layer + 3]] if has_biases else []
+        in_sz = int((_shape_of(w_ih) or [0, 0])[1])
+        h = _reshape(_slice(operands[1], [layer, 0, 0], [1, batch, hidden]), [batch, hidden])
+        c = _reshape(_slice(operands[2], [layer, 0, 0], [1, batch, hidden]), [batch, hidden])
+        if h is None or c is None:
+            return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+        outs = []
+        for t in range(seq):
+            gate_shape = [batch, 4 * hidden]
+            zx = _mm_t(xs[t], w_ih, batch, 4 * hidden, in_sz)
+            zh = _mm_t(h, w_hh, batch, 4 * hidden, hidden)
+            acc = [zx, zh, *biases]
+            maps = [_broadcast_map(_shape_of(v) or [], gate_shape) for v in acc]
+            if any(m is None for m in maps):
+                return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+
+            def _sum(args, oe):
+                from xdsl.dialects.arith import AddfOp
+                made, cur = [], args[0]
+                for a in args[1:]:
+                    op = AddfOp(cur, a)
+                    made.append(op)
+                    cur = op.results[0]
+                return made, cur
+
+            z = _ew(acc, gate_shape, _sum, maps=maps)
+            if z is None:
+                return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+            # torch packs the gates i, f, g, o along the 4H axis, in that order.
+            zi, zf, zg, zo = (_slice(z, [0, k * hidden], [batch, hidden]) for k in range(4))
+            c = _ew([zi, zf, zg, c], [batch, hidden], _cell_c)
+            if c is None:
+                return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+            h = _ew([zo, c], [batch, hidden], _cell_h)
+            if h is None:
+                return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+            outs.append(h)
+        xs = outs
+        h_finals.append(h)
+        c_finals.append(c)
+
+    def _stack(pieces, shape, per_offsets, per_sizes):
+        acc = _make_empty(TensorType(elem, shape))
+        ops.append(acc)
+        _attach_region_id(acc, rid)
+        cur = acc.results[0]
+        for idx, piece in enumerate(pieces):
+            shaped = _reshape(piece, per_sizes)
+            if shaped is None:
+                return None
+            ins = InsertSliceOp.from_static_parameters(shaped, cur, per_offsets(idx), per_sizes,
+                                                       [1] * len(shape))
+            ops.append(ins)
+            _attach_region_id(ins, rid)
+            cur = ins.results[0]
+        return cur
+
+    out_sizes = [batch, 1, hidden] if batch_first else [1, batch, hidden]
+    output = _stack(xs, list(out_shape),
+                    (lambda i: [0, i, 0]) if batch_first else (lambda i: [i, 0, 0]), out_sizes)
+    h_n = _stack(h_finals, [num_layers, batch, hidden], lambda i: [i, 0, 0], [1, batch, hidden])
+    c_n = _stack(c_finals, [num_layers, batch, hidden], lambda i: [i, 0, 0], [1, batch, hidden])
+    if output is None or h_n is None or c_n is None:
+        return _opaque_decomp("aten_lstm", operands[:1], meta, "rnn", pattern_hint="lstm")
+    return DecompResult(ops=ops, result=output, results=[output, h_n, c_n],
+                        region_ids=[rid], pattern_hint="lstm")
+
+
 def decompose_addmm(
     operands: list[SSAValue],
     meta: dict[str, Any],
@@ -2005,10 +2271,16 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
 
 
 def _try_direct_conv2d(operands, meta, in_shape, w_shape):
-    """2-D conv as a single linalg.generic contraction (groups=1, no padding, dilation 1).
+    """2-D conv as one linalg.generic contraction, including grouped convolution.
 
     out[n,f,oh,ow] = sum_{ci,kh,kw} in[n,ci, oh*sh+kh, ow*sw+kw] * w[f,ci,kh,kw] (+ bias).
     Returns a DecompResult or None (caller -> im2col path). Verify-fallback covers mistakes.
+
+    For ``groups > 1`` the contraction's temporary result is ``[N,G,F/G,OH,OW]``.
+    Keeping group and within-group output channel as separate parallel dimensions makes the
+    output map an identity and keeps every input/weight access affine; a collapse_shape then
+    restores NCHW without moving bytes.  This is the direct counterpart of the grouped
+    batch-matmul path, but it never materializes the ``[G,C/G,KH,KW,N,OH,OW]`` im2col tensor.
     """
     val: Any = meta.get("val")
     if val is None or not hasattr(val, "shape"):
@@ -2020,12 +2292,28 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
     padding = _fx_arg(meta, 4, [0, 0]) or [0, 0]
     dilation = _fx_arg(meta, 5, [1, 1]) or [1, 1]
     transposed = _fx_arg(meta, 6, False)
-    groups = _fx_arg(meta, 8, 1)
-    if transposed or int(groups or 1) != 1:
+    groups = int(_fx_arg(meta, 8, 1) or 1)
+    if transposed or groups < 1:
         return None
-    if any(int(p) != 0 for p in padding) or any(int(d) != 1 for d in dilation):
+    if any(int(p) < 0 for p in padding):
         return None
     sh, sw = (int(stride[0]), int(stride[1])) if isinstance(stride, (list, tuple)) else (int(stride), int(stride))
+    ph, pw = int(padding[0]), int(padding[1])
+    dh, dw = ((int(dilation[0]), int(dilation[1]))
+              if isinstance(dilation, (list, tuple))
+              else (int(dilation), int(dilation)))
+    if min(sh, sw) < 1 or len(in_shape) != 4 or len(w_shape) != 4:
+        return None
+    n_in, c_in, h_in, w_in = (int(x) for x in in_shape)
+    f_out, c_per_g, kh, kw = (int(x) for x in w_shape)
+    n_out, f_chk, h_out, w_out = (int(x) for x in out_shape)
+    if min(dh, dw) < 1 or c_in % groups or f_out % groups:
+        return None
+    if (in_shape[0] != out_shape[0] or w_shape[0] != out_shape[1]
+            or c_per_g != c_in // groups
+            or (h_in + 2 * ph - dh * (kh - 1) - 1) // sh + 1 != h_out
+            or (w_in + 2 * pw - dw * (kw - 1) - 1) // sw + 1 != w_out):
+        return None
     elem = _t_elem(operands[0])
     if _t_elem(operands[1]) != elem:
         return None
@@ -2038,13 +2326,19 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
     from xdsl.ir.affine import AffineExpr, AffineMap
 
     inp, w = operands[0], operands[1]
+    pad_ops: list[Operation] = []
+    if ph or pw:
+        # Only pad the activation, never materialize its kh*kw-expanded im2col tensor.
+        # The im2col path performs the same padding; its size limit must not remove support
+        # for padded convolutions when it selects this direct fallback.
+        padded = _zero_pad_ops(inp, elem, list(in_shape),
+                               [(0, 0), (0, 0), (ph, ph), (pw, pw)])
+        if padded is None:
+            return None
+        pad_ops, inp, _padded_shape = padded
     result_type = TensorType(elem, out_shape)
     zero = ConstantOp(FloatAttr(0.0, elem), elem)
-    init = SplatOp(zero.result, [], result_type)
-    D = AffineExpr.dimension  # dims: n=0,f=1,oh=2,ow=3,ci=4,kh=5,kw=6
-    in_map = AffineMap(7, 0, (D(0), D(4), D(2) * sh + D(5), D(3) * sw + D(6)))
-    w_map = AffineMap(7, 0, (D(1), D(4), D(5), D(6)))
-    out_map = AffineMap(7, 0, (D(0), D(1), D(2), D(3)))
+    D = AffineExpr.dimension
     blk = Block(arg_types=[elem, elem, elem])
     prod = MulfOp(blk.args[0], blk.args[1])
     acc = AddfOp(blk.args[2], prod.results[0])
@@ -2052,16 +2346,49 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
     blk.add_op(acc)
     blk.add_op(YieldOp(acc.results[0]))
     par, red = IteratorType.PARALLEL, IteratorType.REDUCTION
-    gen = GenericOp(
-        inputs=[inp, w],
-        outputs=[init.results[0]],
-        body=Region(blk),
-        indexing_maps=[AffineMapAttr(in_map), AffineMapAttr(w_map), AffineMapAttr(out_map)],
-        iterator_types=[IteratorTypeAttr(par)] * 4 + [IteratorTypeAttr(red)] * 3,
-        result_types=[result_type],
-    )
-    ops: list[Operation] = [zero, init, gen]
-    res = gen.results[0]
+    if groups == 1:
+        # dims: n=0,f=1,oh=2,ow=3,ci=4,kh=5,kw=6
+        init = SplatOp(zero.result, [], result_type)
+        in_map = AffineMap(7, 0, (
+            D(0), D(4), D(2) * sh + D(5) * dh, D(3) * sw + D(6) * dw))
+        w_map = AffineMap(7, 0, (D(1), D(4), D(5), D(6)))
+        out_map = AffineMap(7, 0, (D(0), D(1), D(2), D(3)))
+        gen = GenericOp(
+            inputs=[inp, w],
+            outputs=[init.results[0]],
+            body=Region(blk),
+            indexing_maps=[AffineMapAttr(in_map), AffineMapAttr(w_map), AffineMapAttr(out_map)],
+            iterator_types=[IteratorTypeAttr(par)] * 4 + [IteratorTypeAttr(red)] * 3,
+            result_types=[result_type],
+        )
+        ops: list[Operation] = [*pad_ops, zero, init, gen]
+        res = gen.results[0]
+    else:
+        # dims: n=0,g=1,fg=2,oh=3,ow=4,cg=5,kh=6,kw=7
+        # The temporary's [G,F/G] axes are adjacent, so collapsing them to F is a view.
+        f_per_g = f_out // groups
+        grouped_shape = [n_out, groups, f_per_g, h_out, w_out]
+        grouped_type = TensorType(elem, grouped_shape)
+        init = SplatOp(zero.result, [], grouped_type)
+        in_map = AffineMap(8, 0, (
+            D(0), D(1) * c_per_g + D(5),
+            D(3) * sh + D(6) * dh, D(4) * sw + D(7) * dw))
+        w_map = AffineMap(8, 0, (
+            D(1) * f_per_g + D(2), D(5), D(6), D(7)))
+        out_map = AffineMap(8, 0, (D(0), D(1), D(2), D(3), D(4)))
+        gen = GenericOp(
+            inputs=[inp, w],
+            outputs=[init.results[0]],
+            body=Region(blk),
+            indexing_maps=[AffineMapAttr(in_map), AffineMapAttr(w_map), AffineMapAttr(out_map)],
+            iterator_types=[IteratorTypeAttr(par)] * 5 + [IteratorTypeAttr(red)] * 3,
+            result_types=[grouped_type],
+        )
+        collapsed = _emit_reshape(gen.results[0], out_shape, elem)
+        if collapsed is None:
+            return None
+        ops = [*pad_ops, zero, init, gen, *collapsed[0]]
+        res = collapsed[1]
     rid = _next_region_id("conv")
     # optional bias [F] over [N,F,Ho,Wo]
     if len(operands) >= 3 and isinstance(operands[2].type, TensorType):
@@ -2083,29 +2410,73 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="conv2d")
 
 
+def _same_padding(w_shape, dilation, *, spatial: int):
+    """torch's ``padding="same"`` in explicit per-dim pads, or None when it cannot be expressed.
+
+    torch pads ``dilation*(k-1)`` total per spatial dim, split evenly for an ODD kernel and
+    asymmetrically (the extra pixel on the right/bottom) for an even one. Only the symmetric case
+    is returned: the shared conv path zero-pads both sides equally, so answering an even kernel here
+    would shift the output by a pixel and still look like a clean lowering. None -> the caller keeps
+    it opaque, which is visible, rather than silently wrong.
+    """
+    pads = []
+    for i in range(spatial):
+        k = int(w_shape[2 + i])
+        d = int(dilation[i]) if isinstance(dilation, (list, tuple)) else int(dilation)
+        total = d * (k - 1)
+        if total % 2:
+            return None
+        pads.append(total // 2)
+    return pads
+
+
 def decompose_conv2d_padding(operands, meta, node_name):
     """aten.conv2d.padding(input, weight, bias, stride, padding, dilation, groups).
 
-    For ``valid``/zero padding (e.g. a ViT patch-embed: stride=kernel, no pad) this is the
-    direct conv; remap args to the convolution.default layout and reuse _try_direct_conv2d."""
+    This overload exists because ``padding`` may be the STRING ``"same"``/``"valid"`` rather than a
+    number. That is the only difference from ``aten.conv2d.default`` -- so once the string is resolved
+    to explicit pads, the shared convolution path applies unchanged, and with it padding, groups
+    (including depthwise), dilation and the im2col contraction form.
+
+    It previously did not delegate: it tried ``_try_direct_conv2d``, which refuses non-zero padding
+    AND ``groups != 1``, and went opaque otherwise. A padded depthwise conv -- the ordinary MixFFN
+    shape in a mobile-ViT -- therefore never lowered, and four such convs are why lstmnetvit could not
+    be captured at all.
+    """
     if len(operands) < 2:
         return _opaque_decomp("aten_conv2d", operands[:1], meta, "conv", pattern_hint="conv2d")
     in_shape = _shape_of(operands[0])
     w_shape = _shape_of(operands[1])
+    if in_shape is None or w_shape is None or len(w_shape) < 3:
+        return _opaque_decomp("aten_conv2d", operands[:1], meta, "conv", pattern_hint="conv2d")
+    spatial = len(w_shape) - 2
+    stride = _fx_arg(meta, 3, [1] * spatial)
     pad = _fx_arg(meta, 4, 0)
-    is_zero = (pad in (0, "valid", None)) or (isinstance(pad, (list, tuple)) and all(int(p) == 0 for p in pad))
-    if in_shape is not None and w_shape is not None and is_zero:
-        stride = _fx_arg(meta, 3, [1, 1])
-        dilation = _fx_arg(meta, 5, [1, 1])
-        groups = _fx_arg(meta, 6, 1)
-        m = dict(meta)
-        # convolution.default layout: (in, w, bias, stride, padding, dilation, transposed,
-        # output_padding, groups) -- the indices _try_direct_conv2d reads.
-        m["_fx_args"] = (operands[0], operands[1], None, stride, [0, 0], dilation, False, [0, 0], groups)
-        r = _try_direct_conv2d(operands, m, in_shape, w_shape)
-        if r is not None:
-            return r
-    return _opaque_decomp("aten_conv2d", operands[:1], meta, "conv", pattern_hint="conv2d")
+    dilation = _fx_arg(meta, 5, [1] * spatial)
+    groups = _fx_arg(meta, 6, 1)
+
+    if isinstance(pad, str):
+        if pad == "valid":
+            pads = [0] * spatial
+        elif pad == "same":
+            pads = _same_padding(w_shape, dilation, spatial=spatial)
+        else:
+            pads = None
+    elif pad is None:
+        pads = [0] * spatial
+    elif isinstance(pad, (list, tuple)):
+        pads = [int(x) for x in pad][:spatial]
+    else:
+        pads = [int(pad)] * spatial
+    if pads is None or len(pads) != spatial:
+        return _opaque_decomp("aten_conv2d", operands[:1], meta, "conv", pattern_hint="conv2d")
+
+    # Keep the conv2d ARG LAYOUT (groups at index 6, no `transposed`): decompose_convolution branches
+    # on `_aten_target` to read it, and handing it the convolution.default layout instead would make
+    # it read groups as `transposed` -- the exact confusion its own comment warns about.
+    m = dict(meta)
+    m["_fx_args"] = (operands[0], operands[1], None, stride, pads, dilation, groups)
+    return decompose_convolution(operands, m, node_name)
 
 
 def _conv_transposed_to_direct(inp, w, *, in_shape, w_shape, out_shape, stride, padding,
@@ -2258,11 +2629,22 @@ def decompose_convolution(operands, meta, node_name):
                               pattern_hint="convolution")
 
     def _pair(v, default):
+        # A SINGLE-ELEMENT LIST IS THE BROADCAST FORM, not a 1-D pair. torch lowers
+        # padding="valid"/"same" to aten.convolution.default carrying padding=[0] -- one entry
+        # meaning "this value on every spatial dim". Slicing it to vals[:2] returned a
+        # one-element list, and the first consumer that read padding[1] raised IndexError
+        # inside the importer, which swallowed it and emitted an opaque call. A string-padded
+        # conv therefore never lowered, and the failure looked like an unsupported op rather
+        # than a crash.
         if v is None:
             return [default, default]
         if isinstance(v, (list, tuple)):
             vals = [int(x) for x in v]
-            return [default, vals[0]] if rank == 3 else vals[:2]
+            if not vals:
+                return [default, default]
+            if rank == 3:
+                return [default, vals[0]]
+            return vals[:2] if len(vals) >= 2 else [vals[0], vals[0]]
         return [default, int(v)] if rank == 3 else [int(v), int(v)]
 
     # Two aten spellings reach here with DIFFERENT arg layouts, and conflating them is a
@@ -2314,17 +2696,41 @@ def decompose_convolution(operands, meta, node_name):
         ops += t_ops
         stride, padding, output_padding = [1, 1], [0, 0], [0, 0]
 
-    built = _conv_im2col_matmul(
-        cur_in, cur_w, bias_v, in_shape=in_shape, w_shape=w_shape, out_shape=out_shape,
-        stride=stride, padding=padding, dilation=dilation, groups=groups, elem=elem)
-    conv_path = "im2col_matmul"
-    if built is None:
-        # Memory-bounded or unhandled: the fused direct contraction is still correct IR.
+    import os
+
+    lowering = os.environ.get("M2M_CONV_LOWERING", "auto").strip().lower()
+    if lowering not in {"auto", "direct", "grouped_direct", "im2col"}:
+        raise ValueError(
+            "M2M_CONV_LOWERING must be auto/direct/grouped_direct/im2col, "
+            f"got {lowering!r}"
+        )
+
+    def _direct():
         m = dict(meta)
+        # Normalize both aten.conv2d and aten.convolution to convolution's
+        # complete positional layout for the direct helper.
         m["_fx_args"] = (cur_in, cur_w, bias_v, stride, padding, dilation, False,
                          output_padding, groups)
-        direct = _try_direct_conv2d([cur_in, cur_w] + ([bias_v] if bias_v is not None else []),
-                                    m, in_shape, w_shape)
+        return _try_direct_conv2d(
+            [cur_in, cur_w] + ([bias_v] if bias_v is not None else []),
+            m,
+            in_shape,
+            w_shape,
+        )
+
+    direct = (_direct() if (lowering == "direct"
+                            or (lowering == "grouped_direct" and groups > 1))
+              else None)
+    built = None if direct is not None else _conv_im2col_matmul(
+        cur_in, cur_w, bias_v, in_shape=in_shape, w_shape=w_shape, out_shape=out_shape,
+        stride=stride, padding=padding, dilation=dilation, groups=groups, elem=elem)
+    conv_path = "direct_contraction" if direct is not None else "im2col_matmul"
+    if direct is not None:
+        ops += direct.ops
+        res = direct.result
+    elif built is None:
+        # Memory-bounded or unhandled: the fused direct contraction is still correct IR.
+        direct = _direct()
         if direct is None:
             return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
                                   pattern_hint="convolution")
@@ -2351,7 +2757,8 @@ def decompose_convolution(operands, meta, node_name):
         op.attributes["prov.family"] = StringAttr("conv")
         op.attributes["prov.conv_path"] = StringAttr(conv_path)
     return DecompResult(ops=ops, result=res, region_ids=[rid],
-                        pattern_hint="convolution_im2col_matmul")
+                        pattern_hint=("conv2d" if conv_path == "direct_contraction"
+                                      else "convolution_im2col_matmul"))
 
 
 # ---------------------------------------------------------------------------
@@ -2975,7 +3382,11 @@ def decompose_batch_norm_inference(operands, meta, node_name):
     if mean is None or var is None:
         return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
                               "normalization", pattern_hint="batch_norm")
-    eps = _fx_arg(meta, 6, 1e-5)
+    # ``aten.batch_norm.default`` has the same tensor operands but includes both ``training`` and
+    # ``momentum`` before eps, so eps is positional argument 7 rather than 6. Torch versions differ
+    # on whether export leaves this public alias or rewrites to the native inference op.
+    eps_index = 7 if meta.get("_aten_target") == "aten.batch_norm.default" else 6
+    eps = _fx_arg(meta, eps_index, 1e-5)
     try:
         eps = float(eps)
     except (TypeError, ValueError):
@@ -3030,6 +3441,149 @@ def decompose_batch_norm_inference(operands, meta, node_name):
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("normalization")
     return DecompResult(ops=ops, result=cur, region_ids=[rid], pattern_hint="batch_norm")
+
+
+def _pair_arg(value, default):
+    """Normalize a pooling scalar/list argument to an integer pair."""
+    if value in (None, []):
+        value = default
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            value = (value[0], value[0])
+        elif len(value) == 2:
+            value = (value[0], value[1])
+        else:
+            return None
+    else:
+        value = (value, value)
+    try:
+        return int(value[0]), int(value[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def decompose_max_pool2d(operands, meta, node_name):
+    """aten.max_pool2d.default -> padded windowed linalg.generic max reduction.
+
+    Supports the static NCHW inference form, including stride/padding/dilation. ``ceil_mode`` is
+    refused until its asymmetric high-edge extension is represented explicitly; emitting a floor
+    pool for that case would be a silent semantic error.
+    """
+    from xdsl.dialects.arith import ConstantOp, MaximumfOp
+    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr, IntegerType
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import InsertSliceOp, SplatOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    if not operands:
+        return _opaque_decomp("aten_max_pool2d", operands, meta, "pool", pattern_hint="max_pool2d")
+    x = operands[0]
+    in_shape = _shape_of(x)
+    val: Any = meta.get("val")
+    primary = val[0] if isinstance(val, (tuple, list)) and val else val
+    out_shape = _static_shape(getattr(primary, "shape", [])) if primary is not None else []
+    if (in_shape is None or len(in_shape) != 4 or len(out_shape) != 4 or
+            any(d < 0 for d in (*in_shape, *out_shape))):
+        return _opaque_decomp("aten_max_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="max_pool2d")
+    kernel = _pair_arg(_fx_arg(meta, 1, None), None)
+    stride = _pair_arg(_fx_arg(meta, 2, None), kernel)
+    padding = _pair_arg(_fx_arg(meta, 3, 0), (0, 0))
+    dilation = _pair_arg(_fx_arg(meta, 4, 1), (1, 1))
+    ceil_mode = bool(_fx_arg(meta, 5, False))
+    if None in (kernel, stride, padding, dilation) or ceil_mode:
+        return _opaque_decomp("aten_max_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="max_pool2d")
+    kh, kw = kernel
+    sh, sw = stride
+    ph, pw = padding
+    dh, dw = dilation
+    n, c, h, w = in_shape
+    no, co, oh, ow = out_shape
+    if min(kh, kw, sh, sw, dh, dw) < 1 or min(ph, pw) < 0 or (n, c) != (no, co):
+        return _opaque_decomp("aten_max_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="max_pool2d")
+    expected = ((h + 2 * ph - dh * (kh - 1) - 1) // sh + 1,
+                (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1)
+    if expected != (oh, ow):
+        return _opaque_decomp("aten_max_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="max_pool2d")
+    elem = _t_elem(x)
+    if isinstance(elem, IntegerType):
+        # Integer minimum depends on signedness/bit width; add it only with an explicit dtype policy.
+        return _opaque_decomp("aten_max_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="max_pool2d")
+
+    ops: list[Operation] = []
+    neg_inf = ConstantOp(FloatAttr(float("-inf"), elem), elem)
+    ops.append(neg_inf)
+    source = x
+    if ph or pw:
+        padded_type = TensorType(elem, [n, c, h + 2 * ph, w + 2 * pw])
+        padded = SplatOp(neg_inf.results[0], [], padded_type)
+        inserted = InsertSliceOp.from_static_parameters(
+            x, padded.results[0], [0, 0, ph, pw], in_shape, [1, 1, 1, 1])
+        ops += [padded, inserted]
+        source = inserted.results[0]
+
+    out_type = TensorType(elem, out_shape)
+    init = SplatOp(neg_inf.results[0], [], out_type)
+    # A WINDOW OPERAND, shaped exactly like the pooling window, carries the two facts the strided
+    # access map cannot: it makes the op's concatenated indexing map invertible, and it states the
+    # window extents. Without it the window dims (d4, d5) appear ONLY inside `d2 * sh + d4 * dh`,
+    # never as a bare dim, so `inversePermutation` fails -- MLIR rejects the op at parse time with
+    # "invalid indexing maps are non-invertible" -- and even if it did not, the loop bounds for the
+    # reduction would be unrecoverable from the shapes (a 114-wide padded input is consistent with
+    # both a 3- and a 4-tall window at stride 2, and the two compute different maxima). This is
+    # precisely why the upstream `linalg.pooling_*` named ops take a shape-only `K` operand. The
+    # value is never read: the body ignores its block argument.
+    window = _make_empty(TensorType(elem, [kh, kw]))
+    block = Block(arg_types=[elem, elem, elem])
+    maximum = MaximumfOp(block.args[0], block.args[2])
+    block.add_op(maximum)
+    block.add_op(YieldOp(maximum.results[0]))
+    D = AffineExpr.dimension  # n,c,oh,ow,kh,kw
+    pool = GenericOp(
+        inputs=[source, window.results[0]], outputs=[init.results[0]], body=Region(block),
+        indexing_maps=[
+            AffineMapAttr(AffineMap(6, 0, (
+                D(0), D(1), D(2) * sh + D(4) * dh, D(3) * sw + D(5) * dw))),
+            AffineMapAttr(AffineMap(6, 0, (D(4), D(5)))),
+            AffineMapAttr(AffineMap(6, 0, (D(0), D(1), D(2), D(3)))),
+        ],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * 4 +
+                       [IteratorTypeAttr(IteratorType.REDUCTION)] * 2,
+        result_types=[out_type],
+    )
+    ops += [init, window, pool]
+    rid = _next_region_id("max_pool2d")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("pool")
+    return DecompResult(ops=ops, result=pool.results[0], region_ids=[rid],
+                        pattern_hint="max_pool2d")
+
+
+def decompose_adaptive_avg_pool2d(operands, meta, node_name):
+    """aten.adaptive_avg_pool2d.default for global (1,1) pooling -> mean over H,W."""
+    if not operands:
+        return _opaque_decomp("aten_adaptive_avg_pool2d", operands, meta, "pool",
+                              pattern_hint="adaptive_avg_pool2d")
+    x = operands[0]
+    in_shape = _shape_of(x)
+    val: Any = meta.get("val")
+    out_shape = _static_shape(getattr(val, "shape", [])) if val is not None else []
+    output_size = _pair_arg(_fx_arg(meta, 1, None), None)
+    if (in_shape is None or len(in_shape) != 4 or output_size != (1, 1) or
+            out_shape != [in_shape[0], in_shape[1], 1, 1]):
+        return _opaque_decomp("aten_adaptive_avg_pool2d", operands[:1], meta, "pool",
+                              pattern_hint="adaptive_avg_pool2d")
+    rewritten = dict(meta)
+    rewritten["_fx_args"] = (meta.get("_fx_args", (x,))[0], [2, 3], True)
+    result = decompose_mean_dim(operands[:1], rewritten, node_name)
+    result.pattern_hint = "adaptive_avg_pool2d"
+    return result
 
 
 def _rank1_rsqrt(src, rt: TensorType, elem):
@@ -3369,6 +3923,46 @@ def decompose_view(operands, meta, node_name):
     return _reshape_decomp(operands, meta, node_name, hint="view", prefix="view")
 
 
+def decompose_as_strided_identity(operands, meta, node_name):
+    """Forward an as_strided view only when it has identical element mapping.
+
+    Arbitrary strides can alias/reorder elements and cannot be represented by
+    forwarding a value-semantics MLIR tensor.  This narrow case removes a
+    real exported-model identity view without claiming general as_strided
+    support; all other geometries remain opaque for the coverage gate.
+    """
+    source = _fx_arg(meta, 0)
+    source_value = getattr(source, "meta", {}).get("val")
+    size = _fx_arg(meta, 1)
+    strides = _fx_arg(meta, 2)
+    offset = _fx_arg(meta, 3, None)
+    if operands and source_value is not None and isinstance(size, (tuple, list)) and isinstance(strides, (tuple, list)):
+        try:
+            source_shape = tuple(int(x) for x in source_value.shape)
+            source_strides = tuple(int(x) for x in source_value.stride())
+            source_offset = int(source_value.storage_offset())
+            requested_shape = tuple(int(x) for x in size)
+            requested_strides = tuple(int(x) for x in strides)
+            requested_offset = source_offset if offset is None else int(offset)
+            result_shape = tuple(int(x) for x in meta["val"].shape)
+            if (
+                requested_shape == source_shape == result_shape
+                and len(requested_strides) == len(source_strides)
+                and all(
+                    extent == 1 or requested == original
+                    for extent, requested, original in zip(
+                        requested_shape, requested_strides, source_strides
+                    )
+                )
+                and requested_offset == source_offset
+                and operands[0].type == TensorType(_element_type_from_meta(meta), requested_shape)
+            ):
+                return DecompResult(ops=[], result=operands[0], pattern_hint="as_strided_identity")
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
+
+
 def decompose_unsqueeze(operands, meta, node_name):
     """aten.unsqueeze.default(input, dim) -> tensor.reshape inserting a size-1 dim."""
     return _reshape_decomp(operands, meta, node_name, hint="unsqueeze", prefix="unsqueeze")
@@ -3483,6 +4077,35 @@ def decompose_split_with_sizes(operands, meta, node_name):
         results.append(op.results[0])
         off += sz
     return DecompResult(ops=ops, result=results[0], results=results, region_ids=[rid], pattern_hint="split")
+
+
+def decompose_split_tensor(operands, meta, node_name):
+    """aten.split.Tensor(input, chunk_size, dim) via the validated multi-slice writer."""
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+    shape = _shape_of(operands[0])
+    pieces = meta.get("val")
+    chunk = _fx_arg(meta, 1, None)
+    raw_dim = _fx_arg(meta, 2, 0)
+    if (shape is None or not shape or any(d < 0 for d in shape)
+            or not isinstance(chunk, int) or isinstance(chunk, bool) or chunk <= 0
+            or not isinstance(raw_dim, int) or isinstance(raw_dim, bool)
+            or not isinstance(pieces, (tuple, list)) or not pieces):
+        return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+    dim = raw_dim % len(shape)
+    sizes = []
+    for piece in pieces:
+        part_shape = _static_shape(getattr(piece, "shape", []))
+        if len(part_shape) != len(shape) or any(
+            part_shape[axis] != extent for axis, extent in enumerate(shape) if axis != dim
+        ):
+            return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+        sizes.append(part_shape[dim])
+    if sum(sizes) != shape[dim] or any(size != chunk for size in sizes[:-1]) or not 0 <= sizes[-1] <= chunk:
+        return _opaque_decomp("aten_split", operands[:1], meta, "layout", pattern_hint="split")
+    sliced_meta = dict(meta)
+    sliced_meta["_fx_args"] = (None, sizes, dim)
+    return decompose_split_with_sizes(operands, sliced_meta, node_name)
 
 
 def decompose_unbind(operands, meta, node_name):
@@ -4054,6 +4677,24 @@ def decompose_bucketize(operands, meta, node_name):
 
     right = bool(meta.get("_fx_kwargs", {}).get("right", False) or _fx_arg(meta, 3, False))
     in_elem = x.type.element_type
+    boundary_elem = bnd.type.element_type
+    comparison_elem = in_elem
+    if boundary_elem != in_elem:
+        # bucketize promotes the two search operands, not its integer result.
+        # Preserve each linalg block argument's actual operand type and cast
+        # scalars to PyTorch's common comparison dtype inside the body.
+        from types import SimpleNamespace
+
+        import torch
+
+        values = [getattr(_fx_arg(meta, index), "meta", {}).get("val") for index in (0, 1)]
+        if any(not isinstance(value, torch.Tensor) for value in values) or any(
+            _element_type_from_meta({"val": value}) != operand.type.element_type
+            for value, operand in zip(values, (x, bnd), strict=True)
+        ):
+            return _opaque_decomp("aten_bucketize", operands[:2], meta, "search", pattern_hint="bucketize")
+        dtype = torch.promote_types(values[0].dtype, values[1].dtype)
+        comparison_elem = _element_type_from_meta({"val": SimpleNamespace(dtype=dtype)})
     out_elem = _element_type_from_meta(meta)
     if not isinstance(out_elem, IntegerType):
         out_elem = IntegerType(64)
@@ -4068,12 +4709,15 @@ def decompose_bucketize(operands, meta, node_name):
     bnd_map = AffineMap(rank + 1, 0, (AffineExpr.dimension(rank),))
     out_map = in_map
 
-    is_int = isinstance(in_elem, IntegerType)
+    is_int = isinstance(comparison_elem, IntegerType)
     # predicate: boundaries[b] < input (right=False) or <= input (right=True)
     pred_kind = ("sle" if right else "slt") if is_int else ("ole" if right else "olt")
-    blk = Block(arg_types=[in_elem, in_elem, out_elem])
-    pred = CmpiOp(blk.args[1], blk.args[0], pred_kind) if is_int \
-        else CmpfOp(blk.args[1], blk.args[0], pred_kind)   # arg0=input, arg1=boundary
+    blk = Block(arg_types=[in_elem, boundary_elem, out_elem])
+    x_casts, x_value = _cast_scalar_arg(blk.args[0], comparison_elem)
+    b_casts, b_value = _cast_scalar_arg(blk.args[1], comparison_elem)
+    blk.add_ops([*x_casts, *b_casts])
+    pred = CmpiOp(b_value, x_value, pred_kind) if is_int \
+        else CmpfOp(b_value, x_value, pred_kind)   # arg0=input, arg1=boundary
     inc = SelectOp(pred.results[0], one.result, zero.result)
     acc = AddiOp(blk.args[2], inc.results[0])
     for op in (pred, inc, acc):
@@ -4753,6 +5397,40 @@ def _torch_dtype_tag(val: Any) -> str:
     return str(val.dtype).replace("torch.", "")
 
 
+def _pt2e_per_tensor_operands(operands, meta):
+    """Return input/scale/zero-point SSA values for a PT2E per-tensor Q/DQ op.
+
+    PT2E encodes calibrated activation qparams as Python scalar arguments, not
+    graph nodes.  The old importer consequently saw only the input operand and
+    emitted an opaque external call.  Materialize those literals as rank-0
+    tensors here; get_attr/tensor qparams continue to use their original SSA.
+    """
+    from xdsl.dialects.builtin import Float32Type, IntegerType
+
+    by_position = meta.get("_fx_ssa_args") or {}
+    built_ops: list[Operation] = []
+    resolved = []
+    for index, typ in ((0, None), (1, TensorType(Float32Type(), [])),
+                       (2, TensorType(IntegerType(64), []))):
+        value = by_position.get(index)
+        if value is None and index < len(operands) and not by_position:
+            # Direct decomposition unit tests predate positional SSA metadata.
+            value = operands[index]
+        if value is None and typ is not None:
+            raw = _fx_arg(meta, index)
+            if not isinstance(raw, (int, float)):
+                raise IndexError(f"PT2E qparam argument {index} is not materializable: {raw!r}")
+            made = _splat_scalar(raw, typ)
+            if made is None:
+                raise TypeError(f"could not materialize PT2E qparam argument {index}")
+            built_ops.extend(made[0])
+            value = made[1]
+        if value is None:
+            raise IndexError(f"missing PT2E Q/DQ operand at argument {index}")
+        resolved.append(value)
+    return built_ops, resolved
+
+
 def decompose_quantize_per_tensor(operands, meta, node_name):
     """torch.ops.quantized_decomposed.quantize_per_tensor.default.
 
@@ -4766,13 +5444,7 @@ def decompose_quantize_per_tensor(operands, meta, node_name):
     elem = _element_type_from_meta(meta)
     result_type = TensorType(elem, _static_shape(val.shape))
 
-    # Require at least input + scale + zero_point as SSA operands. In
-    # the real FX path these all exist; in unit tests the caller passes
-    # three tensor placeholders which we accept as-is.
-    if len(operands) < 3:
-        raise IndexError(
-            f"decompose_quantize_per_tensor expects input + scale + zero_point (3 operands), got {len(operands)}"
-        )
+    qparam_ops, qoperands = _pt2e_per_tensor_operands(operands, meta)
 
     properties: dict[str, Any] = {}
     qmin = _fx_arg(meta, 3)
@@ -4787,13 +5459,13 @@ def decompose_quantize_per_tensor(operands, meta, node_name):
 
     rid = _next_region_id("quantize")
     op = QuantizePerTensorOp(
-        operands=[operands[0], operands[1], operands[2]],
+        operands=qoperands,
         result_types=[result_type],
         properties=properties,
     )
     _attach_region_id(op, rid)
     return DecompResult(
-        ops=[op],
+        ops=[*qparam_ops, op],
         result=op.results[0],
         region_ids=[rid],
         pattern_hint="quantize_per_tensor",
@@ -4808,8 +5480,7 @@ def decompose_dequantize_per_tensor(operands, meta, node_name):
     elem = _element_type_from_meta(meta)
     result_type = TensorType(elem, _static_shape(val.shape))
 
-    if len(operands) < 3:
-        raise IndexError(f"decompose_dequantize_per_tensor expects input + scale + zero_point, got {len(operands)}")
+    qparam_ops, qoperands = _pt2e_per_tensor_operands(operands, meta)
 
     properties: dict[str, Any] = {}
     qmin = _fx_arg(meta, 3)
@@ -4821,13 +5492,13 @@ def decompose_dequantize_per_tensor(operands, meta, node_name):
 
     rid = _next_region_id("dequantize")
     op = DequantizePerTensorOp(
-        operands=[operands[0], operands[1], operands[2]],
+        operands=qoperands,
         result_types=[result_type],
         properties=properties,
     )
     _attach_region_id(op, rid)
     return DecompResult(
-        ops=[op],
+        ops=[*qparam_ops, op],
         result=op.results[0],
         region_ids=[rid],
         pattern_hint="dequantize_per_tensor",
@@ -5265,6 +5936,29 @@ def decompose_where_scalar(operands, meta, node_name):
     return _opaque_decomp("aten_where", operands[:1], meta, "select", pattern_hint="where")
 
 
+def decompose_where_scalar_other(operands, meta, node_name):
+    """aten.where.ScalarOther(condition, tensor, scalar) -> typed pointwise select."""
+    from xdsl.dialects.arith import ConstantOp, SelectOp
+    from xdsl.dialects.builtin import FloatAttr, IntegerAttr, IntegerType
+
+    other = _fx_arg(meta, 2, None)
+    if len(operands) < 2 or not isinstance(other, (bool, int, float)):
+        return _opaque_decomp("aten_where", operands[:2], meta, "select", pattern_hint="where")
+
+    def build(args, out_elem):
+        cast_ops, value = _cast_scalar_arg(args[1], out_elem)
+        attr = (IntegerAttr(int(other), out_elem) if isinstance(out_elem, IntegerType)
+                else FloatAttr(float(other), out_elem))
+        scalar = ConstantOp(attr, out_elem)
+        selected = SelectOp(args[0], value, scalar.results[0])
+        return [*cast_ops, scalar, selected], selected.results[0]
+
+    real = _pointwise(operands[:2], meta, build, family="select")
+    return real if real is not None else _opaque_decomp(
+        "aten_where", operands[:2], meta, "select", pattern_hint="where"
+    )
+
+
 def decompose_ones(operands, meta, node_name):
     """aten.ones[.default](size, ...) -> splat of 1 (family fill)."""
     val: Any = meta["val"]
@@ -5587,6 +6281,10 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.conv2d.default": decompose_convolution,
     "aten.constant_pad_nd.default": decompose_constant_pad_nd,
     "aten._native_batch_norm_legit_no_training.default": decompose_batch_norm_inference,
+    "aten.batch_norm.default": decompose_batch_norm_inference,
+    "aten.max_pool2d.default": decompose_max_pool2d,
+    "aten.max_pool2d_with_indices.default": decompose_max_pool2d,
+    "aten.adaptive_avg_pool2d.default": decompose_adaptive_avg_pool2d,
     "aten.upsample_bilinear2d.vec": decompose_upsample_bilinear2d,
     "aten.upsample_nearest2d.vec": decompose_upsample_nearest2d,
     # torch.fft: real DFT contractions, complex carried as a trailing (re, im) pair.
@@ -5604,12 +6302,15 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     # layout / structural
     "aten.view.default": decompose_view,
     "aten.unsqueeze.default": decompose_unsqueeze,
+    "aten.lstm.input": decompose_lstm,
+    "aten.pixel_shuffle.default": decompose_pixel_shuffle,
     "aten.squeeze.default": decompose_squeeze,
     "aten.squeeze.dim": decompose_squeeze,
     "aten.squeeze.dims": decompose_squeeze,
     "aten.expand.default": decompose_expand,
     "aten.cat.default": decompose_cat,
     "aten.split_with_sizes.default": decompose_split_with_sizes,
+    "aten.split.Tensor": decompose_split_tensor,
     "aten.clone.default": decompose_clone,
     # production-readiness fill-ins:
     "aten.contiguous.default": decompose_contiguous,
@@ -5658,8 +6359,10 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.__and__.Tensor": decompose_bitwise_and,
     "aten.arange.start": decompose_arange,            # arange(start, end)
     "aten.ones.default": decompose_ones,
+    "aten.new_ones.default": decompose_ones,
     "aten.linspace.default": decompose_linspace,
     "aten.where.Scalar": decompose_where_scalar,
+    "aten.where.ScalarOther": decompose_where_scalar_other,
     "aten.conv2d.padding": decompose_conv2d_padding,
     "aten.where.self": decompose_where_self,
     "aten.scalar_tensor.default": decompose_scalar_tensor,
@@ -5696,6 +6399,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
 DECOMPOSITION_TABLE.update(
     {
         "aten.relu.default": decompose_relu,
+        "aten.relu_.default": decompose_relu,
         "aten.clamp.default": decompose_clamp,
         "aten.clamp.Tensor": decompose_clamp,
         "aten.maximum.default": _make_minmax("MaximumfOp", "maximum"),
@@ -5722,6 +6426,7 @@ DECOMPOSITION_TABLE.update(
         "aten.any.default": decompose_any_real,
         "aten.any.dims": decompose_any_real,
         "aten.reshape.default": decompose_view,
+        "aten.as_strided.default": decompose_as_strided_identity,
         "aten._unsafe_view.default": decompose_view,
         "aten.sum.dim_IntList": decompose_sum_dim,
         "aten.reciprocal.default": decompose_reciprocal,

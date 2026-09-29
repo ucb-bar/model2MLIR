@@ -61,6 +61,9 @@ def expand_to_linalg(module: ModuleOp) -> ModuleOp:
         ops, result = built
         rid = _next_region_id(op_kind)
         for o in ops:
+            from m2m.capture.trace import copy_mlir_sources
+
+            copy_mlir_sources(o, op, role="lowering")
             _attach_region_id(o, rid)
             o.attributes["prov.op"] = StringAttr(op_kind)
             o.attributes["prov.family"] = StringAttr(family)

@@ -1,8 +1,8 @@
-"""Write a self-contained Merlin capture bundle (mlir + weights + golden + inputs + extra +
+"""Write a self-contained capture bundle (mlir + weights + golden + inputs + extra +
 input_order) from ONE seeded model instance.
 
 Factored out of ``workloads/capture_consistent.py`` so any capture path (per-model loader, or the
-GGUF frontend) produces a byte-compatible bundle for the Merlin RVV runtime. It recovers the two
+GGUF frontend) produces a byte-compatible bundle for downstream compiler runtimes. It recovers the two
 argument classes m2m elides to the runtime — registered buffers and lifted get_attr constants — by
 type, plus quantized subclass inner tensors, exactly as the consistent-capture worker does.
 """
@@ -29,7 +29,8 @@ class _LogitsOnly(nn.Module):
 
 
 def capture_hf_bundle(model_dir, out, *, quant_scheme: str | None = None, seq_len: int = 8,
-                      dtype: "torch.dtype" = torch.float32) -> dict:
+                      dtype: "torch.dtype" = torch.float32, capture_trace: bool = False,
+                      metadata: dict | None = None) -> dict:
     """Capture a HuggingFace causal-LM (local dir or hub id) into a Merlin bundle via the torch path.
 
     ``quant_scheme`` is a torchAO scheme name (e.g. ``"int8_weight_only"``) or ``None`` for fp. This
@@ -46,7 +47,8 @@ def capture_hf_bundle(model_dir, out, *, quant_scheme: str | None = None, seq_le
     if quant_scheme:
         from m2m.capture.torchao_pipeline import QuantizationConfig
         quant = QuantizationConfig(scheme=quant_scheme)
-    summary = write_bundle(model, (input_ids,), out, quant=quant)
+    summary = write_bundle(model, (input_ids,), out, quant=quant,
+                           capture_trace=capture_trace, metadata=metadata)
     summary["hf"] = str(model_dir)
     summary["quant_scheme"] = quant_scheme
     return summary
@@ -71,16 +73,19 @@ def _flatten_subclass(obj: Any, prefix: str, out: dict) -> None:
         out[f"qinner::{prefix}"] = arr
 
 
-def _lifted_constants(mdl, inputs, extra: dict) -> None:
+def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> None:
     """Populate c_lifted_tensor_<i> from m2m's own export (graph order matches the importer)."""
     try:
-        from m2m.capture.torch_export import capture_frontend_artifact
-        from m2m.ir.torchmlir_decomps import torch_mlir_gap_decompositions
         from torch.export.graph_signature import InputKind
 
-        artifact = capture_frontend_artifact(
-            mdl, inputs, export_decomposition_table=torch_mlir_gap_decompositions())
-        ep = artifact.exported_program or artifact.original_exported_program
+        ep = exported_program
+        if ep is None:
+            from m2m.capture.torch_export import capture_frontend_artifact
+            from m2m.ir.torchmlir_decomps import torch_mlir_gap_decompositions
+
+            artifact = capture_frontend_artifact(
+                mdl, inputs, export_decomposition_table=torch_mlir_gap_decompositions())
+            ep = artifact.exported_program or artifact.original_exported_program
         consts = dict(getattr(ep, "constants", {}) or {})
         sd = dict(getattr(ep, "state_dict", {}) or {})
         li = 0
@@ -89,7 +94,7 @@ def _lifted_constants(mdl, inputs, extra: dict) -> None:
                 continue
             val = consts.get(str(spec.target), sd.get(str(spec.target)))
             if val is not None and hasattr(val, "detach"):
-                extra[f"c_lifted_tensor_{li}"] = val.detach().cpu().numpy()
+                extra[f"c_lifted_tensor_{li}"] = _numpy_safe(val)
             li += 1
     except Exception as exc:  # noqa: BLE001
         import traceback
@@ -158,7 +163,273 @@ def _capture_region_goldens(mdl, inputs, fqns) -> dict[str, "np.ndarray"]:
     return caught, g
 
 
-def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: bool = True) -> dict:
+def _tensor_outputs(value: Any) -> tuple[torch.Tensor, ...]:
+    """Flatten the capture ABI's top-level tensor results, refusing opaque Python state."""
+    values = value if isinstance(value, (tuple, list)) else (value,)
+    if not values or any(not isinstance(item, torch.Tensor) for item in values):
+        raise ValueError("session forwards must return one tensor or a flat tuple/list of tensors")
+    return tuple(values)
+
+
+def capture_session_trajectory(mdl, inputs, session: dict) -> np.ndarray:
+    """Execute a loader-authored session and return its selected output at every semantic step.
+
+    This intentionally runs before quantization when called by :func:`write_bundle`. The resulting
+    trajectory is the model-quality reference; a second execution after conversion/quantization is
+    recorded separately as the compiler-correctness reference.
+    """
+    inputs = tuple(inputs)
+    states = list(session.get("states", ()) or ())
+    streams = list(session.get("streams", ()) or ())
+    counts: set[int] = set()
+    stream_values: list[tuple[int, torch.Tensor]] = []
+    for index, stream in enumerate(streams):
+        input_index = int(stream["input_index"])
+        if input_index < 0 or input_index >= len(inputs):
+            raise ValueError(f"session stream {index} references an unknown input index")
+        values = stream.get("values")
+        values = values if isinstance(values, torch.Tensor) else torch.as_tensor(values)
+        if values.ndim < 1 or tuple(values.shape[1:]) != tuple(inputs[input_index].shape):
+            raise ValueError(f"session stream {index} shape differs from its model input")
+        counts.add(int(values.shape[0]))
+        stream_values.append((input_index, values))
+    if streams:
+        if len(counts) != 1:
+            raise ValueError("all semantic streams must have one common step count")
+        steps = next(iter(counts))
+    else:
+        steps = int(session.get("steps", 0))
+        if steps < 1 or not states:
+            raise ValueError("stream-free trajectory needs positive steps and carried state")
+    quality = dict(session.get("quality", {}) or {})
+    output_index = int(quality.get("output_index", 0))
+    trajectory_inputs = list(inputs)
+    outputs_seen: list[np.ndarray] = []
+    with torch.no_grad():
+        for step in range(steps):
+            for input_index, values in stream_values:
+                base = inputs[input_index]
+                trajectory_inputs[input_index] = values[step].to(
+                    dtype=base.dtype, device=base.device)
+            outputs = _tensor_outputs(mdl(*trajectory_inputs))
+            if output_index < 0 or output_index >= len(outputs):
+                raise ValueError(
+                    f"quality output index {output_index} is outside {len(outputs)} outputs")
+            outputs_seen.append(outputs[output_index].detach().float().cpu().numpy())
+            for state in states:
+                input_index, state_output = int(state["input_index"]), int(state["output_index"])
+                if state_output < 0 or state_output >= len(outputs):
+                    raise ValueError(
+                        f"state output index {state_output} is outside {len(outputs)} outputs")
+                updated = outputs[state_output].detach().clone()
+                if tuple(updated.shape) != tuple(inputs[input_index].shape):
+                    raise ValueError(
+                        f"state {state.get('name', input_index)!r} changes shape from "
+                        f"{tuple(inputs[input_index].shape)} to {tuple(updated.shape)}")
+                trajectory_inputs[input_index] = updated
+    return np.ascontiguousarray(outputs_seen, dtype=np.float32)
+
+
+def _runtime_args_by_input_index(manifest: dict, input_order: dict[str, int]) -> dict[int, int]:
+    """Map loader tuple indices to the exported forward's numeric ABI argument indices.
+
+    The Merlin runtime consumes the complete exported signature (parameters first), so a loader's
+    fourth input is not generally ABI argument 3.  Resolve through the safetensors manifest and the
+    same ``input_order`` table the runtime uses rather than guessing around the weight count.
+    """
+    by_input: dict[int, int] = {}
+    fallback = 0
+    for raw_index in sorted(manifest, key=lambda value: int(value)):
+        meta = manifest[raw_index]
+        name = str(meta.get("name", "") or "")
+        if meta.get("kind") in ("param", "buffer") or "lifted_tensor" in name:
+            continue
+        input_index = input_order.get(name)
+        if input_index is None:
+            while fallback in by_input:
+                fallback += 1
+            input_index = fallback
+            fallback += 1
+        by_input.setdefault(int(input_index), int(raw_index))
+    return by_input
+
+
+def write_session_artifacts(mdl, inputs, out: str | Path, *, manifest: dict,
+                            input_order: dict[str, int], session: dict,
+                            quality_reference: np.ndarray | None = None) -> dict:
+    """Write a semantic trajectory contract, distinct observations, and eager trajectory goldens.
+
+    ``session`` uses loader tuple indices because those are stable at authoring time:
+
+    - ``states``: ``{name, input_index, output_index}``
+    - ``streams``: ``{name, input_index, key, values}``, where values have a leading step dimension
+    - ``quality``: ``{output_index, key}``
+
+    This function resolves tuple indices to the exported numeric ABI, executes the quantized model over
+    the whole trajectory while carrying state, and emits the files consumed by Merlin's generic runtime.
+    It never infers state from names or tuple positions.
+    """
+    import yaml
+
+    out = Path(out)
+    inputs = tuple(inputs)
+    states = list(session.get("states", ()) or ())
+    streams = list(session.get("streams", ()) or ())
+    abi_args = _runtime_args_by_input_index(manifest, input_order)
+    state_inputs = {int(item["input_index"]) for item in states}
+    stream_inputs = {int(item["input_index"]) for item in streams}
+    if state_inputs & stream_inputs:
+        raise ValueError("a session input cannot be both carried state and an observation stream")
+
+    arrays: dict[str, np.ndarray] = {}
+    contract_streams = []
+    step_counts = set()
+    for index, stream in enumerate(streams):
+        input_index = int(stream["input_index"])
+        if input_index < 0 or input_index >= len(inputs) or input_index not in abi_args:
+            raise ValueError(f"session stream {index} references an unknown input index {input_index}")
+        key = str(stream.get("key") or stream.get("name") or f"stream{index}")
+        value = stream.get("values")
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        array = np.ascontiguousarray(value)
+        if array.ndim < 1 or list(array.shape[1:]) != list(inputs[input_index].shape):
+            raise ValueError(
+                f"session stream {key!r} must have shape [steps, {list(inputs[input_index].shape)}], "
+                f"got {list(array.shape)}")
+        arrays[key] = array
+        step_counts.add(int(array.shape[0]))
+        contract_streams.append({"name": str(stream.get("name", key)),
+                                 "input_arg": abi_args[input_index], "key": key})
+    if streams:
+        if len(step_counts) != 1 or next(iter(step_counts)) < 1:
+            raise ValueError("all semantic input streams must have one common positive step count")
+        steps = next(iter(step_counts))
+    else:
+        steps = int(session.get("steps", 0))
+        if steps < 1 or not states:
+            raise ValueError(
+                "a stream-free semantic session needs positive steps and explicit carried state")
+
+    contract_states = []
+    for index, state in enumerate(states):
+        input_index, output_index = int(state["input_index"]), int(state["output_index"])
+        if input_index < 0 or input_index >= len(inputs) or input_index not in abi_args:
+            raise ValueError(f"session state {index} references an unknown input index {input_index}")
+        contract_states.append({"name": str(state.get("name", f"state{index}")),
+                                "input_arg": abi_args[input_index], "output_index": output_index})
+
+    quality = dict(session.get("quality", {}) or {})
+    quality_output = int(quality.get("output_index", 0))
+    quality_key = str(quality.get("key", "output0"))
+    trajectory_inputs = list(inputs)
+    goldens = []
+    with torch.no_grad():
+        for step in range(steps):
+            for stream, contract_stream in zip(streams, contract_streams, strict=True):
+                input_index = int(stream["input_index"])
+                base = inputs[input_index]
+                trajectory_inputs[input_index] = torch.as_tensor(
+                    arrays[contract_stream["key"]][step], dtype=base.dtype, device=base.device)
+            outputs = _tensor_outputs(mdl(*trajectory_inputs))
+            if quality_output < 0 or quality_output >= len(outputs):
+                raise ValueError(f"quality output index {quality_output} is outside {len(outputs)} outputs")
+            goldens.append(outputs[quality_output].detach().float().cpu().numpy())
+            for state in states:
+                input_index, output_index = int(state["input_index"]), int(state["output_index"])
+                if output_index < 0 or output_index >= len(outputs):
+                    raise ValueError(f"state output index {output_index} is outside {len(outputs)} outputs")
+                updated = outputs[output_index].detach().clone()
+                if tuple(updated.shape) != tuple(inputs[input_index].shape):
+                    raise ValueError(
+                        f"state {state.get('name', input_index)!r} changes shape from "
+                        f"{tuple(inputs[input_index].shape)} to {tuple(updated.shape)}")
+                trajectory_inputs[input_index] = updated
+
+    correctness_values = np.ascontiguousarray(goldens, dtype=np.float32)
+    if quality_reference is None:
+        quality_reference = correctness_values
+    quality_reference = np.ascontiguousarray(quality_reference, dtype=np.float32)
+    if quality_reference.shape != correctness_values.shape:
+        raise ValueError(
+            f"FP32 quality trajectory shape {quality_reference.shape} differs from compiled-precision "
+            f"correctness trajectory {correctness_values.shape}")
+    np.savez(out / "session_inputs.npz", **arrays)
+    np.savez(out / "session_goldens.npz", **{quality_key: correctness_values})
+    np.savez(out / "session_quality_fp32.npz", **{quality_key: quality_reference})
+    import hashlib
+    correctness_sha256 = hashlib.sha256(correctness_values.tobytes()).hexdigest()
+    quality_sha256 = hashlib.sha256(quality_reference.tobytes()).hexdigest()
+    contract = {
+        "version": 1,
+        "kind": str(session["kind"]),
+        "paper_ready": bool(session.get("paper_ready", False)),
+        "stages": [str(value) for value in session.get("stages", ())],
+        "steps": steps,
+        "inputs": "session_inputs.npz",
+        "states": contract_states,
+        "streams": contract_streams,
+        "correctness": {"scope": "trajectory", "golden": "session_goldens.npz",
+                        "key": quality_key, "output_index": quality_output,
+                        "reference": "eager_same_precision",
+                        "reference_sha256": correctness_sha256},
+        "quality": {"scope": "trajectory", "golden": "session_quality_fp32.npz",
+                    "key": quality_key, "output_index": quality_output,
+                    "reference": str(quality.get("reference", "eager_fp32")),
+                    "reference_sha256": quality_sha256},
+    }
+    if session.get("provenance"):
+        contract["provenance"] = session["provenance"]
+    if session.get("stage_schedule"):
+        contract["stage_schedule"] = session["stage_schedule"]
+    if session.get("parameters"):
+        contract["parameters"] = session["parameters"]
+    (out / "session_contract.yaml").write_text(yaml.safe_dump(contract, sort_keys=False))
+    return {"session_kind": contract["kind"], "session_steps": steps,
+            "session_states": len(contract_states), "paper_ready": contract["paper_ready"]}
+
+
+#: Torch dtypes numpy has no equivalent for, so a bundle must store them widened. Named rather than
+#: caught-by-exception: a TypeError from `.numpy()` also covers a genuinely broken tensor, and silently
+#: widening that would hide it.
+def _numpy_unrepresentable() -> frozenset:
+    import torch
+    out = [torch.bfloat16]
+    for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"):
+        dt = getattr(torch, name, None)
+        if dt is not None:
+            out.append(dt)
+    return frozenset(out)
+
+
+def _numpy_safe(x):
+    """A tensor as numpy, converting ONLY the dtypes numpy cannot represent.
+
+    `numpy` has no bfloat16 (nor any float8), so `.numpy()` on such a tensor raises
+    `TypeError: Got unsupported ScalarType BFloat16`. Measured on smolvla, whose vision tower takes
+    bf16 inputs: the export succeeded, the goldens were written, and the bundle died on `inputs.npz` --
+    the one place here that lacked the conversion `golden.npy` and the buffer writes already do.
+
+    ⚠️ NOT a blanket `.float()`. An LLM's `input_ids` are int64, and casting those to float32 corrupts
+    the token ids silently -- the input would still load, still have the right shape, and index a
+    different embedding row. So the conversion is keyed on the dtype actually being unrepresentable,
+    and every other dtype passes through untouched.
+
+    bf16 -> f32 is lossless (bf16 is a truncated f32), so no precision is traded for the storage.
+    """
+    import torch
+
+    t = x.detach().cpu()
+    if t.dtype in _numpy_unrepresentable():
+        t = t.float()
+    return t.numpy()
+
+
+def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: bool = True,
+                 session: dict | None = None, quantization_preapplied: bool = False,
+                 source_path: str | Path | None = None, exported_program=None,
+                 capture_trace: bool = False, original_frontend_snapshot: dict | None = None,
+                 metadata: dict | None = None, conversion_result=None) -> dict:
     """Convert ``mdl`` and write the full bundle to ``out``. Returns a summary dict.
 
     ``quant`` is an m2m ``QuantizationConfig`` (or ``None`` for an unquantized/fp bundle). The golden
@@ -167,6 +438,11 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     ``capture_regions`` (default on) additionally records per-region boundary tensors to
     ``region_goldens.npz`` (keyed by the ``prov.fqn`` modules the export tagged) — the shared substrate
     for per-region equivalence + standalone-section profiling. Captured in the SAME golden forward.
+
+    ``capture_trace`` writes byte-bound frontend correspondence beside ``model.mlir``.
+    ``conversion_result`` reuses an existing conversion without exporting again; its
+    weights must already live in this output directory, and the caller must provide
+    the actual selected model (with quantization preapplied when ``quant`` is set).
     """
     import m2m
 
@@ -175,11 +451,80 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     mdl.eval()
     inputs = tuple(inputs)
 
+    quality_reference = None
+    if session is not None:
+        quality = dict(session.get("quality", {}) or {})
+        supplied = quality.get("reference_values")
+        if supplied is not None:
+            if isinstance(supplied, torch.Tensor):
+                supplied = supplied.detach().float().cpu().numpy()
+            quality_reference = np.ascontiguousarray(supplied, dtype=np.float32)
+        elif not quantization_preapplied:
+            quality_reference = capture_session_trajectory(mdl, inputs, session)
+        elif session.get("paper_ready") is True:
+            raise ValueError(
+                "paper-ready prequantized capture must supply an independently generated "
+                "eager_fp32 quality.reference_values trajectory")
+
     weights_path = str(out / "weights.safetensors")
-    r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=quant,
-                    level="linalg-on-tensors", weights_path=weights_path)
+    eager_output = None
+    if conversion_result is not None:
+        if quant is not None and not quantization_preapplied:
+            raise ValueError("reusing a conversion requires the actual prequantized model")
+        r = conversion_result
+        from xdsl.dialects.builtin import StringAttr
+        weight_attr = r.module.attributes.get("prov.weights_file") if r.module is not None else None
+        if not isinstance(weight_attr, StringAttr) or Path(weight_attr.data).resolve() != Path(weights_path).resolve():
+            raise ValueError("reused conversion weights must be the output bundle's exact weights file")
+    else:
+        if quant is not None and not quantization_preapplied:
+            from m2m.capture.torchao_pipeline import apply_quantization
+            if capture_trace and original_frontend_snapshot is None:
+                original_frontend_snapshot = m2m.capture_frontend_snapshot(mdl, inputs)
+            # PT2E returns a new GraphModule; executing the old mdl would create
+            # a float golden for a quantized compiler payload.
+            mdl = apply_quantization(mdl, quant, example_inputs=inputs,
+                                     original_frontend_snapshot=original_frontend_snapshot)
+            quantization_preapplied = True
+            exported_program = None  # any supplied prequantized export is stale
+        if not capture_regions:
+            # Export can leave Python-side caches holding FakeTensors. Capture
+            # real reference outputs before tracing the selected model, after
+            # any requested quantization has actually been applied.
+            with torch.no_grad():
+                eager_output = mdl(*inputs)
+        r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=quant,
+                        level="linalg-on-tensors", weights_path=weights_path,
+                        quantization_preapplied=quantization_preapplied,
+                        capture_trace=capture_trace,
+                        original_frontend_snapshot=original_frontend_snapshot)
     assert r.ok, "m2m.convert failed"
-    (out / "model.mlir").write_text(r.mlir_text)
+    (out / "model.mlir").write_text(r.mlir_text, encoding="utf-8")
+    trace_pointer = None
+    if capture_trace:
+        import hashlib
+        if r.capture_trace is None:
+            raise ValueError("traced bundle requires a traced conversion result")
+        actual = r.mlir_text.encode("utf-8")
+        if r.capture_trace["mlir"]["sha256"] != hashlib.sha256(actual).hexdigest():
+            raise ValueError("conversion trace does not bind the exact bundle MLIR bytes")
+        trace_path = out / "frontend-trace.json"
+        trace_path.write_text(json.dumps(r.capture_trace, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        trace_pointer = {"path": trace_path.name, "sha256": hashlib.sha256(trace_path.read_bytes()).hexdigest(),
+                         "status": r.capture_trace["status"]}
+        meta_path = out / "meta.json"
+        merged = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        merged.update(metadata or {})
+        merged.update(frontend_trace=trace_pointer)
+        merged.setdefault("ok", r.ok)
+        merged.setdefault("capture_diagnostics", list(r.diagnostics))
+        merged.setdefault("path_taken", r.path_taken)
+        meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    elif metadata is not None:
+        meta_path = out / "meta.json"
+        merged = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        merged.update(metadata)
+        meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     n_regions = 0
     if capture_regions:
@@ -188,6 +533,8 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         if region_goldens:
             np.savez(out / "region_goldens.npz", **region_goldens)
         n_regions = len({k.split("::", 1)[0] for k in region_goldens})
+    elif eager_output is not None:
+        g = eager_output
     else:
         with torch.no_grad():
             g = mdl(*inputs)
@@ -195,7 +542,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     np.save(out / "golden.npy", golden.detach().float().cpu().numpy())
 
     np.savez(out / "inputs.npz",
-             **{f"in{i}": x.detach().cpu().numpy() for i, x in enumerate(inputs)})
+             **{f"in{i}": _numpy_safe(x) for i, x in enumerate(inputs)})
 
     extra: dict = {}
     for name, t in mdl.named_buffers():
@@ -203,7 +550,8 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     for pname, p in mdl.named_parameters():
         if type(p).__name__ not in ("Parameter", "Tensor") or hasattr(p, "__tensor_flatten__"):
             _flatten_subclass(p, pname, extra)
-    _lifted_constants(mdl, inputs, extra)
+    _lifted_constants(mdl, inputs, extra,
+                      exported_program=r.exported_program if r.exported_program is not None else exported_program)
     np.savez(out / "extra.npz", **extra)
 
     man = json.loads(Path(weights_path + ".manifest.json").read_text())
@@ -218,11 +566,111 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         k += 1
     (out / "input_order.json").write_text(json.dumps(order, indent=2))
 
+    session_summary = {}
+    if session is not None:
+        session_summary = write_session_artifacts(
+            mdl, inputs, out, manifest=man, input_order=order, session=session,
+            quality_reference=quality_reference)
+
+    from m2m.capture.provenance import write_capture_receipt
+
+    write_capture_receipt(out, source_path=source_path)
+
     return {
         "out": str(out), "n_inputs": len(inputs),
         "n_buffers": sum(1 for kk in extra if kk.startswith("buf::")),
         "n_lifted": sum(1 for kk in extra if kk.startswith("c_lifted")),
         "n_qinner": sum(1 for kk in extra if kk.startswith("qinner::")),
         "golden_shape": list(golden.shape), "linalg": r.mlir_text.count("linalg."),
-        "input_order": order, "n_regions": n_regions,
+        "input_order": order, "n_regions": n_regions, **session_summary,
+        **({"frontend_trace": trace_pointer} if trace_pointer is not None else {}),
     }
+
+
+def write_multi_program_bundle(programs: list[dict], root_session: dict, out: str | Path, *,
+                               quant=None, quantization_preapplied: bool = False,
+                               capture_trace: bool = False, source_path: str | Path | None = None,
+                               metadata: dict | None = None) -> dict:
+    """Write several fixed-shape compiled programs plus an ABI-resolved root session contract.
+
+    Loader-authored bindings use stable tuple ``input_index`` values.  Each stage conversion can
+    prepend hundreds of weight arguments, so this function resolves those indices through that
+    stage's emitted manifest and records the numeric ``input_arg`` consumed by Merlin.  Cross-stage
+    output ordinals are already stable exported ABI values.
+    """
+    import yaml
+    from m2m.capture.bundle_integrity import _bundle_files, write_bundle_integrity
+
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    # Refuse an existing symlink before any stage writer can follow it out of
+    # this directory. The final receipt repeats this check after writing.
+    _bundle_files(out)
+    names = [str(program["name"]) for program in programs]
+    if not names or len(set(names)) != len(names):
+        raise ValueError("multi-program capture needs unique program names")
+    if any(name in {".", ".."} or "\\" in name or Path(name).parts != (name,) for name in names):
+        raise ValueError("multi-program capture needs plain single-component program names")
+    if names != [str(value) for value in root_session.get("stages", ())]:
+        raise ValueError("program order must exactly equal the root session stages")
+    stage_records: dict[str, dict] = {}
+    summaries = []
+    for program in programs:
+        name = str(program["name"])
+        stage_out = out / "stages" / name
+        summary = write_bundle(
+            program["model"], tuple(program["inputs"]), stage_out, quant=quant,
+            capture_regions=bool(program.get("capture_regions", False)),
+            session=program.get("session"), quantization_preapplied=quantization_preapplied,
+            capture_trace=capture_trace, source_path=source_path,
+            metadata={**(metadata or {}), **program.get("metadata", {})},
+            original_frontend_snapshot=program.get("original_frontend_snapshot"))
+        manifest = json.loads((stage_out / "weights.safetensors.manifest.json").read_text())
+        input_order = json.loads((stage_out / "input_order.json").read_text())
+        stage_records[name] = {
+            "summary": summary,
+            "abi_args": _runtime_args_by_input_index(manifest, input_order),
+            "steps": int(program["steps"]),
+        }
+        summaries.append({"name": name, **summary})
+
+    bindings = []
+    for index, binding in enumerate(root_session.get("bindings", ()) or ()):
+        source = dict(binding["from"])
+        target = dict(binding["to"])
+        target_program = str(target["program"])
+        input_index = int(target.pop("input_index"))
+        abi_args = stage_records[target_program]["abi_args"]
+        if input_index not in abi_args:
+            raise ValueError(
+                f"root binding {index} target input index {input_index} is not in "
+                f"program {target_program}'s exported ABI")
+        target["input_arg"] = abi_args[input_index]
+        bindings.append({"name": str(binding["name"]), "from": source, "to": target})
+
+    schedule = list(root_session.get("stage_schedule", ()) or ())
+    expected_schedule = [(name, stage_records[name]["steps"]) for name in names]
+    actual_schedule = [(str(row.get("name")), int(row.get("steps", 0))) for row in schedule]
+    if actual_schedule != expected_schedule:
+        raise ValueError("stage schedule names/steps differ from the captured programs")
+    contract = {
+        "version": 2,
+        "kind": str(root_session["kind"]),
+        "paper_ready": bool(root_session.get("paper_ready", False)),
+        "stages": names,
+        "stage_schedule": schedule,
+        "parameters": dict(root_session.get("parameters", {}) or {}),
+        "programs": [{"name": name, "bundle": f"stages/{name}",
+                      "steps": stage_records[name]["steps"]} for name in names],
+        "bindings": bindings,
+        "states": [{"name": str(value)} for value in root_session.get("states", ()) or ()],
+        "streams": [],
+        "quality": {"scope": "trajectory", "program": str(root_session["quality_program"])},
+        "provenance": dict(root_session.get("provenance", {}) or {}),
+    }
+    (out / "session_contract.yaml").write_text(
+        yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+    integrity_path = write_bundle_integrity(out)
+    return {"out": str(out), "session_kind": contract["kind"], "paper_ready": contract["paper_ready"],
+            "n_programs": len(programs), "programs": summaries,
+            "n_bindings": len(bindings), "bundle_integrity": str(integrity_path)}
