@@ -14,8 +14,9 @@ falling back while claiming integer coverage.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -156,12 +157,20 @@ def run_pt2e_integer_reference(
             # direct PT2E dequantize nodes.  An attention matmul over the
             # results of integerized linears (often reshaped/transposed) is a
             # floating-point contraction, not another int8 contraction.
-            if len(node.args) < 2 or not all(
+            if len(node.args) < 2:
+                return super().run_node(node)
+            direct_dequant = tuple(
                 isinstance(operand, Node)
                 and operand.op == "call_function"
                 and operand.target in (dequant_tensor, dequant_channel)
                 for operand in node.args[:2]
-            ):
+            )
+            if any(direct_dequant) and not all(direct_dequant):
+                raise ValueError(
+                    "integer PT2E contraction has only one direct dequantize operand; "
+                    "mixed quantized/float execution has no independent integer reference"
+                )
+            if not all(direct_dequant):
                 return super().run_node(node)
 
             args, kwargs = self.fetch_args_kwargs_from_env(node)

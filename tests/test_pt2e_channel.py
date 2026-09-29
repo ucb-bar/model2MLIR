@@ -1,7 +1,8 @@
 """Coarse capture checks for factorable, frozen per-channel PT2E qparams."""
 
+import pytest
 import torch
-import torch.ao.quantization.fx._decomposed  # noqa: F401 -- registers portable PT2E ops
+import torch.ao.quantization.fx._decomposed  # registers portable PT2E ops
 from torch import nn
 
 import m2m
@@ -40,6 +41,7 @@ def _inputs(kind):
 def test_frozen_output_channel_linear_conv_and_batched_matmul_capture():
     """Each real export rewrites, executes, and lowers with exact source accounting."""
     from torch.ao.quantization import allow_exported_model_train_eval
+
     from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 
     for kind in ("linear", "conv2d", "matmul"):
@@ -58,6 +60,58 @@ def test_frozen_output_channel_linear_conv_and_batched_matmul_capture():
         assert result.ok and opaque_report(result.mlir_text) == {}
         assert result.capture_trace["status"] == "complete"
         assert 'prov.aten = "aten._int_mm.default"' in result.mlir_text
+
+
+def test_two_integer_matmuls_across_host_nonlinearity_have_independent_golden():
+    """A composed source must count and execute both integer matmuls, not borrow portable Q/DQ."""
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+
+    class TwoMatmuls(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight0", torch.arange(64).reshape(8, 8).remainder(13).sub(6).to(torch.int8))
+            self.register_buffer("weight1", torch.arange(64).reshape(8, 8).remainder(11).sub(5).to(torch.int8))
+
+        def dequantize(self, value):
+            return torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                value, 0.125, 0, -128, 127, torch.int8
+            )
+
+        def forward(self, x):
+            q0 = torch.ops.quantized_decomposed.quantize_per_tensor.default(x, 0.125, 0, -128, 127, torch.int8)
+            hidden = torch.nn.functional.gelu(torch.matmul(self.dequantize(q0), self.dequantize(self.weight0)))
+            q1 = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                hidden, 0.125, 0, -128, 127, torch.int8
+            )
+            return torch.matmul(self.dequantize(q1), self.dequantize(self.weight1))
+
+    inputs = (torch.arange(64, dtype=torch.float32).reshape(8, 8).sub(31) / 16,)
+    model = torch.export.export(TwoMatmuls().eval(), inputs).module()
+    reference = run_pt2e_integer_reference(model, inputs, expected_contractions=2)
+    integerized, receipt = integerize_pt2e(model, inputs)
+
+    assert reference.matmul_count == reference.contraction_count == 2
+    assert receipt["matmul_integerized"] == receipt["quantized_contractions_seen"] == 2
+    torch.testing.assert_close(reference.output, integerized(*inputs), atol=0, rtol=0)
+
+
+def test_partly_dequantized_matmul_refuses_independent_integer_claim():
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+
+    class MixedMatmul(nn.Module):
+        def forward(self, x, weight):
+            qx = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                x, 0.125, 0, -128, 127, torch.int8
+            )
+            dx = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                qx, 0.125, 0, -128, 127, torch.int8
+            )
+            return torch.matmul(dx, weight)
+
+    inputs = (torch.randn(8, 8), torch.randn(8, 8))
+    model = torch.export.export(MixedMatmul().eval(), inputs).module()
+    with pytest.raises(ValueError, match="only one direct dequantize operand"):
+        run_pt2e_integer_reference(model, inputs)
 
 
 def test_integer_reference_preserves_float_attention_after_integer_linears():
