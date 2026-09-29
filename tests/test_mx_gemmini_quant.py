@@ -46,6 +46,25 @@ def test_rhs_matmul_groups_scales_on_k_axis():
     assert torch.all(scales[1] == 129)
 
 
+@pytest.mark.parametrize("format,expected_negative_zero", [
+    ("mxfp8", True), ("mxfp6", True), ("mxfp4", False),
+])
+def test_signed_zero_matches_selected_rtl_conversion(format, expected_negative_zero):
+    # BF16ToE4M3/BF16ToE3M2 retain the sign on underflow; E3M1Tofp4
+    # explicitly emits code zero, discarding it.
+    values = torch.zeros(32, dtype=torch.bfloat16)
+    values[0] = 1.0
+    values[1] = -0.0
+    values[2] = -(2.0 ** -20)
+    expected, codes, _ = quantize_mx_gemmini(values, format)
+    exported = _dequant_operand_for_graph(values, format, -1)
+    assert torch.equal(expected.view(torch.int16), exported.view(torch.int16))
+    assert torch.signbit(expected[1]).item() is expected_negative_zero
+    assert torch.signbit(expected[2]).item() is expected_negative_zero
+    if format == "mxfp4":
+        assert codes[1].item() == codes[2].item() == 0
+
+
 @pytest.mark.parametrize("format", ["mxfp8", "mxfp6", "mxfp4"])
 def test_export_arithmetic_matches_code_lookup_for_finite_bf16(format):
     generator = torch.Generator().manual_seed(91)
