@@ -1,4 +1,4 @@
-venv = "/scratch/agustin/projects/model2MLIR/.venv"
+venv = ".venv"
 python = "3.12"
 deps = ["torchvision"]
 
