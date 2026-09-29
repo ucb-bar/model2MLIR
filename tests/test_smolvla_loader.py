@@ -61,11 +61,13 @@ def test_deferred_stagewise_capability_passes_one_source_and_explicit_calibratio
     monkeypatch.setattr(stagewise_pt2e, "quantize_stagewise_pt2e_session", convert)
     quant = object()
     calibration = {"prefix_encode": [()], "flow_denoise": [()]}
+    snapshot = {"fixture": "explicit source owner"}
     assert capture.shared_model is shared
     assert capture.stagewise_pt2e_session(
-        quant, calibration_inputs=calibration) == "converted"
+        quant, calibration_inputs=calibration, source_snapshot=snapshot) == "converted"
     assert calls == [((shared, source_session), {
         "quant": quant,
         "shared_programs": ("prefix_encode", "flow_denoise"),
         "calibration_inputs": calibration,
+        "source_snapshot": snapshot,
     })]

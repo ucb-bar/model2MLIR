@@ -229,7 +229,7 @@ class SmolVLAMultiProgramCapture:
         """The one source object used by both quantizable stage wrappers."""
         return self.model
 
-    def stagewise_pt2e_session(self, quant, *, calibration_inputs):
+    def stagewise_pt2e_session(self, quant, *, calibration_inputs, source_snapshot=None):
         """Opt-in named PT2E capture with caller-supplied stage calibration.
 
         PT2E converts ``forward`` on the prefix and flow wrappers separately;
@@ -243,7 +243,7 @@ class SmolVLAMultiProgramCapture:
         return quantize_stagewise_pt2e_session(
             self.shared_model, self.external_runtime_session(), quant=quant,
             shared_programs=("prefix_encode", "flow_denoise"),
-            calibration_inputs=calibration_inputs)
+            calibration_inputs=calibration_inputs, source_snapshot=source_snapshot)
 
     def write_bundle(self, out: str | Path, *, quant=None) -> dict:
         # Capture FP32 quality before optional in-place torchAO conversion.

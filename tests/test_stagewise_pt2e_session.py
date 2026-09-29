@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -10,12 +12,15 @@ from m2m.capture.bundle import write_stagewise_pt2e_multi_program_bundle
 from m2m.capture.bundle_integrity import verify_bundle_integrity
 from m2m.capture.external_runtime import ExternalRuntimeProgram, make_external_runtime_session
 from m2m.capture.stagewise_pt2e import quantize_stagewise_pt2e_session
+from m2m.capture.source_closure import (
+    make_source_snapshot, verify_stagewise_source_snapshot_bundle,
+)
 from m2m.capture.torchao_pipeline import QuantizationConfig
 from tests.test_quantized_multi_program_bundle import Shared, _session
 from tests.test_stagewise_pt2e_boundary import FlowStage, PrefixStage, SharedMethodModel
 
 
-def _convert(shared, session):
+def _convert(shared, session, *, source_snapshot=None):
     return quantize_stagewise_pt2e_session(
         shared, session,
         quant=QuantizationConfig(scheme="int8_static_act_int8_weight",
@@ -26,6 +31,7 @@ def _convert(shared, session):
             "step": [session.programs[1].inputs,
                      (torch.full((1, 2), 2.0), torch.zeros(1, 2))],
         },
+        source_snapshot=source_snapshot,
     )
 
 
@@ -89,6 +95,110 @@ def test_stagewise_pt2e_supports_method_only_shared_model():
     assert {item["source_parameter"] for item in converted.frozen_weights} == {"linear.weight"}
     assert len({item["frozen_sha256"] for item in converted.frozen_weights}) == 1
     assert converted.routes[0]["name"] == "prefix_to_flow"
+
+
+def test_stagewise_snapshot_is_bound_and_independently_rechecked(tmp_path, monkeypatch):
+    import m2m.capture.bundle as bundle_module
+
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    loader = tmp_path / "loader.py"
+    loader.write_text("# tiny fixture loader\n")
+    model_source = tmp_path / "model.bin"
+    model_source.write_bytes(b"tiny model source")
+    runtime_source = tmp_path / "runtime.bin"
+    runtime_source.write_bytes(b"tiny runtime source")
+    snapshot = make_source_snapshot(
+        package_root=Path(__file__).resolve().parents[1] / "m2m",
+        loader=loader, model_roots={"checkpoint": model_source},
+        support_roots={"runtime": runtime_source})
+
+    def tiny_stage_artifacts(programs, _session, out, **kwargs):
+        import yaml
+
+        assert kwargs["source_path"] == str(loader)
+        out = Path(out)
+        out.mkdir()
+        (out / "session_contract.yaml").write_text(yaml.safe_dump({"version": 2}))
+        sources = {
+            f"m2m/{member['path']}": member["sha256"]
+            for member in snapshot["owners"][0]["members"]
+            if member["kind"] == "file" and member["path"].endswith(".py")
+            and "__pycache__" not in Path(member["path"]).parts
+        }
+        for program in programs:
+            stage = out / "stages" / program["name"]
+            stage.mkdir(parents=True)
+            receipt = {
+                "schema": "m2m.capture-receipt.v1", "source_closure_verified": False,
+                "source": {"path": str(loader), "bytes": loader.stat().st_size,
+                           "sha256": hashlib.sha256(loader.read_bytes()).hexdigest()},
+                "tool": {"source_inventory_scope": "m2m_package_python_sources_only",
+                         "source_inventory_status": "complete", "source_sha256": sources},
+                "materialized_abi": {"complete": True},
+            }
+            (stage / "capture_receipt.json").write_text(json.dumps(receipt))
+        return {"n_programs": len(programs)}
+
+    monkeypatch.setattr(bundle_module, "write_multi_program_bundle", tiny_stage_artifacts)
+    shared = Shared().eval()
+    converted = _convert(shared, _session(shared), source_snapshot=snapshot)
+    out = tmp_path / "fresh-stagewise"
+    write_stagewise_pt2e_multi_program_bundle(converted, out, capture_trace=False)
+    verify_bundle_integrity(out)
+    verify_stagewise_source_snapshot_bundle(out)
+    binding = json.loads((out / "quantized-session-binding.json").read_text())
+    assert binding["source_closure_verified"] is False
+    assert binding["source_snapshot"]["source_closure_verified"] is False
+    for name in ("prefix", "step", "final"):
+        receipt = json.loads((out / "stages" / name / "capture_receipt.json").read_text())
+        assert receipt["source"]["path"] == str(loader)
+    model_source.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="membership or bytes"):
+        verify_stagewise_source_snapshot_bundle(out)
+
+
+def test_stagewise_snapshot_rejects_a_different_m2m_package(tmp_path):
+    fake_package = tmp_path / "m2m"
+    fake_package.mkdir()
+    (fake_package / "__init__.py").write_text("# unrelated package\n")
+    loader = tmp_path / "loader.py"
+    loader.write_text("# loader\n")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    runtime = tmp_path / "runtime.bin"
+    runtime.write_bytes(b"runtime")
+    snapshot = make_source_snapshot(
+        package_root=fake_package, loader=loader,
+        model_roots={"checkpoint": model}, support_roots={"runtime": runtime})
+    shared = Shared().eval()
+    with pytest.raises(ValueError, match="not the executing package"):
+        _convert(shared, _session(shared), source_snapshot=snapshot)
+
+
+def test_stagewise_snapshot_refuses_source_drift_during_quantization(tmp_path, monkeypatch):
+    import m2m.capture.stagewise_pt2e as pipeline
+
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    loader = tmp_path / "loader.py"
+    loader.write_text("# loader\n")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"model")
+    runtime = tmp_path / "runtime.bin"
+    runtime.write_bytes(b"runtime")
+    snapshot = make_source_snapshot(
+        package_root=Path(__file__).resolve().parents[1] / "m2m", loader=loader,
+        model_roots={"checkpoint": model}, support_roots={"runtime": runtime})
+    original = pipeline.apply_quantization
+
+    def change_source(*args, **kwargs):
+        converted = original(*args, **kwargs)
+        model.write_bytes(b"changed during quantization")
+        return converted
+
+    monkeypatch.setattr(pipeline, "apply_quantization", change_source)
+    shared = Shared().eval()
+    with pytest.raises(ValueError, match="membership or bytes"):
+        _convert(shared, _session(shared), source_snapshot=snapshot)
 
 
 def test_stagewise_pt2e_retains_eager_reference_for_paper_ready_flow():

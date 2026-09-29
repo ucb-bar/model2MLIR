@@ -9,8 +9,10 @@ identical frozen encodings wherever that Parameter is used by multiple stages.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from itertools import islice
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -181,6 +183,7 @@ class StagewisePT2ESession:
     program_abis: dict
     routes: tuple[dict, ...]
     calibration_counts: dict[str, int]
+    source_snapshot: dict[str, Any] | None = None
 
 
 def quantize_stagewise_pt2e_session(
@@ -190,6 +193,7 @@ def quantize_stagewise_pt2e_session(
     quant: QuantizationConfig,
     shared_programs: Sequence[str],
     calibration_inputs: Mapping[str, Iterable[tuple[torch.Tensor, ...]]],
+    source_snapshot: Mapping[str, Any] | None = None,
 ) -> StagewisePT2ESession:
     """PT2E-convert named stages with explicit calibration and verified source weights.
 
@@ -199,6 +203,17 @@ def quantize_stagewise_pt2e_session(
     Unsupported weight rewrites (including Conv+BN folding) fail closed.
     """
     from m2m.capture.bundle import _shared_tensor_inventory
+
+    snapshot = None
+    if source_snapshot is not None:
+        from m2m.capture.source_closure import verify_source_snapshot
+
+        verify_source_snapshot(source_snapshot)
+        package = next(owner["root"] for owner in source_snapshot["owners"]
+                       if owner["role"] == "m2m_package")
+        if Path(package) != Path(__file__).resolve().parents[1]:
+            raise ValueError("source snapshot M2M owner is not the executing package")
+        snapshot = deepcopy(source_snapshot)
 
     if not isinstance(shared_model, nn.Module) or not isinstance(source_session, ExternalRuntimeSession):
         raise TypeError("stage-wise PT2E needs a source nn.Module and external-runtime session")
@@ -267,5 +282,7 @@ def quantize_stagewise_pt2e_session(
     session = make_external_runtime_session(version=2, programs=tuple(converted),
                                             metadata=source_session.metadata)
     abis, routes = _stage_abis(session)
+    if snapshot is not None:
+        verify_source_snapshot(snapshot)
     return StagewisePT2ESession(shared_model, session, quant, names, inventory,
-                               tuple(records), abis, tuple(routes), counts)
+                               tuple(records), abis, tuple(routes), counts, snapshot)

@@ -840,9 +840,31 @@ def write_stagewise_pt2e_multi_program_bundle(
     from m2m.capture.stagewise_pt2e import (
         StagewisePT2ESession, _frozen_weights, _stage_abis, _tensor_sha256,
     )
+    from m2m.capture.source_closure import (
+        verify_source_snapshot, verify_stagewise_source_snapshot_bundle,
+    )
 
     if not isinstance(converted, StagewisePT2ESession):
         raise TypeError("stage-wise writer needs a verified PT2E session")
+    snapshot = converted.source_snapshot
+    if snapshot is not None:
+        verify_source_snapshot(snapshot)
+        package = next(owner["root"] for owner in snapshot["owners"]
+                       if owner["role"] == "m2m_package")
+        if Path(package) != Path(__file__).resolve().parents[1]:
+            raise ValueError("source snapshot M2M owner is not the executing package")
+        loader = next(owner["root"] for owner in snapshot["owners"]
+                      if owner["role"] == "loader")
+        if source_path is not None and Path(source_path).absolute() != Path(loader):
+            raise ValueError("stage-wise source path differs from snapshot loader")
+        source_path = loader
+        output = Path(out).absolute()
+        if ".." in output.parts or any(part.is_symlink() for part in (output, *output.parents)):
+            raise ValueError("stage-wise output traverses a parent or symlink")
+        if any(output == Path(owner["root"]) or output.is_relative_to(Path(owner["root"]))
+               or Path(owner["root"]).is_relative_to(output)
+               for owner in snapshot["owners"]):
+            raise ValueError("stage-wise output overlaps a source snapshot owner")
     selected_policy = asdict(converted.quant)
     if quantization is not None and quantization != selected_policy:
         raise ValueError("stage-wise quantization metadata differs from the selected PT2E policy")
@@ -881,6 +903,8 @@ def write_stagewise_pt2e_multi_program_bundle(
     after_abis, after_routes = _stage_abis(converted.session)
     if after_abis != converted.program_abis or tuple(after_routes) != converted.routes:
         raise ValueError("stage-wise ABI or routes changed during conversion")
+    if snapshot is not None:
+        verify_source_snapshot(snapshot)
     stage_receipts = {}
     for name in by_name:
         receipt = (out / "stages" / name / "capture_receipt.json").read_bytes()
@@ -901,6 +925,16 @@ def write_stagewise_pt2e_multi_program_bundle(
         "routes": converted.routes,
         "stage_receipts": stage_receipts,
     }
+    if snapshot is not None:
+        snapshot_path = out / "source-snapshot.json"
+        snapshot_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+                                 encoding="utf-8")
+        binding["source_snapshot"] = {
+            "path": snapshot_path.name,
+            "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
+            "verified_before_and_after_capture": True,
+            "source_closure_verified": False,
+        }
     binding_path = out / "quantized-session-binding.json"
     binding_path.write_text(json.dumps(binding, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     contract_path = out / "session_contract.yaml"
@@ -911,5 +945,9 @@ def write_stagewise_pt2e_multi_program_bundle(
     }
     contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
     summary["quantized_session_binding"] = str(binding_path)
+    if snapshot is not None:
+        summary["source_snapshot"] = str(snapshot_path)
     summary["bundle_integrity"] = str(write_bundle_integrity(out))
+    if snapshot is not None:
+        verify_stagewise_source_snapshot_bundle(out)
     return summary
