@@ -145,5 +145,7 @@ and contraction census. This is a frontend proof; model2MLIR has not yet
 established typed MX lowering or simulator conformance. Its stats record
 `numeric_status: operand_fake_quant_only`, so this cannot be interpreted as a
 functional compiler certificate. The Merlin Phase 0 software spec remains
-`unreviewed` until elaborated RTL, Spike, and Verilator agree on the selected
-source closure and each format's vectors.
+`unreviewed`. Selected source-bound RTL and Spike diagnostics agree on
+bounded contraction vectors in each format, including one element-subnormal
+vector per format. They do not establish general numerical behavior,
+whole-model host semantics, or an admitted Phase 0 capsule corpus.
