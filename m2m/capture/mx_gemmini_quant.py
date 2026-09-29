@@ -16,6 +16,8 @@ from torch.nn import functional as F
 
 GROUP = 32
 RTL_COMMIT = "f0167390b56fb315deea90ac1fc3983772e92d82"
+RTL_CONFIG = "GemminiMxFPConfigs.standaloneMxFPConfig"
+RTL_CONFIG_CLASS = "GemminiMxFPStandaloneConfig"
 # (exponent bits, fraction bits, exponent bias, highest finite positive code)
 _FORMATS = {
     "mxfp8": (4, 3, 7, 0x7E),  # OCP E4M3, max 448

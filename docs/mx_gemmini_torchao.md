@@ -2,10 +2,12 @@
 
 The selected hardware contract is the `gemmini-mx-cleanup` RTL at
 `f0167390b56fb315deea90ac1fc3983772e92d82`. This extension is local to
-model2MLIR; it uses TorchAO's public `AOBaseConfig`,
-`register_quantize_module_handler`, and `quantize_` APIs and requires no TorchAO
-fork. The selected formats are `mx_gemmini_fp8`, `mx_gemmini_fp6`, and
-`mx_gemmini_fp4`.
+model2MLIR and selects `GemminiMxFPConfigs.standaloneMxFPConfig` /
+`GemminiMxFPStandaloneConfig`: the pinned 16 by 16 standalone path with the
+three symmetric FP4 E2M1, FP6 E3M2, and FP8 E4M3 PE modes. It uses TorchAO's
+public `AOBaseConfig`, `register_quantize_module_handler`, and `quantize_`
+APIs and requires no TorchAO fork. The selected formats are
+`mx_gemmini_fp8`, `mx_gemmini_fp6`, and `mx_gemmini_fp4`.
 
 ## Use
 
@@ -85,7 +87,8 @@ operand Q/DQ. It does not model the RTL's product truncation, lane schedule,
 LUT projection, packing, accumulator behavior, or transfers. The exported
 model remains a **capture and operand-numerics prototype**. FXImporter emits
 generic MLIR with zero opaque calls for the three-format toy contraction test
-and attaches `prov.mx_capture_contract` with the RTL pin, format, scale rule,
+and attaches `prov.mx_capture_contract` with the RTL pin, selected configuration,
+format, scale rule,
 and contraction census. This is a frontend proof; model2MLIR has not yet
 established typed MX lowering or simulator conformance. Its stats record
 `numeric_status: operand_fake_quant_only`, so this cannot be interpreted as a

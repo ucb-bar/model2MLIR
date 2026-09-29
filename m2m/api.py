@@ -176,7 +176,7 @@ def convert(
             result.module.attributes["prov.quantization"] = StringAttr(str(scheme))
             if scheme in {"mx_gemmini_fp8", "mx_gemmini_fp6", "mx_gemmini_fp4"}:
                 import json
-                from m2m.capture.mx_gemmini_quant import RTL_COMMIT
+                from m2m.capture.mx_gemmini_quant import RTL_COMMIT, RTL_CONFIG, RTL_CONFIG_CLASS
 
                 census = getattr(model, "_m2m_quantization_stats", None)
                 if not isinstance(census, dict) or census.get("numeric_status") != "operand_fake_quant_only":
@@ -186,6 +186,8 @@ def convert(
                     contract = {
                         "schema": "m2m.mx_gemmini_capture.v1",
                         "rtl_commit": RTL_COMMIT,
+                        "rtl_config": RTL_CONFIG,
+                        "rtl_config_class": RTL_CONFIG_CLASS,
                         "format": scheme.removeprefix("mx_gemmini_"),
                         "block_size": 32,
                         "scale_encoding": "e8m0",

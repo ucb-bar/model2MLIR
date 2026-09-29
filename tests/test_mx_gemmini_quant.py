@@ -117,5 +117,6 @@ def test_mx_capture_import_has_explicit_contract_and_no_opaque_calls(scheme):
                      quantization=QuantizationConfig(scheme=scheme), backend="fx_importer")
     assert result.ok, result.diagnostics
     assert "prov.mx_capture_contract" in result.mlir_text
+    assert "GemminiMxFPConfigs.standaloneMxFPConfig" in result.mlir_text
     assert 'operand_fake_quant_only' in result.mlir_text
     assert 'func.func private' not in result.mlir_text
