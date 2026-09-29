@@ -18,6 +18,8 @@ from typing import Any
 
 import torch
 
+from m2m.capture.external_quantization import ExternalQuantizationConfig, apply_external_quantization
+
 
 @dataclass(frozen=True)
 class QuantizationConfig:
@@ -278,7 +280,7 @@ def _apply_pt2e_static_w8a8(
 
 def apply_quantization(
     model: Any,
-    config: QuantizationConfig,
+    config: QuantizationConfig | ExternalQuantizationConfig,
     *,
     example_inputs: tuple[Any, ...] | None = None,
     calibration_inputs: Iterable[Any] | None = None,
@@ -294,68 +296,11 @@ def apply_quantization(
         Quantized model (modified in-place or new module).
 
     """
-    mx_formats = {
-        "mx_gemmini_fp8": "mxfp8",
-        "mx_gemmini_fp6": "mxfp6",
-        "mx_gemmini_fp4": "mxfp4",
-    }
-    if config.per_module and (
-        config.scheme in mx_formats or any(scheme in mx_formats for scheme in config.per_module.values())
-    ):
-        raise ValueError("per_module MX selection needs a whole-graph contraction policy")
-    if config.scheme in mx_formats and not config.per_module:
-        if not example_inputs:
-            raise ValueError("MX Gemmini graph quantization requires example_inputs")
-        from m2m.capture.mx_gemmini_quant import (
-            MXGemminiFakeQuantConfig, quantize_functional_contractions_,
+    if isinstance(config, ExternalQuantizationConfig):
+        return apply_external_quantization(
+            model, tuple(example_inputs or ()), config,
+            original_frontend_snapshot=original_frontend_snapshot,
         )
-        from torchao.quantization import quantize_
-
-        format = mx_formats[config.scheme]
-        tile = 16 if format == "mxfp8" else 32
-        eligible = []
-        skipped_linear = []
-        for name, module in model.named_modules():
-            if not isinstance(module, torch.nn.Linear):
-                continue
-            if module.in_features % 32:
-                skipped_linear.append({"module": name, "reason": "K outside MX block size 32"})
-            elif module.out_features % tile:
-                skipped_linear.append({"module": name, "reason": f"N outside MX tile {tile}"})
-            else:
-                eligible.append(module)
-        quantize_(model, MXGemminiFakeQuantConfig(format=format),
-                  filter_fn=lambda module, _fqn: module in eligible)
-        exported = torch.export.export(model.eval(), tuple(example_inputs))
-        graph_module = exported.module()
-        coverage = quantize_functional_contractions_(graph_module, format)
-        try:
-            from torch.ao.quantization import allow_exported_model_train_eval
-
-            allow_exported_model_train_eval(graph_module)
-        except (ImportError, AttributeError):
-            # PyTorch versions that removed the exported-model shim still
-            # install throwing train()/eval() methods on ExportedProgram.module().
-            # Capture calls eval() defensively; this graph is already frozen.
-            import types
-
-            def _set_frozen_training(self, mode=True):
-                if mode:
-                    raise ValueError("MX exported graph is inference-only")
-                self.training = False
-                return self
-
-            graph_module.train = types.MethodType(_set_frozen_training, graph_module)
-            graph_module.eval = types.MethodType(lambda self: self.train(False), graph_module)
-        graph_module._m2m_quantization_stats = {
-            "scheme": config.scheme,
-            "linear_modules_total": len(eligible) + len(skipped_linear),
-            "torchao_linear_modules": len(eligible),
-            "linear_modules_skipped": skipped_linear,
-            **coverage,
-            "numeric_status": "operand_fake_quant_only",
-        }
-        return graph_module
     if config.scheme == "int8_static_act_int8_weight" and not config.per_module:
         return _apply_pt2e_static_w8a8(
             model,

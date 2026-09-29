@@ -1,9 +1,13 @@
 # model2MLIR
 Any model in Torch or JAX format to MLIR frontend dialects.
 
-The [MX Gemmini TorchAO extension](docs/mx_gemmini_torchao.md) documents
-three-format operand capture, functional attention coverage, and the limits
-of its current MLIR handoff.
+Target quantization adapters can be installed out of tree through the
+`m2m.quantization_adapters` entry-point group. Select an adapter with exact
+software contract and policy files using `--quant-adapter`, `--contract`, and
+`--policy`. A successful conversion writes `<output>.quantization.json` beside
+the MLIR file and stamps its SHA-256 digest in the module attributes. Adapter
+implementations and target-specific format policies belong to their support
+packages.
 
 ## Inspect frontend operations and lowering correspondence
 

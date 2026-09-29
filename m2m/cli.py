@@ -40,19 +40,36 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     import m2m
 
     model, inputs = _load_model_module(args.model)
+    quantization = _make_quant(args.quant)
+    if args.quant_adapter:
+        from m2m.capture.external_quantization import ExternalQuantizationConfig
+
+        if args.quant or not args.contract or not args.policy:
+            raise ValueError("--quant-adapter requires --contract and --policy, without --quant")
+        quantization = ExternalQuantizationConfig(
+            args.quant_adapter, args.contract, args.policy,
+            args.contract_sha256, args.policy_sha256,
+        )
     result = m2m.convert(
         model,
         tuple(inputs),
         output_type=args.output_type,
-        quantization=_make_quant(args.quant),
+        quantization=quantization,
         backend=getattr(args, "backend", "auto"),
         level=getattr(args, "level", "linalg-on-tensors"),
+        capture_trace=bool(args.quant_adapter),
     )
     if not result.ok:
         sys.stderr.write("conversion failed:\n  " + "\n  ".join(result.diagnostics) + "\n")
         return 1
     if args.out:
         Path(args.out).write_text(result.mlir_text)
+        if result.quantization_manifest is not None:
+            import json
+
+            Path(args.out + ".quantization.json").write_text(
+                json.dumps(result.quantization_manifest, sort_keys=True, indent=2) + "\n"
+            )
         sys.stderr.write(
             f"[{result.frontend}/{result.path_taken}] {result.output_type}: "
             f"wrote {len(result.mlir_text)} chars to {args.out}\n"
@@ -90,6 +107,11 @@ def main(argv: list[str] | None = None) -> int:
         pc.add_argument("--output-type", default="linalg-on-tensors")
         pc.add_argument("--backend", default="auto", choices=["auto", "torch_mlir", "fx_importer"])
         pc.add_argument("--quant", default=None, help="torchAO scheme name (e.g. int8_weight_only)")
+        pc.add_argument("--quant-adapter", default=None, help="installed external quantization adapter ID")
+        pc.add_argument("--contract", default=None, help="selected external software contract")
+        pc.add_argument("--policy", default=None, help="selected external model quantization policy")
+        pc.add_argument("--contract-sha256", default=None, help="expected SHA-256 of selected contract")
+        pc.add_argument("--policy-sha256", default=None, help="expected SHA-256 of selected policy")
         pc.add_argument("--level", default="linalg-on-tensors",
                         choices=["linalg-on-tensors", "high-level"], help="representation level")
         pc.set_defaults(func=_cmd_convert)
