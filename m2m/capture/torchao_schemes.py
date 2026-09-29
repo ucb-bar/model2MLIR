@@ -290,24 +290,39 @@ _QAT: tuple[TorchAOScheme, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# CompGen-custom (not TorchAO but ships in this project)
+# Local TorchAO extension configs (registered through public TorchAO API)
 # ---------------------------------------------------------------------------
 
-# Custom (non-TorchAO) schemes were dropped during extraction from CompGen
-# because they depended on NPU-specific modules. Reintroduce here as a
-# m2m.quant extension if needed.
 _COMPGEN_CUSTOM: tuple[TorchAOScheme, ...] = (
     TorchAOScheme(
         name="mx_gemmini_fp8",
         config_class_path="m2m.capture.mx_gemmini_quant.MXGemminiFakeQuantConfig",
-        weight_dtype="float8_e4m3fn",
-        granularity="per_group",
+        weight_dtype="mxfp8_e4m3",
+        activation_dtype="mxfp8_e4m3",
+        granularity="per_block",
         stability="compgen_custom",
         target_hardware="gemmini_mx",
-        params={"group_size": 32, "scale_dtype": "fpe8m0", "rounding": "rtz"},
-        notes="MX-Gemmini-faithful fake quant: fp8 e4m3 RTZ, per-32 fpE8M0 "
-              "power-of-two scales (matches gemmini golden_model.py). Models "
-              "quantized with this run bit-faithfully on the MX accelerator.",
+        params={"format": "mxfp8", "group_size": 32, "scale_dtype": "e8m0", "rounding": "rne"},
+        notes="BF16-to-MX E4M3 operand fake quant; TorchAO module handler plus graph pass. "
+              "RTL arithmetic and memory behavior require separate qualification.",
+    ),
+    TorchAOScheme(
+        name="mx_gemmini_fp6",
+        config_class_path="m2m.capture.mx_gemmini_quant.MXGemminiFakeQuantConfig",
+        weight_dtype="mxfp6_e3m2",
+        activation_dtype="mxfp6_e3m2",
+        granularity="per_block", stability="compgen_custom", target_hardware="gemmini_mx",
+        params={"format": "mxfp6", "group_size": 32, "scale_dtype": "e8m0", "rounding": "rne"},
+        notes="BF16-to-MX E3M2 operand fake quant; requires RTL arithmetic qualification.",
+    ),
+    TorchAOScheme(
+        name="mx_gemmini_fp4",
+        config_class_path="m2m.capture.mx_gemmini_quant.MXGemminiFakeQuantConfig",
+        weight_dtype="mxfp4_e2m1",
+        activation_dtype="mxfp4_e2m1",
+        granularity="per_block", stability="compgen_custom", target_hardware="gemmini_mx",
+        params={"format": "mxfp4", "group_size": 32, "scale_dtype": "e8m0", "rounding": "rne"},
+        notes="BF16-to-E3M1-to-E2M1 operand fake quant; requires RTL arithmetic qualification.",
     ),
 )
 

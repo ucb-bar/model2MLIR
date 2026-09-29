@@ -278,8 +278,14 @@ def capture_frontend_artifact(
     active_model = model
     if quantization_config is not None:
         try:
-            active_model = apply_quantization(model, quantization_config)
+            inputs = tuple(sample_inputs) if isinstance(sample_inputs, (tuple, list)) else (sample_inputs,)
+            active_model = apply_quantization(model, quantization_config, example_inputs=inputs)
         except Exception:
+            mx_schemes = {"mx_gemmini_fp8", "mx_gemmini_fp6", "mx_gemmini_fp4"}
+            if (quantization_config.scheme in mx_schemes or
+                    any(scheme in mx_schemes for scheme in
+                        (quantization_config.per_module or {}).values())):
+                raise
             active_model = model
 
     diagnostics = collect_diagnostics(active_model, sample_inputs)

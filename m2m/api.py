@@ -110,7 +110,7 @@ def convert(
             torch.__future__.set_swap_module_params_on_conversion(False)
         except Exception:  # noqa: BLE001
             pass
-        model = apply_quantization(model, quantization)
+        model = apply_quantization(model, quantization, example_inputs=tuple(example_inputs))
 
     # Decompose-first: capture an ExportedProgram and run decompositions so
     # composite ops torch-mlir can't legalize (e.g. aten.diff) are lowered
@@ -174,6 +174,26 @@ def convert(
 
             scheme = getattr(quantization, "scheme", None) or str(quantization)
             result.module.attributes["prov.quantization"] = StringAttr(str(scheme))
+            if scheme in {"mx_gemmini_fp8", "mx_gemmini_fp6", "mx_gemmini_fp4"}:
+                import json
+                from m2m.capture.mx_gemmini_quant import RTL_COMMIT
+
+                census = getattr(model, "_m2m_quantization_stats", None)
+                if not isinstance(census, dict) or census.get("numeric_status") != "operand_fake_quant_only":
+                    result.diagnostics.append("MX graph lacks an operand quantization census")
+                    result.path_taken = "failed"
+                else:
+                    contract = {
+                        "schema": "m2m.mx_gemmini_capture.v1",
+                        "rtl_commit": RTL_COMMIT,
+                        "format": scheme.removeprefix("mx_gemmini_"),
+                        "block_size": 32,
+                        "scale_encoding": "e8m0",
+                        **census,
+                    }
+                    result.module.attributes["prov.mx_capture_contract"] = StringAttr(
+                        json.dumps(contract, sort_keys=True)
+                    )
             per_module = getattr(quantization, "per_module", None)
             if per_module:
                 # serialize the mixed-precision map as "pattern=scheme;pattern=scheme"
@@ -272,7 +292,7 @@ def coverage_report(
     """
     from m2m.capture.torch_export import capture_frontend_artifact
 
-    if quantization is not None:
+    if quantization is not None and not str(quantization.scheme).startswith("mx_gemmini_"):
         model = apply_quantization(model, quantization)
 
     artifact = capture_frontend_artifact(model, example_inputs, quantization_config=quantization)
