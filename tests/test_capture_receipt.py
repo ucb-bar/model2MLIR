@@ -175,3 +175,6 @@ def test_static_pt2e_bundle_golden_is_actual_quantized_model(tmp_path, monkeypat
     write_bundle(model, inputs, out, capture_regions=False, capture_trace=True,
                  quant=QuantizationConfig(scheme="int8_static_act_int8_weight"))
     np.testing.assert_array_equal(np.load(out / "golden.npy"), expected_golden)
+    receipt = json.loads((out / "capture_receipt.json").read_text())
+    for name in ("weights.safetensors.quantization.json", "weights.safetensors.prequant.safetensors"):
+        assert receipt["artifacts"][name]["sha256"] == hashlib.sha256((out / name).read_bytes()).hexdigest()

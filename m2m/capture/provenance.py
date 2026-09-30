@@ -84,6 +84,27 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
         "inputs.npz", "golden.npy", "extra.npz", "input_order.json",
     )
     artifacts = {name: _file_record(out / name) for name in required}
+    lineage_name = "weights.safetensors.quantization.json"
+    prequant_name = "weights.safetensors.prequant.safetensors"
+    lineage_path, prequant_path = out / lineage_name, out / prequant_name
+    if lineage_path.exists() != prequant_path.exists():
+        raise ValueError("PT2E weight lineage receipt and prequant bytes must be published together")
+    if lineage_path.exists():
+        if lineage_path.is_symlink() or prequant_path.is_symlink():
+            raise ValueError("PT2E private weight evidence must be direct files")
+        lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+        if (
+            lineage.get("schema") != "m2m.quant_weight_lineage.v1"
+            or lineage.get("exported_weights") != {
+                "file": "weights.safetensors", "sha256": artifacts["weights.safetensors"]["sha256"]
+            }
+            or lineage.get("prequant_weights") != {
+                "file": prequant_name, "sha256": _sha256_file(prequant_path)
+            }
+        ):
+            raise ValueError("PT2E private weight evidence differs from the published bundle")
+        artifacts[lineage_name] = _file_record(lineage_path)
+        artifacts[prequant_name] = _file_record(prequant_path)
     for name in ("frontend-trace.json", "meta.json"):
         if (out / name).is_file():
             artifacts[name] = _file_record(out / name)

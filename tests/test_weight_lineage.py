@@ -31,6 +31,34 @@ class _DevelopmentNet(nn.Module):
         return self.fc(self.bn(self.conv(x)).relu().mean((2, 3)))
 
 
+class _MatmulNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(8, 8) * 0.05)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.weight
+
+
+def test_constant_weight_matmul_records_last_axis_quantization(tmp_path):
+    torch.manual_seed(17)
+    model = _MatmulNet().eval()
+    inputs = (torch.randn(8, 8),)
+    path = tmp_path / "weights.safetensors"
+    result = m2m.convert(
+        model, inputs,
+        quantization=QuantizationConfig(scheme="int8_static_act_int8_weight", calibration_samples=1),
+        calibration_inputs=[inputs], backend="fx_importer", decompose=False, weights_path=str(path),
+    )
+    assert result.ok, result.diagnostics
+    lineage = json.loads((tmp_path / "weights.safetensors.quantization.json").read_text())
+    assert len(lineage["weights"]) == 1
+    row = lineage["weights"][0]
+    assert row["original"]["key"] in load_file(str(tmp_path / "weights.safetensors.prequant.safetensors"))
+    assert row["qparams"]["axis"] == 1
+    assert row["frozen"]["key"] in load_file(str(path))
+
+
 def _verify_files(path, *, expected_granularity: str) -> dict:
     receipt = json.loads((path.parent / (path.name + ".quantization.json")).read_text())
     prequant = load_file(str(path.parent / (path.name + ".prequant.safetensors")))

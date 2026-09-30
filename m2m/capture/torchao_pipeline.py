@@ -133,7 +133,7 @@ def _apply_pt2e_static_w8a8(
     calibration_inputs: Iterable[Any] | None,
     original_frontend_snapshot: dict[str, Any] | None = None,
 ) -> Any:
-    """Calibrate and freeze a portable Conv/Linear W8A8 graph with TorchAO PT2E.
+    """Calibrate and freeze a portable constant-weight W8A8 graph with TorchAO PT2E.
 
     TorchAO's unified ``quantize_`` API intentionally defaults to ``nn.Linear``.
     Applying ``Int8StaticActivationInt8WeightConfig`` through that API therefore
@@ -143,7 +143,8 @@ def _apply_pt2e_static_w8a8(
     tensors. The emitted Q/DQ graph is backend-neutral and is deliberately not
     tied to Gemmini (or any other target).
 
-    The small quantizer below annotates aten Conv2d and Linear directly instead of
+    The small quantizer below annotates aten Conv2d, Linear and constant-weight
+    rank-2 Matmul directly instead of
     importing a CPU backend recipe. This keeps the capture contract about numeric
     format, not about the host used to perform capture.
     """
@@ -181,6 +182,14 @@ def _apply_pt2e_static_w8a8(
                 qscheme=torch.per_channel_symmetric,
                 ch_axis=0,
             )
+            self.matmul_weight = QuantizationSpec(
+                dtype=torch.int8,
+                observer_or_fake_quant_ctr=PerChannelMinMaxObserver.with_args(eps=eps),
+                quant_min=-127,
+                quant_max=127,
+                qscheme=torch.per_channel_symmetric,
+                ch_axis=1,
+            )
             self.annotated = 0
             self.fold_candidates = fold_candidates or []
 
@@ -193,16 +202,24 @@ def _apply_pt2e_static_w8a8(
 
         def annotate(self, graph_module: Any) -> Any:
             supported = {torch.ops.aten.conv2d.default, torch.ops.aten.linear.default}
+            matmul = torch.ops.aten.matmul.default
             for node in graph_module.graph.nodes:
-                if node.target not in supported or len(node.args) < 2:
+                if node.target not in supported | {matmul} or len(node.args) < 2:
                     continue
                 activation, weight = node.args[:2]
+                if node.target == matmul:
+                    shape = getattr((weight.meta or {}).get("val"), "shape", ())
+                    if weight.op != "get_attr" or len(shape) != 2:
+                        continue
                 # Quantize each contraction's two inputs. Its result stays f32;
                 # a later contraction observes/quantizes its own input edge. This
                 # is a portable W8A8 core with an explicit requant/dequant boundary,
                 # and does not assume a target can keep arbitrary epilogues in i8.
                 node.meta["quantization_annotation"] = QuantizationAnnotation(
-                    input_qspec_map={activation: self.activation, weight: self.weight},
+                    input_qspec_map={
+                        activation: self.activation,
+                        weight: self.matmul_weight if node.target == matmul else self.weight,
+                    },
                     _annotated=True,
                 )
                 self.annotated += 1
@@ -212,7 +229,7 @@ def _apply_pt2e_static_w8a8(
             del graph_module
             if self.annotated == 0:
                 raise ValueError(
-                    "int8_static_act_int8_weight found no supported Conv2d/Linear ops"
+                    "int8_static_act_int8_weight found no supported constant-weight Conv2d/Linear/Matmul ops"
                 )
 
     # PT2E consumes an exported aten graph. prepare_pt2e also performs the
@@ -264,7 +281,8 @@ def _apply_pt2e_static_w8a8(
         from m2m.capture.trace import attach_quantization_boundaries
 
         attach_quantization_boundaries(quantized, {torch.ops.aten.conv2d.default,
-                                                  torch.ops.aten.linear.default})
+                                                  torch.ops.aten.linear.default,
+                                                  torch.ops.aten.matmul.default})
     pruned_state = _drop_unused_graph_state(quantized)
     try:
         # Exported graph modules reject ordinary eval()/train() unless this shim

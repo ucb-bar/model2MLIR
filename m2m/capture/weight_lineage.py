@@ -54,7 +54,11 @@ def _attr(module: Any, name: str) -> Any:
 def _contractions(module: Any) -> dict[str, Any]:
     import torch
 
-    targets = {torch.ops.aten.conv2d.default, torch.ops.aten.linear.default}
+    targets = {
+        torch.ops.aten.conv2d.default,
+        torch.ops.aten.linear.default,
+        torch.ops.aten.matmul.default,
+    }
     return {
         node.name: node
         for node in module.graph.nodes
