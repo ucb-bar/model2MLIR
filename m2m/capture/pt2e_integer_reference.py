@@ -111,6 +111,18 @@ def run_pt2e_integer_reference(
         def run_node(self, node: Any) -> Any:
             if node.op != "call_function" or node.target not in ({conv2d, linear} | matmuls):
                 return super().run_node(node)
+            # Match the integerizer's selection boundary: ordinary floating-point
+            # contractions (including attention matmuls fed by reshapes/transposes)
+            # stay in Torch. If either direct operand is Q/DQ, still fail closed
+            # below unless both operands have supported integer qparams.
+            selected = any(
+                isinstance(arg, Node)
+                and arg.op == "call_function"
+                and arg.target in {dequant_tensor, dequant_channel}
+                for arg in node.args[:2]
+            )
+            if not selected:
+                return super().run_node(node)
 
             args, kwargs = self.fetch_args_kwargs_from_env(node)
             qx, sx, zx, activation_axis = self.qparams(node.args[0], activation=True)

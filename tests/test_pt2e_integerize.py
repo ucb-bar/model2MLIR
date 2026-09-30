@@ -121,6 +121,31 @@ def test_per_channel_reference_matches_integerized_conv_linear():
     assert torch.equal(independent.output, integerized(*inputs))
 
 
+def test_integer_reference_preserves_unselected_attention_matmul():
+    """Only Q/DQ-selected contractions use integer arithmetic; attention stays float."""
+    torch.manual_seed(7)
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.query = nn.Linear(8, 8, bias=False)
+            self.key = nn.Linear(8, 8, bias=False)
+
+        def forward(self, x):
+            return self.query(x) @ self.key(x).transpose(-2, -1)
+
+    inputs = (torch.randn(1, 4, 8),)
+    converted = _per_tensor_pt2e(Attention(), inputs)
+    independent = run_pt2e_integer_reference(converted, inputs, expected_contractions=2)
+    integerized, receipt = integerize_pt2e(converted, inputs)
+    assert receipt["linear_integerized"] == 2
+    assert receipt["matmul_seen"] == 1
+    assert receipt["matmul_integerized"] == 0
+    assert independent.linear_count == 2
+    assert independent.matmul_count == 0
+    assert torch.equal(independent.output, integerized(*inputs))
+
+
 def test_explicit_per_tensor_matmul_qdq_exact_integer_reference():
     """A static non-broadcast matmul is supported when both Q/DQ operands exist."""
     from torch.fx import Graph, GraphModule
