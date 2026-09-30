@@ -6,15 +6,16 @@ i32 and apply the two scales after the reduction.  Those expressions are algebra
 equivalent over the reals but not bit-identical after a long floating-point network.
 
 This executor keeps every non-contraction operation in Torch and replaces only a
-Conv2d/Linear whose two operands are the corresponding PT2E dequantize operations.  It
+Conv2d/Linear/matmul whose two operands are PT2E dequantize operations.  It
 therefore provides a framework-side integer reference without consuming compiler IR,
 target code, or target output.  Unsupported layouts fail closed rather than silently
 falling back while claiming integer coverage.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -22,10 +23,11 @@ class IntegerReferenceResult:
     output: Any
     conv2d_count: int
     linear_count: int
+    matmul_count: int = 0
 
     @property
     def contraction_count(self) -> int:
-        return self.conv2d_count + self.linear_count
+        return self.conv2d_count + self.linear_count + self.matmul_count
 
 
 def _pair(value: Any) -> tuple[int, int]:
@@ -56,6 +58,11 @@ def run_pt2e_integer_reference(
 
     conv2d = torch.ops.aten.conv2d.default
     linear = torch.ops.aten.linear.default
+    matmuls = {
+        torch.ops.aten.matmul.default,
+        torch.ops.aten.mm.default,
+        torch.ops.aten.bmm.default,
+    }
     dequant_tensor = torch.ops.quantized_decomposed.dequantize_per_tensor.default
     dequant_channel = torch.ops.quantized_decomposed.dequantize_per_channel.default
 
@@ -65,19 +72,34 @@ def run_pt2e_integer_reference(
             super().__init__(graph_module, garbage_collect_values=False)
             self.conv2d_count = 0
             self.linear_count = 0
+            self.matmul_count = 0
 
         def value(self, item: Any) -> Any:
             return self.env[item] if isinstance(item, Node) else item
 
-        def qparams(self, node: Any, expected_target: Any) -> tuple[Any, Any, Any]:
-            if not isinstance(node, Node) or node.target != expected_target:
+        def qparams(self, node: Any, *, activation: bool) -> tuple[Any, Any, Any, int | None]:
+            if not isinstance(node, Node) or node.target not in (
+                {dequant_tensor} if activation else {dequant_tensor, dequant_channel}
+            ):
                 raise ValueError(
-                    "integer PT2E contraction operand is not produced by the required "
-                    f"dequantize op: {node!r}"
+                    f"integer PT2E contraction operand has unsupported dequantize op: {node!r}"
                 )
-            if len(node.args) < 3:
-                raise ValueError(f"PT2E dequantize node has no qvalue/scale/zero-point: {node}")
-            return tuple(self.value(arg) for arg in node.args[:3])  # type: ignore[return-value]
+            channel = node.target == dequant_channel
+            if len(node.args) < (7 if channel else 6):
+                raise ValueError(f"PT2E dequantize node has incomplete qparams: {node}")
+            q, scale, zero = (self.value(arg) for arg in node.args[:3])
+            axis = int(node.args[3]) if channel else None
+            qmin, qmax, dtype = node.args[4:7] if channel else node.args[3:6]
+            if q.dtype != torch.int8 or dtype != torch.int8 or qmin < -128 or qmax > 127:
+                raise ValueError("integer reference requires signed int8 qvalues and range")
+            if not bool(torch.all(torch.as_tensor(0 if zero is None else zero) == 0)):
+                raise ValueError("integer reference requires symmetric zero point 0")
+            scales = torch.as_tensor(scale)
+            if channel and scales.dtype != torch.float32:
+                raise ValueError("integer reference requires frozen f32 per-channel scales")
+            if not bool(torch.isfinite(scales).all()) or not bool((scales > 0).all()):
+                raise ValueError("integer reference requires finite positive scales")
+            return q, scale, 0 if zero is None else zero, axis
 
         def centered(self, value: Any, zero_point: Any, *, channel_axis: bool) -> Any:
             q = value.to(torch.int32)
@@ -87,19 +109,40 @@ def run_pt2e_integer_reference(
             return q - zp
 
         def run_node(self, node: Any) -> Any:
-            if node.op != "call_function" or node.target not in (conv2d, linear):
+            if node.op != "call_function" or node.target not in ({conv2d, linear} | matmuls):
                 return super().run_node(node)
 
             args, kwargs = self.fetch_args_kwargs_from_env(node)
-            qx, sx, zx = self.qparams(node.args[0], dequant_tensor)
-            qw, sw, zw = self.qparams(node.args[1], dequant_channel)
-            # PT2E's portable W8A8 contract uses output-channel weight granularity.
-            weight_axis = int(node.args[1].args[3]) if len(node.args[1].args) > 3 else 0
-            if weight_axis != 0:
-                raise ValueError(f"integer reference requires weight channel axis 0, got {weight_axis}")
+            qx, sx, zx, activation_axis = self.qparams(node.args[0], activation=True)
+            qw, sw, zw, weight_axis = self.qparams(node.args[1], activation=False)
+            expected_weight_axis = qw.ndim - 1 if node.target in matmuls else 0
+            if activation_axis is not None or weight_axis not in (None, expected_weight_axis):
+                raise ValueError(
+                    f"unsupported integer qparam axes: activation={activation_axis}, "
+                    f"weight={weight_axis}, expected weight={expected_weight_axis}"
+                )
             xq = self.centered(qx, zx, channel_axis=False)
-            wq = self.centered(qw, zw, channel_axis=True)
-            bias = args[2] if len(args) > 2 else kwargs.get("bias")
+            if weight_axis is None:
+                wq = self.centered(qw, zw, channel_axis=False)
+            else:
+                wq = qw.to(torch.int32) - torch.as_tensor(
+                    zw, dtype=torch.int32, device=qw.device
+                ).reshape(tuple(-1 if i == weight_axis else 1 for i in range(qw.ndim)))
+            reduction = xq.shape[-1] if node.target != conv2d else qw.shape[1] * qw.shape[2] * qw.shape[3]
+            if reduction * 128 * 128 > (1 << 31) - 1:
+                raise ValueError(f"integer reference i32 accumulator may overflow for K={reduction}")
+            bias = (args[2] if len(args) > 2 else kwargs.get("bias")) if node.target not in matmuls else None
+
+            if node.target in matmuls:
+                if (xq.ndim != wq.ndim or xq.ndim < 2
+                        or xq.shape[:-2] != wq.shape[:-2] or xq.shape[-1] != wq.shape[-2]):
+                    raise ValueError("integer matmul requires non-broadcast matching batch dimensions")
+                acc = torch.matmul(xq, wq)
+                out = acc.to(torch.float32) * torch.as_tensor(sx, dtype=torch.float32, device=acc.device)
+                scales = torch.as_tensor(sw, dtype=torch.float32, device=acc.device)
+                out = out * scales
+                self.matmul_count += 1
+                return out
 
             if node.target == linear:
                 acc = torch.matmul(xq, wq.transpose(-1, -2))
@@ -135,8 +178,8 @@ def run_pt2e_integer_reference(
                 raise ValueError(f"unfold produced {positions} columns, expected {oh}x{ow}")
             out = acc.reshape(batch, wq.shape[0], oh, ow).to(torch.float32)
             out = out * torch.as_tensor(sx, dtype=torch.float32, device=acc.device)
-            out = out * torch.as_tensor(sw, dtype=torch.float32, device=acc.device).reshape(
-                1, -1, 1, 1)
+            scales = torch.as_tensor(sw, dtype=torch.float32, device=acc.device)
+            out = out * (scales.reshape(1, -1, 1, 1) if weight_axis is not None else scales)
             if bias is not None:
                 out = out + bias.reshape(1, -1, 1, 1)
             self.conv2d_count += 1
@@ -145,11 +188,12 @@ def run_pt2e_integer_reference(
     runner = _IntegerInterpreter(model)
     with torch.no_grad():
         output = runner.run(*tuple(inputs))
-    result = IntegerReferenceResult(output, runner.conv2d_count, runner.linear_count)
+    result = IntegerReferenceResult(
+        output, runner.conv2d_count, runner.linear_count, runner.matmul_count
+    )
     if expected_contractions is not None and result.contraction_count != expected_contractions:
         raise ValueError(
             f"integer reference executed {result.contraction_count} contractions, "
             f"expected {expected_contractions}"
         )
     return result
-
