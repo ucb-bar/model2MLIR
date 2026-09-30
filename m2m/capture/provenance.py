@@ -33,26 +33,19 @@ def _file_record(path: Path) -> dict:
 
 def _tool_identity() -> dict:
     root = Path(__file__).resolve().parents[2]
-    sources = (
-        "m2m/api.py",
-        "m2m/capture/bundle.py",
-        "m2m/capture/bundle_integrity.py",
-        "m2m/capture/provenance.py",
-        "m2m/capture/trace.py",
-        "m2m/capture/torch_mlir_bridge.py",
-        "m2m/capture/pt2e_integerize.py",
-        "m2m/capture/pt2e_integer_reference.py",
-        "m2m/capture/torch_export.py",
-        "m2m/capture/torchao_pipeline.py",
-        "m2m/capture/weight_lineage.py",
-        "m2m/ir/decompositions.py",
-        "m2m/ir/import_fx.py",
-        "m2m/ir/torchmlir_decomps.py",
-        "m2m/transforms/expand_ext.py",
-        "m2m/transforms/expand_quant.py",
-        "m2m/transforms/fuse_qdq.py",
-        "m2m/transforms/externalize.py",
-    )
+    package = root / "m2m"
+    if package.is_symlink() or not package.is_dir():
+        raise ValueError("M2M Python package source is absent or indirect")
+    sources = {}
+    for path in sorted(package.rglob("*.py")):
+        relative = path.relative_to(root)
+        if "__pycache__" in relative.parts:
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"M2M Python source is indirect: {relative}")
+        sources[relative.as_posix()] = _sha256_file(path)
+    if not sources:
+        raise ValueError("M2M Python package source is empty")
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=root, check=True,
@@ -60,8 +53,6 @@ def _tool_identity() -> dict:
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         commit = None
-    available = [name for name in sources if (root / name).is_file()]
-    unavailable = [name for name in sources if name not in available]
     # A source-tree workload CLI is an invocation, not part of the installed
     # m2m package. Record whichever actual entrypoint ran independently instead
     # of making every installed wheel appear to lack two unused CLI scripts.
@@ -73,9 +64,10 @@ def _tool_identity() -> dict:
             entrypoint = {"path": str(resolved), **_file_record(resolved)}
     return {
         "commit": commit,
-        "source_sha256": {name: _sha256_file(root / name) for name in available},
-        "source_inventory_status": "complete" if not unavailable else "partial",
-        "unavailable_sources": unavailable,
+        "source_sha256": sources,
+        "source_inventory_scope": "m2m_package_python_sources_only",
+        "source_inventory_status": "complete",
+        "unavailable_sources": [],
         "executed_entrypoint": entrypoint,
     }
 

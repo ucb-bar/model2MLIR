@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -35,9 +36,16 @@ def test_bundle_receipt_binds_source_tool_framework_and_materialized_abi(tmp_pat
     assert receipt["source"]["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
     assert receipt["tool"]["commit"]
     assert receipt["tool"]["source_sha256"]["m2m/ir/decompositions.py"]
+    assert receipt["tool"]["source_inventory_scope"] == "m2m_package_python_sources_only"
     assert receipt["tool"]["source_inventory_status"] == "complete"
     assert not receipt["tool"]["unavailable_sources"]
     assert all(name.startswith("m2m/") for name in receipt["tool"]["source_sha256"])
+    package_root = Path(__file__).resolve().parents[1]
+    assert receipt["tool"]["source_sha256"] == {
+        path.relative_to(package_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted((package_root / "m2m").rglob("*.py"))
+        if "__pycache__" not in path.parts
+    }
     assert receipt["framework"]["torch"] == torch.__version__
     assert receipt["lifted_constants"] == {}
     assert receipt["materialized_abi"] == {"complete": True, "inputs": 1, "lifted_constants": []}
