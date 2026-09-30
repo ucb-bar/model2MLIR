@@ -46,6 +46,14 @@ Data-dependent size guards are not silently discarded: supported
 and `cf.assert` in the MLIR, with exact prepared-call provenance. A later compiler
 must preserve or explicitly discharge `cf.assert`; a complete frontend trace
 alone does not prove its runtime implementation.
+Exported tensor-metadata assertions introduced by a quantizer can inherit a
+producer's source lineage only when every asserted size, stride, dtype, device,
+or layout field matches that producer's captured type. A mismatch leaves the
+original-to-quantized trace diagnostic.
+Re-exported single-use tensor constants keep the lineage of their captured
+placeholder and value-preserving copy. Tuple selectors reconstructed by export
+are related to their original calls only when the tuple producer, selected
+index, and result type match uniquely.
 
 When a grad-disabled nested graph is inlined, it is flattened before export
 decompositions so each inner call retains its own source identity. The trace

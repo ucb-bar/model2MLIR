@@ -2,6 +2,7 @@
 import hashlib
 import json
 
+import pytest
 import torch
 
 import m2m
@@ -32,6 +33,108 @@ def _check_trace(result):
         range(len(list(result.module.walk()))))
     assert all(op["role"] != "unresolved" for op in trace["mlir"]["operations"])
     return trace
+
+
+def test_introduced_metadata_guard_needs_a_proven_typed_producer():
+    import copy
+    from m2m.capture.trace import snapshot_exported_program
+
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return value.relu()
+
+    exported = torch.export.export(Model().eval(), (torch.randn(2, 4),))
+    source = snapshot_exported_program(exported, stage="original")
+    dest = snapshot_exported_program(exported, stage="quantized")
+    producer = next(node for node in dest["nodes"] if node["target"] == "aten.relu.default")
+    guard = {
+        "id": "g:quantized:root:guard", "graph_id": "g:quantized:root",
+        "op": "call_function", "target": "aten._assert_tensor_metadata.default",
+        "args": [{"node_id": producer["id"], "value_id": producer["results"][0]["id"]}],
+        "kwargs": {"dtype": {"kind": "dtype", "value": "torch.float32"},
+                   "device": {"kind": "device", "value": "cpu"}},
+        "results": [{"id": "g:quantized:root:guard:v0", "kind": "unknown",
+                     "shape": None, "dtype": None}],
+        "origin_node_ids": [],
+    }
+    dest["nodes"].append(guard)
+    relation = graph_relation(source, dest)
+    assert relation["status"] == "complete"
+    assert any(row["kind"] == "introduced_metadata_guard" and
+               row["destination_ids"] == [guard["id"]] and
+               row["source_ids"] == producer["origin_node_ids"]
+               for row in relation["relations"])
+
+    wrong_type = copy.deepcopy(dest)
+    wrong_type["nodes"][-1]["kwargs"]["dtype"]["value"] = "torch.float16"
+    assert guard["id"] in graph_relation(source, wrong_type)["unresolved_destination_ids"]
+    wrong_size = copy.deepcopy(dest)
+    wrong_size["nodes"][-1]["kwargs"]["size"] = [9, 4]
+    assert guard["id"] in graph_relation(source, wrong_size)["unresolved_destination_ids"]
+    wrong_value = copy.deepcopy(dest)
+    wrong_value["nodes"][-1]["args"][0]["value_id"] = "not-a-result"
+    assert guard["id"] in graph_relation(source, wrong_value)["unresolved_destination_ids"]
+    no_lineage = copy.deepcopy(dest)
+    next(node for node in no_lineage["nodes"] if node["id"] == producer["id"])["origin_node_ids"] = []
+    assert guard["id"] in graph_relation(source, no_lineage)["unresolved_destination_ids"]
+
+
+@pytest.mark.parametrize("decomposed_clone", [False, True])
+def test_lifted_tensor_constant_keeps_lineage_on_reexport(decomposed_clone):
+    from m2m.capture.trace import (prepare_lifted_constant_lineage,
+                                   snapshot_exported_program)
+
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return value + torch.tensor(1.0, dtype=torch.float32)
+
+    inputs = (torch.randn(2, 4),)
+    exported = torch.export.export(Model().eval(), inputs)
+    original = snapshot_exported_program(exported, stage="original")
+    graph_module = exported.module()
+    if decomposed_clone:
+        copied = next(node for node in graph_module.graph.nodes
+                      if node.target == torch.ops.aten.lift_fresh_copy.default)
+        copied.target = torch.ops.aten.clone.default
+        graph_module.recompile()
+    assert prepare_lifted_constant_lineage(graph_module) == 1
+    transformed = torch.export.export(graph_module, inputs)
+    quantized = snapshot_exported_program(transformed, stage="quantized")
+    relation = graph_relation(original, quantized)
+    assert relation["status"] == "complete", relation
+    copied = next(node for node in original["nodes"]
+                  if node["target"] == "aten.lift_fresh_copy.default")
+    assert any(copied["id"] in row["source_ids"] for row in relation["relations"])
+
+
+def test_reconstructed_tuple_selector_requires_exact_parent_index_and_type():
+    import copy
+    from m2m.capture.trace import snapshot_exported_program
+
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            left, right = value.split(4, dim=-1)
+            return left + right
+
+    exported = torch.export.export(Model().eval(), (torch.randn(2, 8),))
+    source = snapshot_exported_program(exported, stage="original")
+    dest = snapshot_exported_program(exported, stage="quantized")
+    parent = next(node for node in source["nodes"] if node["target"] == "aten.split.Tensor")
+    selectors = [node for node in dest["nodes"]
+                 if node["target"] == "<built-in function getitem>"]
+    assert len(selectors) == 2
+    for selector in selectors:
+        selector["origin_node_ids"] = [parent["id"]]
+    relation = graph_relation(source, dest)
+    assert relation["status"] == "complete", relation
+    assert sum(row["kind"] == "tuple_selection" for row in relation["relations"]) == 2
+
+    wrong_index = copy.deepcopy(dest)
+    next(node for node in wrong_index["nodes"] if node["id"] == selectors[0]["id"])["args"][1] = 1
+    assert graph_relation(source, wrong_index)["status"] == "diagnostic"
+    wrong_type = copy.deepcopy(dest)
+    next(node for node in wrong_type["nodes"] if node["id"] == selectors[0]["id"])["results"][0]["dtype"] = "float16"
+    assert graph_relation(source, wrong_type)["status"] == "diagnostic"
 
 
 def test_mixed_precision_source_sites_decomposition_and_final_serialization(tmp_path, monkeypatch):

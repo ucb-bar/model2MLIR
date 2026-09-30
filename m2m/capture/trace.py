@@ -285,6 +285,45 @@ def attach_original_identity(exported: Any, original: dict[str, Any], actual: di
     return True
 
 
+def prepare_lifted_constant_lineage(graph_module: Any) -> int:
+    """Keep both source IDs when re-export lifts a copied tensor constant.
+
+    Export may replace a single-use ``get_attr -> copy`` pair with
+    one placeholder; decomposition can turn ``lift_fresh_copy`` into ``clone``.
+    Its placeholder naming pass requires identical custom
+    metadata on both nodes. The merged lineage records that exact value path;
+    other constant uses and non-lineage custom metadata are left alone.
+    """
+    import torch
+
+    count = 0
+    for _, module in _graph_modules(graph_module):
+        for constant in module.graph.nodes:
+            if constant.op != "get_attr" or len(constant.users) != 1:
+                continue
+            copy = next(iter(constant.users))
+            if (copy.target not in {torch.ops.aten.lift_fresh_copy.default,
+                                    torch.ops.aten.clone.default}
+                    or copy.args != (constant,) or copy.kwargs):
+                continue
+            left = dict(constant.meta.get("custom") or {})
+            right = dict(copy.meta.get("custom") or {})
+            if not left.get("m2m_lineage") or not right.get("m2m_lineage"):
+                continue
+            other_left = {k: v for k, v in left.items()
+                          if k not in {"m2m_node_id", "m2m_lineage"}}
+            other_right = {k: v for k, v in right.items()
+                           if k not in {"m2m_node_id", "m2m_lineage"}}
+            if other_left != other_right:
+                raise ValueError("lifted constant has conflicting custom metadata")
+            merged = {**other_left, "m2m_lineage": list(dict.fromkeys(
+                [*left["m2m_lineage"], *right["m2m_lineage"]]))}
+            constant.meta["custom"] = dict(merged)
+            copy.meta["custom"] = dict(merged)
+            count += 1
+    return count
+
+
 def attach_quantization_boundaries(quantized: Any, contraction_targets: Any) -> int:
     """Attribute inserted Q/DQ input chains to their exact annotated consumers.
 
@@ -573,6 +612,84 @@ def _unused_tuple_selection(source: dict[str, Any], node: dict[str, Any]) -> dic
             "proof": {"tuple_node_id": producer["id"], "result_index": index}}
 
 
+def _tuple_selector_relations(source: dict[str, Any], dest: dict[str, Any],
+                              relations: list[dict[str, Any]], consumed: set[str]) -> list[dict[str, Any]]:
+    """Recover a selector whose exporter lineage was copied from its tuple parent.
+
+    Require an exact typed tuple value, a uniquely mapped producer, and one
+    selector at the same index carrying that producer's lineage. This covers
+    split/min tuple selectors reconstructed by export without matching names.
+    """
+    target = "<built-in function getitem>"
+    source_nodes = {node["id"]: node for node in source["nodes"]}
+    dest_nodes = {node["id"]: node for node in dest["nodes"]}
+    mapped: dict[str, set[str]] = {}
+    for relation in relations:
+        for identity in relation["source_ids"]:
+            mapped.setdefault(identity, set()).update(relation["destination_ids"])
+
+    def spec(value):
+        return {key: field for key, field in value.items() if key != "id"}
+
+    source_keys = Counter()
+    for node in source["nodes"]:
+        args = node.get("args") or []
+        if (node.get("target") == target and len(args) == 2
+                and isinstance(args[0], dict) and type(args[1]) is int):
+            source_keys[(args[0].get("node_id"), args[1])] += 1
+    dest_selectors: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for node in dest["nodes"]:
+        args = node.get("args") or []
+        if (node.get("target") == target and len(args) == 2
+                and isinstance(args[0], dict) and type(args[1]) is int):
+            dest_selectors.setdefault((args[0].get("node_id"), args[1]), []).append(node)
+
+    result = []
+    for selector in source["nodes"]:
+        if selector["id"] in consumed or selector.get("target") != target:
+            continue
+        args = selector.get("args") or []
+        if (len(args) != 2 or not isinstance(args[0], dict) or type(args[1]) is not int
+                or selector.get("kwargs")):
+            continue
+        parent_id, index = args[0].get("node_id"), args[1]
+        parent = source_nodes.get(parent_id)
+        values = parent.get("results") or [] if parent else []
+        if (len(values) < 2 or not -len(values) <= index < len(values)
+                or selector.get("graph_id") != parent.get("graph_id")
+                or source_keys[(parent_id, index)] != 1
+                or args[0].get("value_id") != values[index].get("id")
+                or len(selector.get("results") or []) != 1
+                or spec(selector["results"][0]) != spec(values[index])):
+            continue
+        candidates = []
+        for dest_id in mapped.get(parent_id, ()):
+            candidate_parent = dest_nodes.get(dest_id)
+            dest_values = candidate_parent.get("results") or [] if candidate_parent else []
+            if (candidate_parent is None or candidate_parent.get("target") != parent.get("target")
+                    or candidate_parent.get("graph_id", "").split(":", 2)[-1]
+                    != parent.get("graph_id", "").split(":", 2)[-1]
+                    or len(dest_values) != len(values)
+                    or [spec(value) for value in dest_values] != [spec(value) for value in values]):
+                continue
+            for candidate in dest_selectors.get((dest_id, index), ()):
+                ref = candidate["args"][0]
+                if (parent_id in (candidate.get("origin_node_ids") or ())
+                        and candidate.get("graph_id") == candidate_parent.get("graph_id")
+                        and ref.get("value_id") == dest_values[index].get("id")
+                        and len(candidate.get("results") or []) == 1
+                        and spec(candidate["results"][0]) == spec(selector["results"][0])):
+                    candidates.append(candidate)
+        if len(candidates) == 1:
+            result.append({"source_ids": [selector["id"]],
+                           "destination_ids": [candidates[0]["id"]],
+                           "kind": "tuple_selection",
+                           "proof": {"source_tuple_node_id": parent_id,
+                                     "destination_tuple_node_id": candidates[0]["args"][0]["node_id"],
+                                     "result_index": index, "exact_typed_value": True}})
+    return result
+
+
 _ANCHORED_TARGETS = {
     "aten.sym_size.int", "aten.sym_constrain_range_for_size.default",
     "<built-in function ge>", "<built-in function le>", "aten._assert_scalar.default",
@@ -843,6 +960,62 @@ def _anchored_guard_relations(source: dict[str, Any], dest: dict[str, Any],
     return inferred
 
 
+def _introduced_metadata_guard_relations(dest: dict[str, Any],
+                                         relations: list[dict[str, Any]],
+                                         unknown: list[str]) -> list[dict[str, Any]]:
+    """Account for export guards on values with proven source lineage."""
+    nodes = {node["id"]: node for node in dest["nodes"]}
+    origins: dict[str, set[str]] = {}
+    for relation in relations:
+        for target in relation["destination_ids"]:
+            origins.setdefault(target, set()).update(relation["source_ids"])
+    fields = ("a", "size", "stride", "dtype", "device", "layout")
+    introduced = []
+    for identity in unknown:
+        guard = nodes.get(identity)
+        if not guard or guard["op"] != "call_function" or guard["target"] != "aten._assert_tensor_metadata.default":
+            continue
+        results = guard.get("results") or []
+        if results and not (len(results) == 1 and results[0].get("kind") == "unknown"
+                            and results[0].get("shape") is None and results[0].get("dtype") is None):
+            continue
+        args, kwargs = guard.get("args"), guard.get("kwargs") or {}
+        if (not isinstance(args, list) or not 1 <= len(args) <= len(fields)
+                or not isinstance(kwargs, dict) or set(kwargs) - set(fields)
+                or any(field in kwargs for field in fields[:len(args)])):
+            continue
+        values = {field: args[index] if index < len(args) else kwargs.get(field)
+                  for index, field in enumerate(fields)}
+        ref = values.pop("a")
+        if not isinstance(ref, dict) or set(ref) != {"node_id", "value_id"}:
+            continue
+        producer = nodes.get(ref["node_id"])
+        source_ids = sorted(origins.get(ref["node_id"], ()))
+        if producer is None or not source_ids:
+            continue
+        typed = [row for row in producer.get("results") or [] if row.get("id") == ref["value_id"]]
+        if len(typed) != 1 or typed[0].get("kind") != "tensor":
+            continue
+        result = typed[0]
+        expected = {
+            "size": result.get("shape"), "stride": result.get("stride"),
+            "dtype": {"kind": "dtype", "value": f"torch.{result['dtype']}"},
+            "device": {"kind": "device", "value": result.get("device")},
+            "layout": {"kind": "layout", "value": result.get("layout")},
+        }
+        asserted = {field: value for field, value in values.items() if value is not None}
+        if not asserted or any(expected[field] is None or value != expected[field]
+                               for field, value in asserted.items()):
+            continue
+        introduced.append({
+            "source_ids": source_ids, "destination_ids": [identity],
+            "kind": "introduced_metadata_guard",
+            "proof": {"producer_value_id": ref["value_id"],
+                      "asserted_fields": sorted(asserted), "exact_typed_value": True},
+        })
+    return introduced
+
+
 def _unchanged_nested_graph_relations(source: dict[str, Any], dest: dict[str, Any],
                                       relations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Recover a nested graph's identity only when its body and caller are exact.
@@ -1070,6 +1243,13 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
         consumed.update(identity for relation in new for identity in relation["source_ids"])
         unknown = [identity for identity in unknown if identity not in {
             target for relation in new for target in relation["destination_ids"]}]
+    introduced_guards = _introduced_metadata_guard_relations(dest, relations, unknown)
+    relations.extend(introduced_guards)
+    unknown = [identity for identity in unknown if identity not in {
+        target for relation in introduced_guards for target in relation["destination_ids"]}]
+    selectors = _tuple_selector_relations(source, dest, relations, consumed)
+    relations.extend(selectors)
+    consumed.update(identity for relation in selectors for identity in relation["source_ids"])
     dead = _dead_forward_value_relations(source, consumed)
     relations.extend(dead)
     consumed.update(origin for relation in dead for origin in relation["source_ids"])
