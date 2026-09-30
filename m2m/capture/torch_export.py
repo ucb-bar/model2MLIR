@@ -278,7 +278,11 @@ def capture_frontend_artifact(
     active_model = model
     if quantization_config is not None:
         try:
-            active_model = apply_quantization(model, quantization_config)
+            active_model = apply_quantization(
+                model,
+                quantization_config,
+                example_inputs=tuple(sample_inputs),
+            )
         except Exception:
             active_model = model
 

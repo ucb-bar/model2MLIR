@@ -21,6 +21,12 @@ The bundle records SHA-256 digests for both the input file and a canonical seria
 state dict. The source label must identify the exact corpus split/sample list; the preprocessing string is
 not inferred from the input values.
 
+For a benchmark with a fixed measured sample, provide an independent calibration
+corpus with `M2M_RESNET_CALIBRATION_NPZ`. Its arrays use the same shapes as the
+measured stream. `M2M_RESNET_CALIBRATION_SOURCE` is recorded in provenance, and
+the loader exposes the corpus through `get_calibration_inputs()` so capture does
+not calibrate on the benchmark sample by accident.
+
 For compiler-only bring-up, set `M2M_RESNET_RANDOM=1`; optionally set
 `M2M_RESNET_PRETRAINED=0` to avoid loading weights.  Either choice marks `paper_ready: false` and the
 paper freeze must reject it.

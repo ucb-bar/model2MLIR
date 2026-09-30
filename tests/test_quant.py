@@ -77,6 +77,77 @@ def test_true_int_matmul_present():
     assert "i32" in r.mlir_text  # int32 accumulation
 
 
+def test_static_w8a8_pt2e_quantizes_conv_and_uses_calibration():
+    """Static W8A8 is graph quantization, not a Linear-only quantize_ label."""
+    from m2m.capture.torchao_pipeline import apply_quantization
+
+    class ConvNet(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = nn.Conv2d(3, 8, 3)
+            self.fc = nn.Linear(8, 4)
+
+        def forward(self, x):
+            return self.fc(torch.relu(self.conv(x)).mean((2, 3)))
+
+    x = (torch.randn(1, 3, 16, 16),)
+    cfg = QuantizationConfig(
+        scheme="int8_static_act_int8_weight", calibration_samples=2
+    )
+    quantized = apply_quantization(
+        ConvNet().eval(), cfg, example_inputs=x, calibration_inputs=[x, x, x]
+    )
+    stats = quantized._m2m_quantization_stats
+    assert stats["annotated_contractions"] == 2
+    assert stats["calibration_samples"] == 2
+    assert stats["pruned_dead_state_tensors"] == 2
+    frozen = [v for k, v in quantized.state_dict().items() if k.startswith("_frozen_param")]
+    assert len(frozen) == 2 and all(v.dtype is torch.int8 for v in frozen)
+    assert not any(k.endswith(".weight") for k in quantized.state_dict())
+
+    r = m2m.convert(
+        quantized,
+        x,
+        backend="fx_importer",
+        decompose=False,
+        quantization=cfg,
+        quantization_preapplied=True,
+    )
+    assert r.ok
+    assert "0 opaque" in " ".join(r.diagnostics)
+    assert r.mlir_text.count("quant_ext.dequantize_per_channel") == 2
+    assert r.mlir_text.count("quant_ext.quantize_per_tensor") == 2
+    assert "tensor<8x3x3x3xi8>" in r.mlir_text
+
+
+def test_pt2e_integer_reference_executes_conv_and_linear():
+    """The integer oracle uses frozen PT2E qparams and accounts for every contraction."""
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+    from m2m.capture.torchao_pipeline import apply_quantization
+
+    class ConvNet(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = nn.Conv2d(4, 4, 3, padding=1, groups=2)
+            self.fc = nn.Linear(4, 3)
+
+        def forward(self, x):
+            return self.fc(torch.relu(self.conv(x)).mean((2, 3)))
+
+    inputs = (torch.randn(1, 4, 8, 8),)
+    quantized = apply_quantization(
+        ConvNet().eval(),
+        QuantizationConfig(scheme="int8_static_act_int8_weight", calibration_samples=1),
+        example_inputs=inputs,
+        calibration_inputs=[inputs],
+    )
+    result = run_pt2e_integer_reference(quantized, inputs, expected_contractions=2)
+    assert result.conv2d_count == 1
+    assert result.linear_count == 1
+    assert result.output.shape == (1, 3)
+    assert torch.isfinite(result.output).all()
+
+
 def test_fp8_type_renders_native_spelling():
     """The shim fp8 type prints with the MLIR-native spelling (f8E4M3FN) on text emission,
     so an artifact carrying f8 storage parses in a standard MLIR toolchain."""

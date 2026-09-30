@@ -812,6 +812,16 @@ class FXImporter:
                 # quant_max, etc.) that don't show up as SSA operands.
                 meta["_fx_args"] = tuple(node.args)
                 meta["_fx_kwargs"] = dict(node.kwargs)
+                # Preserve the positional relationship between raw FX arguments
+                # and the SSA values we resolved above.  Quantized-decomposed
+                # activation Q/DQ uses literal scale/zero-point arguments while
+                # weight Q/DQ commonly uses get_attr nodes; a flattened operand
+                # list alone cannot distinguish those two cases.
+                meta["_fx_ssa_args"] = {
+                    i: value_map[arg.name]
+                    for i, arg in enumerate(node.args)
+                    if hasattr(arg, "name") and arg.name in value_map
+                }
                 meta["_aten_target"] = target_str  # provenance: source aten op
                 meta["_emit_named_ops"] = self.emit_named_ops  # high-level form toggle
                 meta["_quant_inner"] = _quant_inner_key.get(node.name)  # subclass attr path

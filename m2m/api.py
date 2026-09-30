@@ -60,6 +60,7 @@ def convert(
     fully_standard: bool = False,
     weights_path: str | None = None,
     quantization_preapplied: bool = False,
+    calibration_inputs: Any | None = None,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -113,7 +114,12 @@ def convert(
             torch.__future__.set_swap_module_params_on_conversion(False)
         except Exception:  # noqa: BLE001
             pass
-        model = apply_quantization(model, quantization)
+        model = apply_quantization(
+            model,
+            quantization,
+            example_inputs=tuple(example_inputs),
+            calibration_inputs=calibration_inputs,
+        )
 
     # Decompose-first: capture an ExportedProgram and run decompositions so
     # composite ops torch-mlir can't legalize (e.g. aten.diff) are lowered
@@ -276,7 +282,7 @@ def coverage_report(
     from m2m.capture.torch_export import capture_frontend_artifact
 
     if quantization is not None:
-        model = apply_quantization(model, quantization)
+        model = apply_quantization(model, quantization, example_inputs=tuple(example_inputs))
 
     artifact = capture_frontend_artifact(model, example_inputs, quantization_config=quantization)
     return {
