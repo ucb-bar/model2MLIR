@@ -22,6 +22,25 @@ class _NewOnes(torch.nn.Module):
         return torch.ops.aten.new_ones.default(x, [2, 3])
 
 
+class _LogicalAnd(torch.nn.Module):
+    def forward(self, left, right):
+        return torch.logical_and(left, right)
+
+
+def test_boolean_logical_and_lowers_without_opaque_call():
+    left = torch.tensor([[True, False, True], [False, True, True]])
+    right = torch.tensor([True, True, False])
+    exported = torch.export.export(_LogicalAnd(), (left, right))
+    assert any(str(node.target) == "aten.logical_and.default"
+               for node in exported.graph.nodes if node.op == "call_function")
+    result = m2m.convert(_LogicalAnd(), (left, right), backend="fx_importer",
+                         level="linalg-on-tensors", decompose=False)
+    assert result.ok, result.diagnostics
+    assert not opaque_report(result.mlir_text), opaque_report(result.mlir_text)
+    assert "arith.andi" in result.mlir_text
+    result.module.verify()
+
+
 class _IdentityAsStrided(torch.nn.Module):
     def forward(self, x):
         # Singleton strides are irrelevant to element mapping.  A ResNet

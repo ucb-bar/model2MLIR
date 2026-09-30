@@ -6137,6 +6137,27 @@ def decompose_logical_not(operands, meta, node_name):
     return _opaque_decomp("aten_logical_not", operands[:1], meta, "logical", pattern_hint="logical_not")
 
 
+def decompose_logical_and(operands, meta, node_name):
+    """aten.logical_and.default on boolean tensors, including broadcast axes."""
+    from xdsl.dialects.arith import AndIOp
+    from xdsl.dialects.builtin import IntegerType
+
+    i1 = IntegerType(1)
+    selected = operands[:2]
+    if len(selected) != 2 or any(
+        not isinstance(value.type, TensorType) or value.type.element_type != i1
+        for value in selected
+    ):
+        return _opaque_decomp("aten_logical_and", selected, meta, "logical",
+                              pattern_hint="logical_and")
+
+    real = _pointwise(selected, meta, _bin_build(AndIOp), family="logical", out_elem=i1)
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_logical_and", selected, meta, "logical",
+                          pattern_hint="logical_and")
+
+
 def decompose_bitwise_not(operands, meta, node_name):
     """aten.bitwise_not.default(x) -> x XOR all-ones (family bitwise). For i1 this is
     boolean NOT; for wider integers it flips every bit (~x)."""
@@ -6371,6 +6392,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.arange.start_step": decompose_arange,
     "aten.arange.default": decompose_arange,
     "aten.logical_not.default": decompose_logical_not,
+    "aten.logical_and.default": decompose_logical_and,
     "aten.bitwise_and.Tensor": decompose_bitwise_and,
     "aten.bitwise_not.default": decompose_bitwise_not,
     "aten.repeat.default": decompose_repeat,
