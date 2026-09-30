@@ -31,6 +31,8 @@ _LAZY: dict[str, str] = {
     "ConversionResult": "m2m.api",
     "convert": "m2m.api",
     "coverage_report": "m2m.api",
+    "capture_frontend_snapshot": "m2m.capture.trace",
+    "materialize_frontend_precision": "m2m.capture.trace",
     "torch_mlir_available": "m2m.capture.torch_mlir_bridge",
     "expand_to_linalg": "m2m.transforms",
     "to_standard": "m2m.transforms",
@@ -41,6 +43,8 @@ __all__ = [
     "__version__",
     "convert",
     "coverage_report",
+    "capture_frontend_snapshot",
+    "materialize_frontend_precision",
     "expand_to_linalg",
     "to_standard",
     "torch_mlir_available",
@@ -63,4 +67,5 @@ def __dir__() -> list[str]:
 if TYPE_CHECKING:  # static analysers / IDEs still see the real symbols
     from m2m.api import ConversionResult, convert, coverage_report
     from m2m.capture.torch_mlir_bridge import torch_mlir_available
+    from m2m.capture.trace import capture_frontend_snapshot
     from m2m.transforms import expand_to_linalg, to_standard

@@ -14,6 +14,7 @@ Invariants:
 from __future__ import annotations
 
 import io
+import operator
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -200,6 +201,12 @@ def _forward_fx_meta(
         op.attributes["prov.family"] = StringAttr(fam)  # authoritative coarse family
 
     if isinstance(fx_meta, dict):
+        from m2m.capture.trace import stamp_mlir_sources
+
+        custom = fx_meta.get("custom") or {}
+        stamp_mlir_sources(op, fx_meta.get("_m2m_node_id") or custom.get("m2m_node_id"),
+                           fx_meta["_m2m_origin_ids"] if "_m2m_origin_ids" in fx_meta
+                           else custom.get("m2m_lineage", ()))
         if fx_meta.get("_compgen_transpose_absorbed") and "prov.transpose_absorbed" not in op.attributes:
             op.attributes["prov.transpose_absorbed"] = StringAttr("true")
         if fx_meta.get("_compgen_fuse_dequant") and "prov.fuse_dequant" not in op.attributes:
@@ -392,6 +399,7 @@ class FXImporter:
     explicit_blackboxes: set[str] = field(default_factory=set)
     dynamic_decompositions: dict[str, DecompFn] = field(default_factory=dict)
     emit_named_ops: bool = False  # high-level form: emit linalg_ext.* composites
+    trace_dispositions: dict[str, Any] = field(default_factory=dict)
 
     @property
     def decomposition_coverage(self) -> float:
@@ -651,6 +659,7 @@ class FXImporter:
             op.attributes["prov.op"] = StringAttr("const")
             op.attributes["prov.family"] = StringAttr("fill")
             op.attributes["prov.get_attr"] = StringAttr(str(node.target))
+            _forward_fx_meta(op, node.meta)
             block.add_op(op)
             value_map[node.name] = op.results[0]
 
@@ -696,11 +705,126 @@ class FXImporter:
         # Process call_function nodes
         for node in call_nodes:
             target_str = _canonicalize_fx_target_str(str(node.target))
+            # Exported data-dependent dimensions carry runtime constraints. Do
+            # not silently drop the SymInt chain merely because it has no
+            # TensorType result: its assertions restrict valid model inputs.
+            if node.target == torch.ops.aten.sym_size.int and len(node.args) == 2:
+                from xdsl.dialects import arith, tensor
+                from xdsl.dialects.builtin import IndexType
+
+                inp, dim = node.args
+                imported = value_map.get(getattr(inp, "name", ""))
+                if (type(dim) is int and imported is not None
+                        and isinstance(imported.type, TensorType)
+                        and 0 <= dim < len(imported.type.get_shape())):
+                    axis = arith.ConstantOp.from_int_and_width(dim, IndexType())
+                    extent = tensor.DimOp(imported, axis.result)
+                    for op in (axis, extent):
+                        _forward_fx_meta(op, node.meta, "shape_extent")
+                        block.add_op(op)
+                    value_map[node.name] = extent.result
+                    self.decomposed_count += 1
+                    continue
+            if node.target == torch.ops.aten.sym_constrain_range_for_size.default and len(node.args) == 1:
+                from xdsl.dialects import arith, cf
+                from xdsl.dialects.builtin import IndexType
+
+                extent = value_map.get(getattr(node.args[0], "name", ""))
+                lower = node.kwargs.get("min")
+                upper = node.kwargs.get("max")
+                if (extent is not None and isinstance(extent.type, IndexType)
+                        and (lower is None or type(lower) is int)
+                        and (upper is None or type(upper) is int)):
+                    for bound, predicate in ((0 if lower is None else lower, "sge"), (upper, "sle")):
+                        if bound is None:
+                            continue
+                        constant = arith.ConstantOp.from_int_and_width(bound, IndexType())
+                        compare = arith.CmpiOp(extent, constant.result, predicate)
+                        assertion = cf.AssertOp(compare.result, f"size constraint {predicate} {bound}")
+                        for op in (constant, compare, assertion):
+                            _forward_fx_meta(op, node.meta, "shape_guard")
+                            block.add_op(op)
+                    self.decomposed_count += 1
+                    continue
+            if node.target in (operator.ge, operator.le) and len(node.args) == 2:
+                from xdsl.dialects import arith
+                from xdsl.dialects.builtin import IndexType
+
+                lhs = value_map.get(getattr(node.args[0], "name", ""))
+                rhs = node.args[1]
+                if lhs is not None and isinstance(lhs.type, IndexType) and type(rhs) is int:
+                    constant = arith.ConstantOp.from_int_and_width(rhs, IndexType())
+                    compare = arith.CmpiOp(lhs, constant.result, "sge" if node.target is operator.ge else "sle")
+                    for op in (constant, compare):
+                        _forward_fx_meta(op, node.meta, "shape_guard")
+                        block.add_op(op)
+                    value_map[node.name] = compare.result
+                    self.decomposed_count += 1
+                    continue
+            if node.target == torch.ops.aten._assert_scalar.default and len(node.args) == 2:
+                from xdsl.dialects import cf
+                from xdsl.dialects.builtin import IntegerType
+
+                condition = value_map.get(getattr(node.args[0], "name", ""))
+                message = node.args[1]
+                if (condition is not None and isinstance(condition.type, IntegerType)
+                        and condition.type.width.data == 1 and isinstance(message, str)):
+                    assertion = cf.AssertOp(condition, message)
+                    _forward_fx_meta(assertion, node.meta, "shape_guard")
+                    block.add_op(assertion)
+                    self.decomposed_count += 1
+                    continue
+            if node.target == torch.ops.aten._assert_tensor_metadata.default:
+                # Export inserts metadata guards around explicit dtype casts.
+                # Erase only assertions proved by the actual imported static SSA
+                # type and the CPU/strided capture specialization. This is not a
+                # runtime device/layout qualification; preserve those assumptions
+                # in the receipt. Other device/stride/layout guards remain unknown.
+                args = list(node.args)
+                expected = [args[i] if i < len(args) else node.kwargs.get(key)
+                            for i, key in enumerate(("a", "size", "stride", "dtype", "device", "layout"))]
+                inp, size, stride, dtype, device, layout = expected
+                imported = value_map.get(getattr(inp, "name", ""))
+                known_type = imported.type if imported is not None else None
+                static_size = size is None or (isinstance(size, (list, tuple))
+                                               and all(isinstance(s, int) for s in size))
+                captured = getattr(inp, "meta", {}).get("val")
+                known_device = device is None or (
+                    str(device) == "cpu" and str(getattr(captured, "device", None)) == "cpu")
+                known_layout = layout is None or (
+                    layout == torch.strided and getattr(captured, "layout", None) == torch.strided)
+                proven = (isinstance(known_type, TensorType) and static_size
+                          and stride is None and known_device and known_layout
+                          and (size is None or list(known_type.get_shape()) == list(size))
+                          and (dtype is None or known_type.element_type == _torch_dtype_to_xdsl(dtype)))
+                if proven:
+                    source_id = node.meta.get("_m2m_node_id")
+                    if source_id:
+                        self.trace_dispositions[source_id] = {
+                            "status": "eliminated", "reason": "verified static tensor metadata assertion",
+                            "asserted_dtype": str(dtype).removeprefix("torch.") if dtype is not None else None,
+                            "asserted_shape": list(size) if size is not None else None,
+                            "asserted_device": str(device) if device is not None else None,
+                            "asserted_layout": str(layout) if layout is not None else None,
+                            "qualification": "capture_specialization_not_runtime_device_proof",
+                            "evidence": {"input_node_id": inp.meta.get("_m2m_node_id"),
+                                         "imported_tensor_type": str(known_type),
+                                         "captured_device": str(getattr(captured, "device", None)),
+                                         "captured_layout": str(getattr(captured, "layout", None)),
+                                         "assertion_schema": str(node.target._schema),
+                                         "static_compare_passed": True},
+                            "input_node_id": inp.meta.get("_m2m_node_id"),
+                        }
+                    continue
             # P21: lower a torch.while_loop HOP to scf.for (loop-preserving capture). Additive — only
             # fires for while_loop nodes; on any failure falls through (no loop emitted) without affecting
             # the existing per-node path below.
             if "while_loop" in target_str:
+                preceding = set(block.ops)
                 if self._lower_while_loop(node, value_map, multi_results, block, exported_program):
+                    for emitted in block.ops:
+                        if emitted not in preceding:
+                            _forward_fx_meta(emitted, node.meta)
                     continue
             result_type = node_types.get(node.name)
             if result_type is None:
@@ -738,6 +862,12 @@ class FXImporter:
                 idx = node.args[1]
                 if isinstance(idx, int) and 0 <= idx < len(outs):
                     value_map[node.name] = outs[idx]
+                    source_id = node.meta.get("_m2m_node_id")
+                    if source_id:
+                        self.trace_dispositions[source_id] = {
+                            "status": "alias", "alias_of_node_id": node.args[0].meta.get("_m2m_node_id"),
+                            "result_index": idx,
+                        }
                     continue
 
             if (
@@ -749,6 +879,12 @@ class FXImporter:
                 idx = node.args[1]
                 if idx == 0:
                     value_map[node.name] = value_map[node.args[0].name]
+                    source_id = node.meta.get("_m2m_node_id")
+                    if source_id:
+                        self.trace_dispositions[source_id] = {
+                            "status": "alias", "alias_of_node_id": node.args[0].meta.get("_m2m_node_id"),
+                            "result_index": idx,
+                        }
                     self.diagnostics.append(
                         ImportDiagnostic(
                             fx_node=node.name,
@@ -864,6 +1000,17 @@ class FXImporter:
 
                         if result.result is not None:
                             value_map[node.name] = result.result
+                            if not result.ops:
+                                source_id = node.meta.get("_m2m_node_id")
+                                aliased = next((arg for arg in node.all_input_nodes
+                                                if value_map.get(arg.name) is result.result), None)
+                                if source_id and aliased is not None:
+                                    self.trace_dispositions[source_id] = {
+                                        "status": "alias",
+                                        "alias_of_node_id": aliased.meta.get("_m2m_node_id"),
+                                        "result_index": 0,
+                                        "reason": "identity decomposition",
+                                    }
                         if result.results:
                             multi_results[node.name] = list(result.results)
 
@@ -914,6 +1061,7 @@ class FXImporter:
 
             func_name = declared_sigs[sig_key]
             call_op = CallOp(func_name, operands, [result_type])
+            _forward_fx_meta(call_op, node.meta)
             block.add_op(call_op)
             value_map[node.name] = call_op.res[0]
 
@@ -1042,6 +1190,10 @@ def _zero_fill_contraction_accumulators(module: ModuleOp) -> None:
         fill = FillOp(inputs=[zero.result], outputs=[empty.results[0]], res=[res_t])
         fill.attributes["prov.op"] = StringAttr("fill")
         fill.attributes["prov.family"] = StringAttr("fill")
+        from m2m.capture.trace import copy_mlir_sources
+
+        copy_mlir_sources(zero, op)
+        copy_mlir_sources(fill, op)
         # Inherit the contraction's source-module tag so the inserted init ops section with
         # their matmul (split_by_section buckets prov.module-less, operand-less ops as 'shared').
         mod = op.attributes.get("prov.module")

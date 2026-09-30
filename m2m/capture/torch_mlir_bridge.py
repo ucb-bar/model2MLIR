@@ -66,6 +66,7 @@ class BridgeResult:
     output_type: str = ""
     mlir_text: str = ""
     diagnostics: list[str] = field(default_factory=list)
+    trace_dispositions: dict[str, Any] = field(default_factory=dict)
 
 
 def _try_torch_mlir_import() -> Any:
@@ -145,6 +146,7 @@ def bridge_fx_graph(
     use_torch_mlir: bool = True,
     emit_named_ops: bool = False,
     weights_path: str | None = None,
+    capture_trace: bool = False,
 ) -> BridgeResult:
     """Convert ``model`` + ``example_inputs`` into an xDSL ModuleOp.
 
@@ -171,6 +173,9 @@ def bridge_fx_graph(
             the torch-mlir path instead of falling back wholesale.
     """
     result = BridgeResult(output_type=output_type)
+    if capture_trace and exported_program is None:
+        result.diagnostics.append("capture_trace requires the exact already-captured program")
+        return result
 
     fx_module = _try_torch_mlir_import() if use_torch_mlir else None
     if not use_torch_mlir:
@@ -247,6 +252,7 @@ def bridge_fx_graph(
             pass
         importer = FXImporter(emit_named_ops=emit_named_ops)
         module = importer.import_graph(exported)
+        result.trace_dispositions = dict(importer.trace_dispositions)
         errors = [d for d in importer.diagnostics if d.level == "error"]
         if errors:
             result.diagnostics.append(
@@ -305,11 +311,13 @@ _NATIVE_F8 = {
 }
 
 
-def module_to_text(module: ModuleOp) -> str:
+def module_to_text(module: ModuleOp, *, generic: bool = False) -> str:
     """Pretty-print an xDSL ModuleOp as MLIR text, rendering shim fp8 types with their
     MLIR-native spelling (``f8E4M3FN`` etc.) for portability."""
     buf = io.StringIO()
-    Printer(stream=buf).print(module)
+    # Custom printers for e.g. tensor.empty historically discard attributes.
+    # Traced artifacts must retain exact source IDs across serialization.
+    Printer(stream=buf, print_generic_format=generic).print(module)
     text = buf.getvalue()
     for shim, native in _NATIVE_F8.items():
         if shim in text:

@@ -38,6 +38,8 @@ class ConversionResult:
     output_type: str = "linalg-on-tensors"
     frontend: str = "torch"
     diagnostics: list[str] = field(default_factory=list)
+    capture_trace: dict[str, Any] | None = None
+    exported_program: Any | None = field(default=None, repr=False)
 
     @property
     def ok(self) -> bool:
@@ -61,6 +63,8 @@ def convert(
     weights_path: str | None = None,
     quantization_preapplied: bool = False,
     calibration_inputs: Any | None = None,
+    capture_trace: bool = False,
+    original_frontend_snapshot: dict[str, Any] | None = None,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -78,7 +82,16 @@ def convert(
             only, no fallback), or "fx_importer" (skip torch-mlir entirely). Use
             "fx_importer" for models whose torch-mlir lowering OOMs (e.g. the
             vision-heavy VLAs) -- an OOM SIGKILL can't be caught for fallback.
+        quantization_preapplied: the supplied model already contains the named
+            quantization. Keep its provenance without applying the transform twice.
+        capture_trace: record static source graphs, typed edges and exact final
+            MLIR correspondence. FXImporter is initially the qualified path.
+        original_frontend_snapshot: optional pre-quantization snapshot captured
+            before an external quantizer mutates the model. An unavailable
+            snapshot is preserved as unknown, never replaced by a quantized graph.
     """
+    if quantization_preapplied and quantization is None:
+        raise ValueError("quantization_preapplied requires a quantization config")
     if backend == "torch_mlir":
         allow_fallback = False
 
@@ -102,8 +115,19 @@ def convert(
             return convert_jax(model, example_inputs)
         except ImportError:
             pass  # no jax; fall through and let the torch path try (will error clearly)
-    if quantization_preapplied and quantization is None:
-        raise ValueError("quantization_preapplied=True requires a quantization config for provenance")
+    trace_graphs: dict[str, Any] = {}
+    if capture_trace:
+        from m2m.capture.trace import capture_frontend_snapshot
+
+        if original_frontend_snapshot is not None:
+            trace_graphs["original"] = original_frontend_snapshot
+        elif quantization_preapplied:
+            trace_graphs["original"] = {"schema": "m2m.frontend_graph.v1",
+                                        "stage": "original", "status": "unavailable",
+                                        "reason": "quantization was preapplied without an original graph",
+                                        "call_count": None}
+        elif quantization is not None:
+            trace_graphs["original"] = capture_frontend_snapshot(model, example_inputs)
     if quantization is not None and not quantization_preapplied:
         # Quantized (tensor-subclass) weights are swapped by .to()/.eval() during
         # capture; disable swap-on-conversion process-wide so capture uses copy
@@ -119,6 +143,7 @@ def convert(
             quantization,
             example_inputs=tuple(example_inputs),
             calibration_inputs=calibration_inputs,
+            original_frontend_snapshot=trace_graphs.get("original") if capture_trace else None,
         )
 
     # Decompose-first: capture an ExportedProgram and run decompositions so
@@ -126,7 +151,41 @@ def convert(
     # away before torch-mlir sees them. Falls back to letting the bridge
     # re-export the module if capture fails.
     exported_program = None
-    if decompose:
+    if capture_trace:
+        # A traced conversion lowers exactly this export. Failed capture is not
+        # hidden by the bridge exporting a different program on a second attempt.
+        from m2m.capture.trace import attach_original_identity, finalize_trace, snapshot_exported_program
+        from m2m.capture.torch_export import capture_model, _prepare_exported_program
+        from m2m.ir.torchmlir_decomps import inline_set_grad_hops, torch_mlir_gap_decompositions
+
+        try:
+            raw = model if hasattr(model, "graph_signature") and hasattr(model, "graph_module") \
+                else capture_model(model, tuple(example_inputs))
+            if "original" not in trace_graphs:
+                trace_graphs["original"] = snapshot_exported_program(raw, stage="original")
+            actual = snapshot_exported_program(raw, stage="quantized")
+            attach_original_identity(raw, trace_graphs["original"], actual)
+            trace_graphs["quantized"] = snapshot_exported_program(raw, stage="quantized")
+            # Inline captured higher-order regions while their inner FX nodes still
+            # carry their own identities. Decomposition otherwise attributes every
+            # operation in a region to its outer wrapper and loses the per-op proof.
+            for _ in range(8):
+                if not inline_set_grad_hops(raw.graph_module):
+                    break
+            if decompose:
+                exported_program, _ = _prepare_exported_program(
+                    raw, run_default_decompositions=True,
+                    export_decomposition_table=torch_mlir_gap_decompositions(), capture_trace=True)
+            else:
+                exported_program = raw
+            for _ in range(8):
+                if not inline_set_grad_hops(exported_program.graph_module):
+                    break
+            trace_graphs["prepared"] = snapshot_exported_program(exported_program, stage="prepared")
+        except Exception as exc:  # Tracing remains diagnostic; no silent recapture.
+            return ConversionResult(diagnostics=[f"traced frontend capture failed: {exc}"],
+                                    capture_trace=finalize_trace(trace_graphs, "", path="failed"))
+    elif decompose:
         try:
             from m2m.capture.torch_export import capture_frontend_artifact
             from m2m.ir.torchmlir_decomps import inline_set_grad_hops, torch_mlir_gap_decompositions
@@ -163,6 +222,7 @@ def convert(
         use_torch_mlir=(backend != "fx_importer" and not emit_named),
         emit_named_ops=emit_named,
         weights_path=weights_path,
+        capture_trace=capture_trace,
     )
     if weights_path and quantization is not None and quantization.scheme == "int8_static_act_int8_weight":
         if result.path_taken != "fx_importer":
@@ -267,13 +327,24 @@ def convert(
         except Exception:  # noqa: BLE001
             pass
 
-    mlir_text = result.mlir_text or (module_to_text(result.module) if result.module is not None else "")
+    mlir_text = result.mlir_text or (module_to_text(result.module, generic=capture_trace)
+                                   if result.module is not None else "")
+    trace = None
+    if capture_trace:
+        from m2m.capture.trace import finalize_trace
+
+        trace = finalize_trace(trace_graphs, mlir_text, path=result.path_taken,
+                               dispositions=result.trace_dispositions)
+        if trace["precision"]["projections"]:
+            result.diagnostics.append("FP8 storage was projected to f32: diagnostic capture only, not native FP8 lowering")
     return ConversionResult(
         mlir_text=mlir_text,
         module=result.module,
         path_taken=result.path_taken,
         output_type=output_type,
         diagnostics=list(result.diagnostics),
+        capture_trace=trace,
+        exported_program=exported_program,
     )
 
 

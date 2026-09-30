@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 
 import pytest
@@ -84,6 +85,27 @@ def test_per_channel_capture_records_exact_original_effective_and_frozen_weights
     assert (path.parent / (path.name + ".prequant.safetensors")).read_bytes() == (
         repeat.parent / (repeat.name + ".prequant.safetensors")
     ).read_bytes()
+
+
+def test_traced_pt2e_capture_keeps_weight_lineage_and_exact_mlir_bytes(tmp_path):
+    torch.manual_seed(17)
+    model = _DevelopmentNet().eval()
+    inputs = (torch.randn(1, 3, 8, 8),)
+    path = tmp_path / "weights.safetensors"
+    result = m2m.convert(
+        model, inputs,
+        quantization=QuantizationConfig(scheme="int8_static_act_int8_weight", calibration_samples=1),
+        calibration_inputs=[inputs], backend="fx_importer", weights_path=str(path),
+        capture_trace=True,
+    )
+
+    assert result.ok, result.diagnostics
+    assert result.capture_trace["graphs"]["original"]["status"] == "complete"
+    assert result.capture_trace["mlir"]["sha256"] == hashlib.sha256(
+        result.mlir_text.encode("utf-8")
+    ).hexdigest()
+    assert result.exported_program is not None
+    _verify_files(path, expected_granularity="per_channel")
 
 
 def test_per_tensor_recipe_shape_records_literal_qparams_and_refuses_mismatch(tmp_path):

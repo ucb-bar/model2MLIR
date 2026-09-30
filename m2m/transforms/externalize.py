@@ -69,8 +69,10 @@ def externalize_weights(exported: Any, module: ModuleOp, path: str) -> dict:
         else:
             manifest[str(idx)] = {"kind": kind, "name": ph.name}
 
-    if tensors:
-        save_file(tensors, path)
+    # Parameter-free programs are valid bundle stages too. Persist a genuine
+    # empty safetensors container so the declared weights path and receipt
+    # contract are satisfied without inventing a tensor or weakening hashing.
+    save_file(tensors, path)
     with open(path + ".manifest.json", "w") as fh:
         json.dump(manifest, fh, indent=2)
     try:

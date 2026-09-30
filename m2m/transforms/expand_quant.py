@@ -43,6 +43,9 @@ def expand_quant_to_standard(module: ModuleOp) -> ModuleOp:
         ops, result = built
         rid = _next_region_id("dequantize")
         for o in ops:
+            from m2m.capture.trace import copy_mlir_sources
+
+            copy_mlir_sources(o, op, role="lowering")
             _attach_region_id(o, rid)
             o.attributes["prov.op"] = StringAttr("dequantize")
             o.attributes["prov.family"] = StringAttr("quantize")

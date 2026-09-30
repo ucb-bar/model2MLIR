@@ -131,6 +131,7 @@ def _apply_pt2e_static_w8a8(
     *,
     example_inputs: tuple[Any, ...] | None,
     calibration_inputs: Iterable[Any] | None,
+    original_frontend_snapshot: dict[str, Any] | None = None,
 ) -> Any:
     """Calibrate and freeze a portable Conv/Linear W8A8 graph with TorchAO PT2E.
 
@@ -163,7 +164,7 @@ def _apply_pt2e_static_w8a8(
         raise RuntimeError("TorchAO PT2E quantization is unavailable") from exc
 
     class _PortableW8A8Quantizer(Quantizer):
-        def __init__(self) -> None:
+        def __init__(self, fold_candidates: list | None = None) -> None:
             eps = float(config.extra_args.get("eps", 2**-12))
             self.activation = QuantizationSpec(
                 dtype=torch.int8,
@@ -181,6 +182,14 @@ def _apply_pt2e_static_w8a8(
                 ch_axis=0,
             )
             self.annotated = 0
+            self.fold_candidates = fold_candidates or []
+
+        def transform_for_annotation(self, graph_module: Any) -> Any:
+            if self.fold_candidates:
+                from m2m.capture.trace import attach_pt2e_conv_bn_folds
+
+                attach_pt2e_conv_bn_folds(graph_module, self.fold_candidates)
+            return graph_module
 
         def annotate(self, graph_module: Any) -> Any:
             supported = {torch.ops.aten.conv2d.default, torch.ops.aten.linear.default}
@@ -212,9 +221,20 @@ def _apply_pt2e_static_w8a8(
     # weights, but clone only the graph's selected contraction operands.
     from m2m.capture.weight_lineage import snapshot_source_weights
 
-    exported_module = torch.export.export(model.eval(), tuple(example_inputs)).module()
+    exported = torch.export.export(model.eval(), tuple(example_inputs))
+    if original_frontend_snapshot is not None:
+        from m2m.capture.trace import attach_original_identity, snapshot_exported_program
+
+        actual = snapshot_exported_program(exported, stage="quantization_input")
+        attach_original_identity(exported, original_frontend_snapshot, actual)
+    exported_module = exported.module()
     original_state = snapshot_source_weights(model, exported_module)
-    quantizer = _PortableW8A8Quantizer()
+    fold_candidates = []
+    if original_frontend_snapshot is not None:
+        from m2m.capture.trace import pt2e_conv_bn_fold_candidates
+
+        fold_candidates = pt2e_conv_bn_fold_candidates(exported_module, original_frontend_snapshot)
+    quantizer = _PortableW8A8Quantizer(fold_candidates)
     prepared = prepare_pt2e(exported_module, quantizer)
 
     samples: Iterable[Any]
@@ -240,6 +260,11 @@ def _apply_pt2e_static_w8a8(
     # follows the live graph and stores the frozen int8 parameter.
     quantized = convert_pt2e(prepared, use_reference_representation=False, fold_quantize=True)
     quantized._m2m_weight_lineage = bind_frozen_weights(prepared_weights, quantized)  # type: ignore[attr-defined]
+    if original_frontend_snapshot is not None:
+        from m2m.capture.trace import attach_quantization_boundaries
+
+        attach_quantization_boundaries(quantized, {torch.ops.aten.conv2d.default,
+                                                  torch.ops.aten.linear.default})
     pruned_state = _drop_unused_graph_state(quantized)
     try:
         # Exported graph modules reject ordinary eval()/train() unless this shim
@@ -264,6 +289,7 @@ def apply_quantization(
     *,
     example_inputs: tuple[Any, ...] | None = None,
     calibration_inputs: Iterable[Any] | None = None,
+    original_frontend_snapshot: dict[str, Any] | None = None,
 ) -> Any:
     """Apply TorchAO quantization to a model.
 
@@ -281,6 +307,7 @@ def apply_quantization(
             config,
             example_inputs=example_inputs,
             calibration_inputs=calibration_inputs,
+            original_frontend_snapshot=original_frontend_snapshot,
         )
 
     # NOTE: CompGen's NPU-custom FP8 schemes ("fp8_e4m3_po2[_npu]") were dropped
