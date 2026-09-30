@@ -13,6 +13,7 @@ dependencies = [
     "xdsl>=0.24",
     "structlog>=24.1",
     "numpy>=1.26",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]

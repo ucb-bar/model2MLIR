@@ -208,7 +208,12 @@ def _apply_pt2e_static_w8a8(
 
     # PT2E consumes an exported aten graph. prepare_pt2e also performs the
     # inference Conv+BatchNorm fold before observer insertion.
+    # Keep source bytes before PT2E's Conv+BatchNorm fusion changes effective
+    # weights, but clone only the graph's selected contraction operands.
+    from m2m.capture.weight_lineage import snapshot_source_weights
+
     exported_module = torch.export.export(model.eval(), tuple(example_inputs)).module()
+    original_state = snapshot_source_weights(model, exported_module)
     quantizer = _PortableW8A8Quantizer()
     prepared = prepare_pt2e(exported_module, quantizer)
 
@@ -227,10 +232,14 @@ def _apply_pt2e_static_w8a8(
     if calibrated == 0:
         raise ValueError("static W8A8 calibration requires at least one input sample")
 
+    from m2m.capture.weight_lineage import bind_frozen_weights, snapshot_effective_weights
+
+    prepared_weights = snapshot_effective_weights(original_state, prepared)
     # fold_quantize freezes weight Q nodes to int8 buffers. Keeping float
     # originals in an unused module attribute is harmless: export/externalize
     # follows the live graph and stores the frozen int8 parameter.
     quantized = convert_pt2e(prepared, use_reference_representation=False, fold_quantize=True)
+    quantized._m2m_weight_lineage = bind_frozen_weights(prepared_weights, quantized)  # type: ignore[attr-defined]
     pruned_state = _drop_unused_graph_state(quantized)
     try:
         # Exported graph modules reject ordinary eval()/train() unless this shim

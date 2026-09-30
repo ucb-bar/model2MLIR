@@ -164,6 +164,16 @@ def convert(
         emit_named_ops=emit_named,
         weights_path=weights_path,
     )
+    if weights_path and quantization is not None and quantization.scheme == "int8_static_act_int8_weight":
+        if result.path_taken != "fx_importer":
+            raise ValueError("PT2E weight lineage requires FXImporter weight externalization")
+        from m2m.capture.weight_lineage import write_weight_lineage
+
+        rows = getattr(model, "_m2m_weight_lineage", None)
+        if not rows:
+            raise ValueError("PT2E model has no original-to-frozen weight lineage")
+        sidecars = write_weight_lineage(rows, weights_path)
+        result.diagnostics.append(f"PT2E weight lineage -> {sidecars['receipt']}")
     # Stamp the representation level so downstream/merlin knows which contract it received
     # (default portable standard form vs the opt-in structured high-level form).
     if result.module is not None:
