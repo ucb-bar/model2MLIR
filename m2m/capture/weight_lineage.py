@@ -62,33 +62,36 @@ def _contractions(module: Any) -> dict[str, Any]:
     }
 
 
-def _prepared_weight_attr(node: Any) -> str:
-    """Accept only the direct observer(get_attr(weight)) shape emitted by PT2E."""
+def _prepared_weight_attr(node: Any) -> str | None:
+    """Select observed weights; leave unannotated host contractions untouched."""
     weight = node.args[1]
     if weight.op != "call_module" or not str(weight.target).startswith("activation_post_process_"):
-        raise ValueError(f"{node.name}: weight is not a PT2E observer output")
+        annotation = node.meta.get("quantization_annotation")
+        if (annotation is not None and getattr(annotation, "_annotated", False)
+                and weight in getattr(annotation, "input_qspec_map", {})):
+            raise ValueError(f"{node.name}: annotated weight has no PT2E observer output")
+        return None
     if len(weight.args) != 1 or weight.args[0].op != "get_attr":
         raise ValueError(f"{node.name}: observer does not read one named weight")
     return str(weight.args[0].target)
 
 
 def snapshot_source_weights(model: Any, exported: Any) -> dict[str, Any]:
-    """Clone only named source weights of selected exported contractions.
+    """Clone named source weight candidates before the recipe selects them.
 
-    This runs before PT2E preparation/folding.  A source operand that cannot be
-    bound to one state key is refused rather than guessed by shape or position.
+    This runs before PT2E preparation/folding, where the quantizer has not yet
+    annotated its selected nodes.  Dynamic or non-state host operands are not
+    candidates; if PT2E later observes one, effective binding refuses it.
     """
     source = model.state_dict()
     selected: dict[str, Any] = {}
     for node in _contractions(exported).values():
         if len(node.args) < 2 or getattr(node.args[1], "op", None) != "get_attr":
-            raise ValueError(f"{node.name}: source weight is not a named state operand")
+            continue
         key = str(node.args[1].target)
         if key not in source:
             raise ValueError(f"{node.name}: source state has no weight {key!r}")
         selected[key] = _tensor(source[key], label=f"original {key}")
-    if not selected:
-        raise ValueError("PT2E source has no named Conv2d/Linear weight")
     return selected
 
 
@@ -104,6 +107,8 @@ def snapshot_effective_weights(original_state: dict[str, Any], prepared: Any) ->
     result: dict[str, dict[str, Any]] = {}
     for node_name, node in _contractions(prepared).items():
         state_key = _prepared_weight_attr(node)
+        if state_key is None:
+            continue
         if state_key not in original_state:
             raise ValueError(f"{node_name}: original state has no weight {state_key!r}")
         original = _tensor(original_state[state_key], label=f"original {state_key}")
@@ -132,10 +137,20 @@ def bind_frozen_weights(prepared_weights: dict[str, dict[str, Any]], converted: 
     import torch
 
     nodes = _contractions(converted)
-    if set(nodes) != set(prepared_weights):
-        raise ValueError("PT2E conversion changed contraction node identities")
+    if not set(prepared_weights) <= set(nodes):
+        raise ValueError("PT2E conversion lost selected contraction node identities")
+    qdq_targets = {
+        torch.ops.quantized_decomposed.dequantize_per_channel.default,
+        torch.ops.quantized_decomposed.dequantize_per_tensor.default,
+    }
+    for node_name, node in nodes.items():
+        if node_name in prepared_weights:
+            continue
+        weight = node.args[1]
+        if getattr(weight, "op", None) == "call_function" and weight.target in qdq_targets:
+            raise ValueError(f"{node_name}: converted weight dequantization has no source lineage")
     rows: list[dict[str, Any]] = []
-    for node_name in sorted(nodes):
+    for node_name in sorted(prepared_weights):
         node = nodes[node_name]
         prior = prepared_weights[node_name]
         if str(node.target) != prior["operator"]:
@@ -225,6 +240,13 @@ def bind_frozen_weights(prepared_weights: dict[str, dict[str, Any]], converted: 
             "quant_min": qmin,
             "quant_max": qmax,
         })
+    bound = {row["frozen_buffer"] for row in rows}
+    unbound = {
+        name for name, _ in converted.named_buffers(recurse=True)
+        if name.rsplit(".", 1)[-1].startswith("_frozen_param") and name not in bound
+    }
+    if unbound:
+        raise ValueError(f"converted graph has frozen buffers without source lineage: {sorted(unbound)}")
     return rows
 
 

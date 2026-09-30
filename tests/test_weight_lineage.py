@@ -137,3 +137,55 @@ def test_per_tensor_recipe_shape_records_literal_qparams_and_refuses_mismatch(tm
         from m2m.capture.weight_lineage import write_weight_lineage
 
         write_weight_lineage(bad, path)
+
+
+def test_selected_weight_lineage_skips_host_contraction_but_catches_unbound_freeze(tmp_path):
+    from torchao.quantization.pt2e import HistogramObserver, MinMaxObserver
+    from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
+    from torchao.quantization.pt2e.quantizer import QuantizationAnnotation, QuantizationSpec, Quantizer
+    from torch.ao.quantization import allow_exported_model_train_eval
+
+    class ConvOnlyQuantizer(Quantizer):
+        def __init__(self):
+            self.activation = QuantizationSpec(torch.int8, HistogramObserver.with_args(eps=2**-12), -128, 127, torch.per_tensor_symmetric)
+            self.weight = QuantizationSpec(torch.int8, MinMaxObserver.with_args(eps=2**-12), -127, 127, torch.per_tensor_symmetric)
+
+        def annotate(self, graph_module):
+            for node in graph_module.graph.nodes:
+                if node.target == torch.ops.aten.conv2d.default:
+                    node.meta["quantization_annotation"] = QuantizationAnnotation(
+                        input_qspec_map={node.args[0]: self.activation, node.args[1]: self.weight},
+                        _annotated=True,
+                    )
+            return graph_module
+
+        def validate(self, graph_module):
+            del graph_module
+
+    torch.manual_seed(13)
+    source = _DevelopmentNet().eval()
+    inputs = (torch.randn(1, 3, 8, 8),)
+    exported = torch.export.export(source, inputs).module()
+    original = snapshot_source_weights(source, exported)
+    assert set(original) == {"conv.weight", "fc.weight"}
+    prepared = prepare_pt2e(exported, ConvOnlyQuantizer())
+    prepared(*inputs)
+    selected = snapshot_effective_weights(original, prepared)
+    assert len(selected) == 1
+    assert next(iter(selected.values()))["state_key"] == "conv.weight"
+    converted = convert_pt2e(prepared, fold_quantize=True)
+    converted._m2m_weight_lineage = bind_frozen_weights(selected, converted)
+    assert len(converted._m2m_weight_lineage) == 1
+    with pytest.raises(ValueError, match="converted weight dequantization has no source lineage"):
+        bind_frozen_weights({}, converted)
+    allow_exported_model_train_eval(converted)
+    path = tmp_path / "weights.safetensors"
+    result = m2m.convert(
+        converted, inputs, quantization=QuantizationConfig(scheme="int8_static_act_int8_weight"),
+        quantization_preapplied=True, backend="fx_importer", decompose=False, weights_path=str(path),
+    )
+    assert result.ok, result.diagnostics
+    receipt = json.loads((path.parent / (path.name + ".quantization.json")).read_text())
+    assert len(receipt["weights"]) == 1
+    assert receipt["weights"][0]["original"]["state_key"] == "conv.weight"
+    assert load_file(str(path))["fc.weight"].dtype is torch.float32
