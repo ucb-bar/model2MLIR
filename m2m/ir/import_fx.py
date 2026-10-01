@@ -96,7 +96,7 @@ def _reg(family: str, *hints: str) -> None:
     for h in hints:
         _FAMILY_OF[h] = family
 
-_reg("elementwise", "add", "mul", "sub", "div", "neg", "reciprocal", "pow",
+_reg("elementwise", "add", "mul", "sub", "div", "floor_divide", "trunc_divide", "neg", "reciprocal", "pow",
      "pow_tensor_scalar", "exp", "sqrt", "rsqrt", "tanh", "abs", "floor", "ceil",
      "log", "cos", "sin", "erf", "round", "sigmoid", "silu", "gelu", "relu", "clamp",
      "copy", "clone", "contiguous", "identity")
@@ -107,7 +107,7 @@ _reg("compare", "compare")
 _reg("select", "where")
 _reg("minmax", "maximum", "minimum", "minmax")
 _reg("logical", "logical_not")
-_reg("bitwise", "bitwise_and", "bitwise_not")
+_reg("bitwise", "bitwise_and", "bitwise_not", "bitwise_right_shift")
 _reg("reduce", "reduce", "reduce_sum", "reduce_mean", "sum", "mean", "any", "bool_reduce")
 _reg("arg_reduce", "aten_min_dim", "aten_max_dim", "aten_argmin", "aten_argmax")
 _reg("contraction", "matmul", "batch_matmul", "int_matmul", "addmm", "linear",
