@@ -26,6 +26,17 @@ def _opaque_call_count(module) -> int | None:
     return sum(isinstance(op, CallOp) for op in module.walk())
 
 
+def _tensor_abi(value: torch.Tensor) -> dict:
+    """Describe a captured tensor without silently changing its source dtype."""
+    names = {
+        torch.float64: "f64", torch.float32: "f32", torch.float16: "f16",
+        torch.bfloat16: "bf16", torch.int64: "i64", torch.int32: "i32",
+        torch.int16: "i16", torch.int8: "i8", torch.uint8: "i8", torch.bool: "i1",
+    }
+    return {"shape": [int(size) for size in value.shape],
+            "dtype": names.get(value.dtype, str(value.dtype).removeprefix("torch."))}
+
+
 class _LogitsOnly(nn.Module):
     """Wrap a HF causal LM so export sees a clean ``input_ids -> logits`` forward."""
 
@@ -575,6 +586,15 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
 
     np.savez(out / "inputs.npz",
              **{f"in{i}": _numpy_safe(x) for i, x in enumerate(inputs)})
+    if capture_trace:
+        outputs = g if isinstance(g, (tuple, list)) else (g,)
+        if any(not isinstance(value, torch.Tensor) for value in (*inputs, *outputs)):
+            raise ValueError("traced bundle ABI requires tensor inputs and outputs")
+        meta_path = out / "meta.json"
+        merged = json.loads(meta_path.read_text(encoding="utf-8"))
+        merged["input_abi"] = [_tensor_abi(value) for value in inputs]
+        merged["output_abi"] = [_tensor_abi(value) for value in outputs]
+        meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     extra: dict = {}
     for name, t in runtime_mdl.named_buffers():

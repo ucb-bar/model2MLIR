@@ -8,7 +8,7 @@ import numpy as np
 import sympy
 import torch
 
-from m2m.capture.bundle import _lifted_constants, _opaque_call_count, write_bundle
+from m2m.capture.bundle import _lifted_constants, _opaque_call_count, _tensor_abi, write_bundle
 from m2m.capture.provenance import capture_receipt
 from m2m.capture.torch_export import _serialize_range_constraints
 
@@ -129,6 +129,8 @@ def test_traced_bundle_and_reused_conversion_bind_exact_bytes_without_recapture(
     receipt = json.loads((out / "capture_receipt.json").read_text())
     assert trace["status"] == "complete" and meta["workload_role"] == "iteration"
     assert meta["opaque"] == 0
+    assert meta["input_abi"] == [{"shape": [2, 4], "dtype": "f32"}]
+    assert meta["output_abi"] == [{"shape": [2, 3], "dtype": "f32"}]
     assert meta["loader_provenance"] == {"source": "authored"}
     for name in ("model.mlir", "frontend-trace.json", "meta.json"):
         assert receipt["artifacts"][name]["sha256"] == hashlib.sha256((out / name).read_bytes()).hexdigest()
@@ -158,6 +160,7 @@ def test_opaque_count_is_structural_and_unknown_without_module():
 
     assert _opaque_call_count(ModuleOp([CallOp("unlowered", [], [])])) == 1
     assert _opaque_call_count(None) is None
+    assert _tensor_abi(torch.empty(2, 3, dtype=torch.bfloat16)) == {"shape": [2, 3], "dtype": "bf16"}
 
 
 def test_static_pt2e_bundle_golden_is_actual_quantized_model(tmp_path, monkeypatch):
