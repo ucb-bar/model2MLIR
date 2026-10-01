@@ -167,6 +167,11 @@ inputs, actual selected-model goldens, `frontend-trace.json`, and merged
 `meta.json` (caller provenance is retained). `capture_receipt.json` binds the
 exact bytes, including the trace and its MLIR digest. Lifted constants come from
 the same prepared export used for lowering, not a hidden replacement capture.
+An installed external quantization adapter can return a `torch.export.ExportedProgram`.
+`write_bundle(..., quant=ExternalQuantizationConfig(...))` executes that selected
+program for goldens and saves `quantization-manifest.json`. The receipt binds
+the manifest file, its canonical digest in `meta.json`, and the digest stamped
+on `model.mlir`. The adapter and its policy remain outside model2MLIR.
 Session and multi-program helpers expose the same trace opt-in.
 For a multi-program session, `write_multi_program_bundle` also writes
 `bundle_integrity.json`: a sorted SHA-256/byte-count inventory of every regular

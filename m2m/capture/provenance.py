@@ -37,6 +37,7 @@ def _tool_identity() -> dict:
         "m2m/api.py",
         "m2m/capture/bundle.py",
         "m2m/capture/bundle_integrity.py",
+        "m2m/capture/external_quantization.py",
         "m2m/capture/provenance.py",
         "m2m/capture/trace.py",
         "m2m/capture/torch_mlir_bridge.py",
@@ -91,9 +92,33 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
         "inputs.npz", "golden.npy", "extra.npz", "input_order.json",
     )
     artifacts = {name: _file_record(out / name) for name in required}
-    for name in ("frontend-trace.json", "meta.json"):
+    for name in ("frontend-trace.json", "meta.json", "quantization-manifest.json"):
         if (out / name).is_file():
             artifacts[name] = _file_record(out / name)
+    if "quantization-manifest.json" not in artifacts and (
+        b"prov.quantization_manifest_sha256" in (out / "model.mlir").read_bytes()
+        or ("meta.json" in artifacts and "quantization_manifest" in json.loads(
+            (out / "meta.json").read_text(encoding="utf-8")
+        ))
+    ):
+        raise ValueError("bundle quantization manifest is missing")
+    if "quantization-manifest.json" in artifacts:
+        from m2m.capture.external_quantization import manifest_digest
+
+        manifest = json.loads((out / "quantization-manifest.json").read_text(encoding="utf-8"))
+        digest = manifest_digest(manifest)
+        meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+        pointer = meta.get("quantization_manifest") or {}
+        if pointer != {
+            "path": "quantization-manifest.json",
+            "sha256": artifacts["quantization-manifest.json"]["sha256"],
+            "manifest_sha256": digest,
+        }:
+            raise ValueError("bundle metadata does not bind its exact quantization manifest")
+        if f'prov.quantization_manifest_sha256 = "{digest}"' not in (
+            out / "model.mlir"
+        ).read_text(encoding="utf-8"):
+            raise ValueError("bundle MLIR does not bind its quantization manifest")
     if "meta.json" in artifacts:
         meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
         agreement = (meta.get("integerization_receipt") or {}).get("golden_agreement") or {}

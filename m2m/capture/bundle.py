@@ -529,6 +529,23 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         merged.update(metadata)
         meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    if r.quantization_manifest is not None:
+        import hashlib
+        from m2m.capture.external_quantization import manifest_digest
+
+        manifest_path = out / "quantization-manifest.json"
+        manifest_path.write_text(
+            json.dumps(r.quantization_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        meta_path = out / "meta.json"
+        merged = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        merged["quantization_manifest"] = {
+            "path": manifest_path.name,
+            "sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            "manifest_sha256": manifest_digest(r.quantization_manifest),
+        }
+        meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
     n_regions = 0
     if capture_regions:
         fqns = _extract_prov_fqns(r.mlir_text)

@@ -9,6 +9,7 @@ from torch import nn
 from m2m.api import convert
 from m2m.capture.external_quantization import ExternalQuantizationConfig
 from m2m.capture.bundle import write_bundle
+from m2m.capture.provenance import capture_receipt
 
 
 class _Model(nn.Module):
@@ -90,4 +91,12 @@ def test_external_exported_program_materializes_bundle(tmp_path, monkeypatch):
     assert (bundle / "model.mlir").is_file()
     assert (bundle / "weights.safetensors.manifest.json").is_file()
     assert (bundle / "capture_receipt.json").is_file()
+    assert (bundle / "quantization-manifest.json").is_file()
     assert "prov.quantization_manifest_sha256" in (bundle / "model.mlir").read_text()
+    assert "quantization-manifest.json" in capture_receipt(bundle)["artifacts"]
+    (bundle / "quantization-manifest.json").write_text("{}\n")
+    with pytest.raises(ValueError, match="quantization manifest"):
+        capture_receipt(bundle)
+    (bundle / "quantization-manifest.json").unlink()
+    with pytest.raises(ValueError, match="quantization manifest"):
+        capture_receipt(bundle)
