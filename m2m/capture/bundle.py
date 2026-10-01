@@ -17,6 +17,15 @@ import torch
 from torch import nn
 
 
+def _opaque_call_count(module) -> int | None:
+    """Count unresolved calls in the emitted xDSL module, or leave it unknown."""
+    if module is None:
+        return None
+    from xdsl.dialects.func import CallOp
+
+    return sum(isinstance(op, CallOp) for op in module.walk())
+
+
 class _LogitsOnly(nn.Module):
     """Wrap a HF causal LM so export sees a clean ``input_ids -> logits`` forward."""
 
@@ -522,6 +531,9 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         merged.setdefault("ok", r.ok)
         merged.setdefault("capture_diagnostics", list(r.diagnostics))
         merged.setdefault("path_taken", r.path_taken)
+        # This is measured from the emitted module, never accepted from caller metadata
+        # or parsed from a human-readable diagnostic. None remains unqualified.
+        merged["opaque"] = _opaque_call_count(r.module)
         meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     elif metadata is not None:
         meta_path = out / "meta.json"

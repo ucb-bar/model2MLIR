@@ -8,7 +8,7 @@ import numpy as np
 import sympy
 import torch
 
-from m2m.capture.bundle import _lifted_constants, write_bundle
+from m2m.capture.bundle import _lifted_constants, _opaque_call_count, write_bundle
 from m2m.capture.provenance import capture_receipt
 from m2m.capture.torch_export import _serialize_range_constraints
 
@@ -120,7 +120,7 @@ def test_traced_bundle_and_reused_conversion_bind_exact_bytes_without_recapture(
     model, inputs = _Tiny().eval(), (torch.ones(2, 4),)
     out = tmp_path / "bundle"
     out.mkdir()
-    (out / "meta.json").write_text(json.dumps({"loader_provenance": {"source": "authored"}}))
+    (out / "meta.json").write_text(json.dumps({"loader_provenance": {"source": "authored"}, "opaque": 7}))
     write_bundle(model, inputs, out, capture_trace=True, capture_regions=False,
                  metadata={"workload_role": "iteration"})
     assert len(calls) == 1  # no separate lifted-constant capture
@@ -128,6 +128,7 @@ def test_traced_bundle_and_reused_conversion_bind_exact_bytes_without_recapture(
     meta = json.loads((out / "meta.json").read_text())
     receipt = json.loads((out / "capture_receipt.json").read_text())
     assert trace["status"] == "complete" and meta["workload_role"] == "iteration"
+    assert meta["opaque"] == 0
     assert meta["loader_provenance"] == {"source": "authored"}
     for name in ("model.mlir", "frontend-trace.json", "meta.json"):
         assert receipt["artifacts"][name]["sha256"] == hashlib.sha256((out / name).read_bytes()).hexdigest()
@@ -149,6 +150,14 @@ def test_traced_bundle_and_reused_conversion_bind_exact_bytes_without_recapture(
     import pytest
     with pytest.raises(ValueError, match="exact model.mlir"):
         capture_receipt(reused)
+
+
+def test_opaque_count_is_structural_and_unknown_without_module():
+    from xdsl.dialects.builtin import ModuleOp
+    from xdsl.dialects.func import CallOp
+
+    assert _opaque_call_count(ModuleOp([CallOp("unlowered", [], [])])) == 1
+    assert _opaque_call_count(None) is None
 
 
 def test_static_pt2e_bundle_golden_is_actual_quantized_model(tmp_path, monkeypatch):
