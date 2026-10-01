@@ -129,6 +129,7 @@ def test_traced_bundle_and_reused_conversion_bind_exact_bytes_without_recapture(
     receipt = json.loads((out / "capture_receipt.json").read_text())
     assert trace["status"] == "complete" and meta["workload_role"] == "iteration"
     assert meta["opaque"] == 0
+    assert meta["weights"] == str(out / "weights.safetensors")
     assert meta["input_abi"] == [{"shape": [2, 4], "dtype": "f32"}]
     assert meta["output_abi"] == [{"shape": [2, 3], "dtype": "f32"}]
     assert meta["loader_provenance"] == {"source": "authored"}

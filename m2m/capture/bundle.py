@@ -545,6 +545,13 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         # This is measured from the emitted module, never accepted from caller metadata
         # or parsed from a human-readable diagnostic. None remains unqualified.
         merged["opaque"] = _opaque_call_count(r.module)
+        from xdsl.dialects.builtin import StringAttr
+        weight_attr = r.module.attributes.get("prov.weights_file") if r.module is not None else None
+        if (isinstance(weight_attr, StringAttr) and
+                Path(weight_attr.data).resolve() == Path(weights_path).resolve()):
+            merged["weights"] = weight_attr.data
+        else:
+            merged.pop("weights", None)
         meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     elif metadata is not None:
         meta_path = out / "meta.json"
