@@ -487,18 +487,21 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
                                      original_frontend_snapshot=original_frontend_snapshot)
             quantization_preapplied = True
             exported_program = None  # any supplied prequantized export is stale
+        runtime_mdl = mdl.module() if isinstance(mdl, torch.export.ExportedProgram) else mdl
         if not capture_regions:
             # Export can leave Python-side caches holding FakeTensors. Capture
             # real reference outputs before tracing the selected model, after
             # any requested quantization has actually been applied.
             with torch.no_grad():
-                eager_output = mdl(*inputs)
+                eager_output = runtime_mdl(*inputs)
         r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=quant,
                         level="linalg-on-tensors", weights_path=weights_path,
                         quantization_preapplied=quantization_preapplied,
                         capture_trace=capture_trace,
                         original_frontend_snapshot=original_frontend_snapshot)
     assert r.ok, "m2m.convert failed"
+    if conversion_result is not None:
+        runtime_mdl = mdl.module() if isinstance(mdl, torch.export.ExportedProgram) else mdl
     (out / "model.mlir").write_text(r.mlir_text, encoding="utf-8")
     trace_pointer = None
     if capture_trace:
@@ -529,7 +532,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     n_regions = 0
     if capture_regions:
         fqns = _extract_prov_fqns(r.mlir_text)
-        region_goldens, g = _capture_region_goldens(mdl, inputs, fqns)
+        region_goldens, g = _capture_region_goldens(runtime_mdl, inputs, fqns)
         if region_goldens:
             np.savez(out / "region_goldens.npz", **region_goldens)
         n_regions = len({k.split("::", 1)[0] for k in region_goldens})
@@ -537,7 +540,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         g = eager_output
     else:
         with torch.no_grad():
-            g = mdl(*inputs)
+            g = runtime_mdl(*inputs)
     golden = g[0] if isinstance(g, (tuple, list)) else g
     np.save(out / "golden.npy", golden.detach().float().cpu().numpy())
 
@@ -545,12 +548,12 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
              **{f"in{i}": _numpy_safe(x) for i, x in enumerate(inputs)})
 
     extra: dict = {}
-    for name, t in mdl.named_buffers():
+    for name, t in runtime_mdl.named_buffers():
         extra["buf::" + name] = t.detach().float().cpu().numpy()
-    for pname, p in mdl.named_parameters():
+    for pname, p in runtime_mdl.named_parameters():
         if type(p).__name__ not in ("Parameter", "Tensor") or hasattr(p, "__tensor_flatten__"):
             _flatten_subclass(p, pname, extra)
-    _lifted_constants(mdl, inputs, extra,
+    _lifted_constants(runtime_mdl, inputs, extra,
                       exported_program=r.exported_program if r.exported_program is not None else exported_program)
     np.savez(out / "extra.npz", **extra)
 
@@ -569,7 +572,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     session_summary = {}
     if session is not None:
         session_summary = write_session_artifacts(
-            mdl, inputs, out, manifest=man, input_order=order, session=session,
+            runtime_mdl, inputs, out, manifest=man, input_order=order, session=session,
             quality_reference=quality_reference)
 
     from m2m.capture.provenance import write_capture_receipt
