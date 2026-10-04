@@ -4651,6 +4651,173 @@ def decompose_bitwise_and(operands, meta, node_name):
     return _opaque_decomp("aten_bitwise_and", operands[:2], meta, "bitwise", pattern_hint="bitwise_and")
 
 
+# ---- integer right shift and integer floor / truncating division -------------------------------
+#
+# Both are exact integer operations. Before these existed they were OPAQUE, so a capture that needed
+# an integer floor-shift or floor-divide built it from float64 (cast, divide, floor, cast back) to get
+# a decomposed program -- per element, around every fixed-point step. The semantics below are
+# torch's, including the corners that differ from a bare machine instruction.
+
+
+def _signed_int_args(meta, n_args: int) -> bool:
+    """True when every tensor argument and the result are SIGNED integers (int8/16/32/64).
+
+    An unsigned tensor maps to the same signless ``iN`` as a signed one, so the element type cannot
+    tell them apart; a sign-extending promotion or an arithmetic shift of a ``uint8`` would be wrong
+    and type-check. Those stay opaque (the behaviour before these decompositions existed)."""
+    import torch
+
+    signed = (torch.int8, torch.int16, torch.int32, torch.int64)
+    val: Any = meta.get("val")
+    if getattr(val, "dtype", None) not in signed:
+        return False
+    for i in range(n_args):
+        arg = _fx_arg(meta, i)
+        arg_val = getattr(arg, "meta", {}).get("val") if hasattr(arg, "meta") else None
+        if arg_val is not None and getattr(arg_val, "dtype", None) not in signed:
+            return False
+    return True
+
+
+def _wrap_int(value: int, width: int) -> int:
+    """``value`` as a two's-complement ``width``-bit integer: how torch casts a python scalar operand
+    into an integer tensor's dtype before the op sees it."""
+    value = int(value) & ((1 << width) - 1)
+    return value - (1 << width) if value >> (width - 1) else value
+
+
+def _opaque_name(meta, node_name: str) -> str:
+    """The callee name the importer gives an op with no decomposition (``aten.div.Tensor_mode`` ->
+    ``aten_div_Tensor_mode``), so falling back from here is indistinguishable from never trying."""
+    target = meta.get("_aten_target")
+    return str(target).replace(".", "_") if target else f"aten_{node_name}"
+
+
+def _scalar_position(meta) -> tuple[int, Any] | None:
+    """``(position, value)`` of the one python-int argument of a (tensor, scalar) binary op."""
+    for i in (0, 1):
+        a = _fx_arg(meta, i, None)
+        if isinstance(a, int) and not isinstance(a, bool):
+            return i, a
+    return None
+
+
+def _int_binary(operands, meta, family: str, body, fix_scalar=None):
+    """Integer binary op ``body(lhs, rhs, out_elem) -> (ops, value)`` as a linalg.generic.
+
+    Two tensors: both are read through broadcast maps and promoted (sign-extended / truncated) to
+    the result type, as torch's type promotion does. A tensor and a python int: the int is wrapped
+    to the result width (then passed through ``fix_scalar(position, value, width)`` if given) and
+    becomes an ``arith.constant`` in the body (no splatted tensor), on the side it was written.
+    Returns None (caller -> opaque) for anything else."""
+    from xdsl.dialects.arith import ConstantOp
+    from xdsl.dialects.builtin import IntegerAttr, IntegerType
+
+    oe = _element_type_from_meta(meta)
+    if not isinstance(oe, IntegerType) or not _signed_int_args(meta, 2):
+        return None
+    width = oe.width.data
+    if len(operands) >= 2:
+        if not all(isinstance(o.type, TensorType) for o in operands[:2]):
+            return None
+
+        def build2(args, out_elem):
+            return body(args[0], args[1], out_elem)
+
+        return _pointwise(operands[:2], meta, build2, family=family, promote=True)
+    found = _scalar_position(meta)
+    if len(operands) != 1 or found is None or not isinstance(operands[0].type, TensorType):
+        return None
+    pos, scalar = found
+    scalar = _wrap_int(scalar, width)
+    if fix_scalar is not None:
+        scalar = fix_scalar(pos, scalar, width)
+
+    def build1(args, out_elem):
+        cops, x = _cast_scalar_arg(args[0], out_elem)
+        c = ConstantOp(IntegerAttr(scalar, out_elem), out_elem)
+        lhs, rhs = (c.results[0], x) if pos == 0 else (x, c.results[0])
+        bops, res = body(lhs, rhs, out_elem)
+        return [*cops, c, *bops], res
+
+    return _pointwise(operands[:1], meta, build1, family=family)
+
+
+def _shift_right_body(x, s, out_elem):
+    """torch's signed ``x >> s``: an arithmetic shift whose amount, if negative or past the sign bit,
+    is the sign bit's position (so ``x >> 64`` on int64 is 0 or -1, never poison).
+
+    One unsigned min does all of it: a negative amount read as unsigned exceeds ``width - 1``, and so
+    does a too-large one; ``arith.shrsi`` alone would be poison for both. A python-int amount is
+    clamped before it reaches the body (``_shift_amount``), so it costs the shift alone."""
+    from xdsl.dialects.arith import ConstantOp, MinUIOp, ShRSIOp
+    from xdsl.dialects.builtin import IntegerAttr
+
+    owner = getattr(s, "owner", None)
+    if isinstance(owner, ConstantOp):
+        shr = ShRSIOp(x, s)
+        return [shr], shr.results[0]
+    top = ConstantOp(IntegerAttr(out_elem.width.data - 1, out_elem), out_elem)
+    amount = MinUIOp(s, top.results[0])
+    shr = ShRSIOp(x, amount.results[0])
+    return [top, amount, shr], shr.results[0]
+
+
+def _shift_amount(position: int, value: int, width: int) -> int:
+    """The clamp of ``_shift_right_body`` applied to a python-int AMOUNT (position 1) at capture
+    time; a python-int shifted VALUE (position 0) is left as is."""
+    if position == 1 and not 0 <= value <= width - 1:
+        return width - 1
+    return value
+
+
+def decompose_bitwise_right_shift(operands, meta, node_name):
+    """aten.bitwise_right_shift / aten.__rshift__ on signed integers -> arith.shrsi (family bitwise).
+
+    Arithmetic (sign-propagating) shift, i.e. floor division by ``2**s``; the amount is clamped as
+    torch clamps it (see ``_shift_right_body``)."""
+    real = _int_binary(operands, meta, "bitwise", _shift_right_body, fix_scalar=_shift_amount)
+    if real is not None:
+        real.pattern_hint = "bitwise_right_shift"
+        return real
+    return _opaque_decomp(_opaque_name(meta, node_name), operands[:2], meta, "bitwise",
+                          pattern_hint="bitwise_right_shift")
+
+
+def _floor_div_body(a, b, out_elem):
+    from xdsl.dialects.arith import FloorDivSIOp
+
+    op = FloorDivSIOp(a, b)
+    return [op], op.results[0]
+
+
+def _trunc_div_body(a, b, out_elem):
+    from xdsl.dialects.arith import DivSIOp
+
+    op = DivSIOp(a, b)
+    return [op], op.results[0]
+
+
+def decompose_div_mode(operands, meta, node_name):
+    """aten.div.Tensor_mode / aten.div.Scalar_mode / aten.floor_divide on signed integers.
+
+    ``rounding_mode='floor'`` (and ``floor_divide``) -> ``arith.floordivsi``: rounds toward
+    -infinity, so ``-7 // 2 == -4`` -- NOT the C truncation ``arith.divsi`` gives. ``'trunc'`` ->
+    ``arith.divsi``. ``None`` is true division and goes to the ordinary div. A float operand or
+    result, and an unsigned one, stay opaque: torch's float floor-division is not ``floor(a / b)``
+    and is not written here. Division by zero is an error in torch and undefined here."""
+    target = str(meta.get("_aten_target", ""))
+    mode = "floor" if "floor_divide" in target else meta.get("_fx_kwargs", {}).get("rounding_mode", _fx_arg(meta, 2))
+    if mode is None:
+        return decompose_div_tensor(operands, meta, node_name)
+    body = {"floor": _floor_div_body, "trunc": _trunc_div_body}.get(mode)
+    real = _int_binary(operands, meta, "elementwise", body) if body is not None else None
+    if real is not None:
+        real.pattern_hint = "floor_divide" if mode == "floor" else "trunc_divide"
+        return real
+    return _opaque_decomp(_opaque_name(meta, node_name), operands[:2], meta, "elementwise", pattern_hint="div")
+
+
 def decompose_any_dim(operands, meta, node_name):
     """aten.any.dim(input, dim, keepdim) — boolean OR reduction along dim."""
     return _opaque_decomp("aten_any_dim", operands[:1], meta, "bool_reduce", pattern_hint="bool_reduce")
@@ -6477,6 +6644,16 @@ DECOMPOSITION_TABLE.update(
         "aten.amin.default": _make_amin_amax(is_min=True),
         "aten.amax.default": _make_amin_amax(is_min=False),
         "aten.round.default": decompose_round,
+        # integer right shift and integer floor / truncating division
+        "aten.bitwise_right_shift.Tensor": decompose_bitwise_right_shift,
+        "aten.bitwise_right_shift.Tensor_Scalar": decompose_bitwise_right_shift,
+        "aten.bitwise_right_shift.Scalar_Tensor": decompose_bitwise_right_shift,
+        "aten.__rshift__.Tensor": decompose_bitwise_right_shift,
+        "aten.__rshift__.Scalar": decompose_bitwise_right_shift,
+        "aten.div.Tensor_mode": decompose_div_mode,
+        "aten.div.Scalar_mode": decompose_div_mode,
+        "aten.floor_divide.default": decompose_div_mode,
+        "aten.floor_divide.Scalar": decompose_div_mode,
     }
 )
 for _k in ("eq", "ne", "lt", "le", "gt", "ge"):
