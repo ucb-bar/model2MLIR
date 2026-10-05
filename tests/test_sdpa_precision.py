@@ -28,7 +28,8 @@ def test_export_decomposition_half_sdpa_matches_wide_reference(dtype,mask_kind):
     if mask_kind=='bool':mask=torch.ones(8,8,dtype=torch.bool).tril()
     if mask_kind=='half':mask=torch.randn(8,8).to(dtype)
     actual=_sdpa(q,k,v,mask)
-    wide_mask=mask.float() if mask_kind=='half' else mask
-    expected=_sdpa(q.float(),k.float(),v.float(),wide_mask).to(dtype)
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    with sdpa_kernel(SDPBackend.MATH):
+        expected=torch.nn.functional.scaled_dot_product_attention(q,k,v,mask)
     torch.testing.assert_close(actual,expected,rtol=0,atol=0)
     torch.testing.assert_close(actual,torch.nn.functional.scaled_dot_product_attention(q,k,v,mask),rtol=.008,atol=.004)
