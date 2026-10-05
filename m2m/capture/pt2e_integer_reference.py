@@ -13,6 +13,7 @@ falling back while claiming integer coverage.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -20,10 +21,18 @@ from typing import Any, Iterable
 
 @dataclass(frozen=True)
 class IntegerReferenceResult:
+    """Reference outputs and in-memory, exact-operand reduction diagnostics.
+
+    ``partial_sum_evidence`` describes the recorded mathematical K order, not a
+    hardware accumulation order or a serialized bundle certificate. The
+    conservative K * 128**2 bound remains the order-independent i32 safety gate.
+    """
+
     output: Any
     conv2d_count: int
     linear_count: int
     matmul_count: int = 0
+    partial_sum_evidence: tuple[dict[str, Any], ...] = ()
 
     @property
     def contraction_count(self) -> int:
@@ -37,6 +46,43 @@ def _pair(value: Any) -> tuple[int, int]:
     if len(values) != 2:
         raise ValueError(f"expected a 2-D convolution parameter, got {value!r}")
     return values
+
+
+def _operand_identity(value: Any) -> dict[str, Any]:
+    """Bind a diagnostic to exact centered, signed-i8 operand bytes and shape."""
+    import torch
+
+    if value.numel() < 1 or bool(((value < -128) | (value > 127)).any()):
+        raise ValueError("partial-sum evidence requires nonempty signed-i8 operands")
+    raw = value.detach().to(device="cpu", dtype=torch.int8).contiguous().numpy().tobytes()
+    return {"dtype": "i8", "shape": [int(dim) for dim in value.shape],
+            "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def _max_partial_sum(lhs: Any, rhs: Any) -> int:
+    """Exact maximum over every prefix of every output reduction, initial sum zero.
+
+    Inputs are rank-2 [output positions, K] and [output channels, K]. Tiles
+    bound memory independently of model size; int64 prevents an intermediate
+    overflow while checking the i32-safe PT2E sites.
+    """
+    import torch
+
+    if lhs.ndim != 2 or rhs.ndim != 2 or lhs.shape[1] != rhs.shape[1] or min(*lhs.shape, *rhs.shape) < 1:
+        raise ValueError("partial-sum evidence has invalid contraction geometry")
+    lhs, rhs = lhs.to(device="cpu", dtype=torch.int64), rhs.to(device="cpu", dtype=torch.int64)
+    maximum = 0
+    for row in range(0, lhs.shape[0], 64):
+        left = lhs[row:row + 64]
+        for col in range(0, rhs.shape[0], 32):
+            right = rhs[col:col + 32]
+            carry = torch.zeros((left.shape[0], right.shape[0]), dtype=torch.int64)
+            for start in range(0, left.shape[1], 128):
+                products = left[:, None, start:start + 128] * right[None, :, start:start + 128]
+                prefixes = products.cumsum(dim=-1) + carry[..., None]
+                maximum = max(maximum, int(prefixes.abs().amax()))
+                carry = prefixes[..., -1]
+    return maximum
 
 
 def run_pt2e_integer_reference(
@@ -73,6 +119,19 @@ def run_pt2e_integer_reference(
             self.conv2d_count = 0
             self.linear_count = 0
             self.matmul_count = 0
+            self.partial_sum_evidence: list[dict[str, Any]] = []
+
+        def record(self, node: Any, kind: str, xq: Any, wq: Any, maximum: int,
+                   *, reduction_k: int, reduction_order: str, bias: Any,
+                   geometry: dict[str, Any] | None = None) -> None:
+            self.partial_sum_evidence.append({
+                "node": node.name, "kind": kind, "reduction_k": reduction_k,
+                "initial_sum": 0, "max_abs_partial_sum": maximum,
+                "reduction_order": reduction_order,
+                "bias_application": "post_scale_f32" if bias is not None else "none",
+                "activation": _operand_identity(xq), "weight": _operand_identity(wq),
+                "geometry": geometry or {},
+            })
 
         def value(self, item: Any) -> Any:
             return self.env[item] if isinstance(item, Node) else item
@@ -185,6 +244,9 @@ def run_pt2e_integer_reference(
                     out = out.to(torch.float32)
                 if bias is not None:
                     out = out + bias
+                left = xq.reshape(-1, xq.shape[-1])
+                self.record(node, "linear", xq, wq, _max_partial_sum(left, wq),
+                            reduction_k=int(xq.shape[-1]), reduction_order="k_ascending", bias=bias)
                 self.linear_count += 1
                 return out
 
@@ -203,6 +265,13 @@ def run_pt2e_integer_reference(
                 out = out * torch.as_tensor(sw, device=acc.device)
                 if weight_channel is not None:
                     out = out.to(torch.float32)
+                maximum = 0
+                for index in range(math.prod(xq.shape[:-2])):
+                    left = xq.reshape(-1, *xq.shape[-2:])[index]
+                    right = wq.reshape(-1, *wq.shape[-2:])[index].transpose(0, 1)
+                    maximum = max(maximum, _max_partial_sum(left, right))
+                self.record(node, "matmul", xq, wq, maximum,
+                            reduction_k=int(xq.shape[-1]), reduction_order="k_ascending", bias=None)
                 self.matmul_count += 1
                 return out
 
@@ -240,13 +309,32 @@ def run_pt2e_integer_reference(
                 out = out.to(torch.float32)
             if bias is not None:
                 out = out + bias.reshape(1, -1, 1, 1)
+            maximum = 0
+            # The integerized graph's _int_mm assembles each patch with
+            # (kernel_h, kernel_w, channel) as its K order. F.unfold above uses
+            # (channel, kernel_h, kernel_w); final sums agree but intermediate
+            # MAC prefixes need the *emitted* order.
+            prefix_cols = cols.reshape(batch, groups, cin_group, kh, kw, positions)
+            prefix_cols = prefix_cols.permute(0, 1, 3, 4, 2, 5).reshape(batch, groups, cin_group * kh * kw, positions)
+            prefix_weights = weights.reshape(groups, cout_group, cin_group, kh, kw)
+            prefix_weights = prefix_weights.permute(0, 1, 3, 4, 2).reshape(groups, cout_group, cin_group * kh * kw)
+            for batch_index in range(batch):
+                for group_index in range(groups):
+                    left = prefix_cols[batch_index, group_index].transpose(0, 1)
+                    maximum = max(maximum, _max_partial_sum(left, prefix_weights[group_index]))
+            self.record(node, "conv2d", xq, wq, maximum,
+                        reduction_k=cin_group * kh * kw,
+                        reduction_order="kh_kw_channel", bias=bias,
+                        geometry={"stride": list(stride), "padding": list(padding),
+                                  "dilation": list(dilation), "groups": groups})
             self.conv2d_count += 1
             return out
 
     runner = _IntegerInterpreter(model)
     with torch.no_grad():
         output = runner.run(*tuple(inputs))
-    result = IntegerReferenceResult(output, runner.conv2d_count, runner.linear_count, runner.matmul_count)
+    result = IntegerReferenceResult(output, runner.conv2d_count, runner.linear_count,
+                                    runner.matmul_count, tuple(runner.partial_sum_evidence))
     if expected_contractions is not None and result.contraction_count != expected_contractions:
         raise ValueError(
             f"integer reference executed {result.contraction_count} contractions, "

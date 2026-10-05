@@ -120,6 +120,18 @@ def test_static_w8a8_pt2e_quantizes_conv_and_uses_calibration():
     assert "tensor<8x3x3x3xi8>" in r.mlir_text
 
 
+def test_pt2e_converted_model_accepts_eval_at_bundle_boundary():
+    from m2m.capture.torchao_pipeline import apply_quantization
+
+    inputs = (torch.ones(1, 2),)
+    quantized = apply_quantization(
+        nn.Linear(2, 2).eval(), QuantizationConfig(scheme="int8_static_act_int8_weight"),
+        example_inputs=inputs)
+    quantized.eval()
+    with torch.no_grad():
+        assert torch.isfinite(quantized(*inputs)).all()
+
+
 def test_pt2e_integer_reference_executes_conv_and_linear():
     """The integer oracle uses frozen PT2E qparams and accounts for every contraction."""
     from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
@@ -146,6 +158,58 @@ def test_pt2e_integer_reference_executes_conv_and_linear():
     assert result.linear_count == 1
     assert result.output.shape == (1, 3)
     assert torch.isfinite(result.output).all()
+    assert len(result.partial_sum_evidence) == result.contraction_count
+    assert {site["kind"] for site in result.partial_sum_evidence} == {"conv2d", "linear"}
+    assert all(site["initial_sum"] == 0 and site["max_abs_partial_sum"] >= 0
+               and len(site["activation"]["sha256"]) == 64
+               and len(site["weight"]["sha256"]) == 64
+               for site in result.partial_sum_evidence)
+
+
+def test_pt2e_integer_reference_proves_internal_prefix_not_final_output():
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+
+    class Cancellation(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight_q", torch.tensor([[127, 127]], dtype=torch.int8))
+
+        def forward(self, x):
+            qx = torch.ops.quantized_decomposed.quantize_per_tensor.default(x, 1.0, 0, -128, 127, torch.int8)
+            dx = torch.ops.quantized_decomposed.dequantize_per_tensor.default(qx, 1.0, 0, -128, 127, torch.int8)
+            dw = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.weight_q, 1.0, 0, -128, 127, torch.int8)
+            return torch.ops.aten.linear.default(dx, dw)
+
+    sample = (torch.tensor([[127.0, -127.0]]),)
+    model = torch.export.export(Cancellation().eval(), sample).module()
+    result = run_pt2e_integer_reference(model, sample, expected_contractions=1)
+    assert result.output.tolist() == [[0.0]]
+    assert result.partial_sum_evidence[0]["max_abs_partial_sum"] == 127 * 127
+    assert result.partial_sum_evidence[0]["reduction_k"] == 2
+
+
+def test_pt2e_conv_prefix_uses_integerized_patch_order():
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+
+    class CancellationConv(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight_q", torch.tensor([[[[100, -100]], [[100, -100]]]], dtype=torch.int8))
+
+        def forward(self, x):
+            qx = torch.ops.quantized_decomposed.quantize_per_tensor.default(x, 1.0, 0, -128, 127, torch.int8)
+            dx = torch.ops.quantized_decomposed.dequantize_per_tensor.default(qx, 1.0, 0, -128, 127, torch.int8)
+            dw = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.weight_q, 1.0, 0, -128, 127, torch.int8)
+            return torch.ops.aten.conv2d.default(dx, dw)
+
+    sample = (torch.ones(1, 2, 1, 2),)
+    model = torch.export.export(CancellationConv().eval(), sample).module()
+    result = run_pt2e_integer_reference(model, sample, expected_contractions=1)
+    assert result.output.tolist() == [[[[0.0]]]]
+    assert result.partial_sum_evidence[0]["reduction_order"] == "kh_kw_channel"
+    assert result.partial_sum_evidence[0]["max_abs_partial_sum"] == 200
 
 
 def test_pt2e_integer_reference_matches_rewrite_with_per_tensor_weights():
