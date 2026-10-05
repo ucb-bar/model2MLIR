@@ -3968,12 +3968,17 @@ def _sigmoid_build(args, out_elem):
 
 
 def _silu_build(args, out_elem):
-    """silu(x) = x * sigmoid(x)."""
-    from xdsl.dialects.arith import MulfOp
+    """Use the framework's x/(1+exp(-x)) without rounding a reciprocal."""
+    from xdsl.dialects.arith import AddfOp, ConstantOp, DivfOp, NegfOp
+    from xdsl.dialects.builtin import FloatAttr
+    from xdsl.dialects.math import ExpOp
 
-    ops, sig = _sigmoid_build(args, out_elem)
-    m = MulfOp(args[0], sig)
-    return [*ops, m], m.results[0]
+    one = ConstantOp(FloatAttr(1.0, out_elem), out_elem)
+    neg = NegfOp(args[0])
+    ex = ExpOp(neg.result)
+    den = AddfOp(one.result, ex.result)
+    result = DivfOp(args[0], den.result)
+    return [one, neg, ex, den, result], result.result
 
 
 def decompose_sigmoid(operands, meta, node_name):
@@ -3995,7 +4000,29 @@ def decompose_neg(operands, meta, node_name):
 
 
 def decompose_silu(operands, meta, node_name):
-    """aten.silu.default(input) -> x*sigmoid(x) via linalg.generic."""
+    """aten.silu.default(input) with framework division and half opmath."""
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    elem = _t_elem(operands[0]) if operands else None
+    shape = _shape_of(operands[0]) if operands else None
+    if (
+        isinstance(elem, (BFloat16Type, Float16Type))
+        and _element_type_from_meta(meta) == elem
+        and shape is not None
+        and all(d >= 0 for d in shape)
+    ):
+        # The framework evaluates the complete activation in f32 opmath and
+        # rounds once. Rounding the sigmoid's intermediate values to half is
+        # a different operation, even when exp itself uses a wider libm call.
+        wide = _cast_tensor(operands[0], shape, f32)
+        real = _unary_elementwise([wide[1]], meta, "silu", _silu_build, out_elem=f32)
+        if real is not None:
+            narrow = _cast_tensor(real.result, shape, elem)
+            for op in [*wide[0], *narrow[0]]:
+                _attach_region_id(op, real.region_ids[0])
+            real.ops = [*wide[0], *real.ops, *narrow[0]]
+            real.result = narrow[1]
+            return real
     real = _unary_elementwise(operands, meta, "silu", _silu_build)
     if real is not None:
         return real
