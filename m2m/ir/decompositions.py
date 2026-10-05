@@ -441,17 +441,31 @@ def decompose_linear(
     return DecompResult(ops=ops, result=result, region_ids=region_ids)
 
 
-def _gelu_build(args, out_elem):
-    """gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))  (matches torch-mlir's exact form)."""
+def _gelu_build(args, out_elem, approximate="none"):
+    """Build the requested exact-erf or tanh GELU scalar expression."""
     import math as _pymath
 
     from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp
     from xdsl.dialects.builtin import FloatAttr
-    from xdsl.dialects.math import ErfOp
+    from xdsl.dialects.math import ErfOp, TanhOp
 
     x = args[0]
     half = ConstantOp(FloatAttr(0.5, out_elem), out_elem)
     one = ConstantOp(FloatAttr(1.0, out_elem), out_elem)
+    if approximate == "tanh":
+        coefficient = ConstantOp(FloatAttr(0.044715, out_elem), out_elem)
+        sqrt_two_over_pi = ConstantOp(FloatAttr(_pymath.sqrt(2.0 / _pymath.pi), out_elem), out_elem)
+        square = MulfOp(x, x)
+        cube = MulfOp(square.result, x)
+        scaled_cube = MulfOp(coefficient.result, cube.result)
+        inner_sum = AddfOp(x, scaled_cube.result)
+        inner = MulfOp(sqrt_two_over_pi.result, inner_sum.result)
+        activation = TanhOp(inner.result)
+        onep = AddfOp(one.result, activation.result)
+        hx = MulfOp(half.result, x)
+        out = MulfOp(hx.result, onep.result)
+        return [half, one, coefficient, sqrt_two_over_pi, square, cube, scaled_cube,
+                inner_sum, inner, activation, onep, hx, out], out.result
     inv_sqrt2 = ConstantOp(FloatAttr(1.0 / _pymath.sqrt(2.0), out_elem), out_elem)
     scaled = MulfOp(x, inv_sqrt2.results[0])
     er = ErfOp(scaled.results[0])
@@ -462,8 +476,26 @@ def _gelu_build(args, out_elem):
 
 
 def decompose_gelu(operands, meta, node_name):
-    """aten.gelu.default(input) -> 0.5*x*(1+erf(x/sqrt(2))) via linalg.generic."""
-    real = _unary_elementwise(operands, meta, "gelu", _gelu_build)
+    """Preserve GELU mode and evaluate half inputs with framework f32 opmath."""
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    approximate = meta.get("_fx_kwargs", {}).get("approximate", _fx_arg(meta, 1, "none"))
+    if approximate not in ("none", "tanh"):
+        return _opaque_decomp("aten_gelu", operands[:1], meta, "elementwise", pattern_hint="gelu")
+    scalar_build = lambda args, elem: _gelu_build(args, elem, approximate)
+    elem = _t_elem(operands[0]) if operands else None
+    shape = _shape_of(operands[0]) if operands else None
+    if isinstance(elem, (BFloat16Type, Float16Type)) and shape is not None and all(d >= 0 for d in shape):
+        wide = _cast_tensor(operands[0], shape, f32)
+        real = _unary_elementwise([wide[1]], meta, "gelu", scalar_build, out_elem=f32)
+        if real is not None:
+            narrow = _cast_tensor(real.result, shape, elem)
+            for op in [*wide[0], *narrow[0]]:
+                _attach_region_id(op, real.region_ids[0])
+            real.ops = [*wide[0], *real.ops, *narrow[0]]
+            real.result = narrow[1]
+            return real
+    real = _unary_elementwise(operands, meta, "gelu", scalar_build)
     if real is not None:
         return real
     return _opaque_decomp("aten_gelu", operands[:1], meta, "elementwise", pattern_hint="gelu")
