@@ -1740,14 +1740,20 @@ def decompose_rsqrt(operands, meta, node_name):
 
 
 def decompose_pow_tensor_scalar(operands, meta, node_name):
-    """aten.pow.Tensor_Scalar(input, exponent) -> math.powf via linalg.generic."""
-    from xdsl.dialects.arith import ConstantOp
+    """Scalar square uses multiplication; other exponents use ``math.powf``."""
+    from xdsl.dialects.arith import ConstantOp, MulfOp
     from xdsl.dialects.builtin import FloatAttr
     from xdsl.dialects.math import PowFOp
 
     exp = _fx_arg(meta, 1, 2.0)
 
     def build(args, oe):
+        # PyTorch specializes exponent two to x*x, including its signed-zero,
+        # infinity and NaN behavior. Emit that operation explicitly: downstream
+        # freestanding compilation cannot assume libm powf has builtin semantics.
+        if exp == 2:
+            square = MulfOp(args[0], args[0])
+            return [square], square.result
         c = ConstantOp(FloatAttr(float(exp), oe), oe)
         p = PowFOp(args[0], c.results[0])
         return [c, p], p.results[0]
