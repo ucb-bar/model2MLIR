@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from m2m.api import convert
-from m2m.capture.external_quantization import ExternalQuantizationConfig
+from m2m.capture.external_quantization import ExternalQuantizationConfig, validate_manifest
 from m2m.capture.bundle import write_bundle
 from m2m.capture.provenance import capture_receipt
 
@@ -66,6 +66,57 @@ def test_external_adapter_rejects_changed_selected_contract(tmp_path):
                                         expected_contract_sha256="0" * 64)
     with pytest.raises(ValueError, match="selected contract sha256 differs"):
         convert(_Model(), (torch.ones(2, 4),), quantization=config)
+
+
+def test_preserved_accelerator_site_is_distinct_from_host(tmp_path):
+    contract = tmp_path / "contract.yaml"
+    policy = tmp_path / "policy.yaml"
+    contract.write_bytes(b"contract: selected\n")
+    policy.write_bytes(b"policy: selected\n")
+    config = ExternalQuantizationConfig("fixture", contract, policy)
+    manifest = {
+        "schema": "m2m.quantization_manifest.v2", "adapter_id": "fixture",
+        "contract_sha256": hashlib.sha256(contract.read_bytes()).hexdigest(),
+        "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+        "sites": [
+            {"site_id": "functional:mm", "status": "preserved", "execution_route": "simt_float"},
+            {"site_id": "functional:matmul", "status": "quantized", "format": "mxfp8"},
+            {"site_id": "module:host", "status": "host"},
+        ],
+    }
+    assert validate_manifest(manifest, config) is manifest
+    del manifest["sites"][0]["execution_route"]
+    with pytest.raises(ValueError, match="execution route"):
+        validate_manifest(manifest, config)
+    manifest["sites"][0]["execution_route"] = "simt_float"
+    manifest["schema"] = "m2m.quantization_manifest.v1"
+    with pytest.raises(ValueError, match="explicit status"):
+        validate_manifest(manifest, config)
+
+
+def test_preserved_site_manifest_survives_conversion(tmp_path, monkeypatch):
+    contract = tmp_path / "contract.yaml"
+    policy = tmp_path / "policy.yaml"
+    contract.write_bytes(b"contract: selected\n")
+    policy.write_bytes(b"policy: selected\n")
+
+    def adapter(model, _inputs, *, contract_bytes, policy_bytes, original_frontend_snapshot):
+        return model, {
+            "schema": "m2m.quantization_manifest.v2", "adapter_id": "fixture",
+            "contract_sha256": hashlib.sha256(contract_bytes).hexdigest(),
+            "policy_sha256": hashlib.sha256(policy_bytes).hexdigest(),
+            "sites": [{"site_id": "module:linear", "status": "preserved",
+                       "execution_route": "simt_float"}],
+        }
+
+    monkeypatch.setattr("m2m.capture.external_quantization._entry_point",
+                        lambda _: _Entry(adapter))
+    result = convert(_Model().eval(), (torch.ones(2, 4),),
+                     quantization=ExternalQuantizationConfig("fixture", contract, policy),
+                     backend="fx_importer")
+    assert result.ok, result.diagnostics
+    assert result.quantization_manifest["sites"][0]["execution_route"] == "simt_float"
+    assert "prov.quantization_manifest_sha256" in result.mlir_text
 
 
 def test_external_exported_program_materializes_bundle(tmp_path, monkeypatch):

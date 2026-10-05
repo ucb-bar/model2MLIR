@@ -1,7 +1,9 @@
 """Explicit, target-independent quantization adapter loading.
 
-Adapters own their numerical transforms.  m2m only freezes selected input bytes,
+Adapters own their numerical transforms. m2m freezes selected input bytes,
 checks the returned manifest, and carries it through the frontend boundary.
+Manifest v2 distinguishes an explicitly preserved accelerator float site from
+a host fallback; its execution route is an opaque target-owned identifier.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from typing import Any
 
 ENTRY_POINT_GROUP = "m2m.quantization_adapters"
 MANIFEST_SCHEMA = "m2m.quantization_manifest.v1"
+MANIFEST_SCHEMA_V2 = "m2m.quantization_manifest.v2"
 
 
 @dataclass(frozen=True)
@@ -89,7 +92,7 @@ def validate_manifest(
         _, contract_sha = _read_selected(config.contract_path, config.expected_contract_sha256, "contract")
     if policy_sha is None:
         _, policy_sha = _read_selected(config.policy_path, config.expected_policy_sha256, "policy")
-    if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
+    if not isinstance(manifest, dict) or manifest.get("schema") not in {MANIFEST_SCHEMA, MANIFEST_SCHEMA_V2}:
         raise ValueError("external quantization manifest has an invalid schema")
     for field, expected in (("adapter_id", config.adapter_id),
                             ("contract_sha256", contract_sha), ("policy_sha256", policy_sha)):
@@ -102,8 +105,15 @@ def validate_manifest(
     for site in sites:
         if not isinstance(site, dict) or not isinstance(site.get("site_id"), str):
             raise ValueError("external quantization site needs a stable site_id")
-        if site.get("status") not in {"quantized", "host", "skipped"}:
+        allowed = {"quantized", "host", "skipped"}
+        if manifest["schema"] == MANIFEST_SCHEMA_V2:
+            allowed.add("preserved")
+        if site.get("status") not in allowed:
             raise ValueError("external quantization site needs an explicit status")
+        if site["status"] == "preserved" and (
+            not isinstance(site.get("execution_route"), str) or not site["execution_route"]
+        ):
+            raise ValueError("preserved site needs an explicit execution route")
         ids.append(site["site_id"])
     if len(ids) != len(set(ids)):
         raise ValueError("external quantization manifest has duplicate site IDs")

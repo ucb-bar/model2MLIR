@@ -9,6 +9,13 @@ the MLIR file and stamps its SHA-256 digest in the module attributes. Adapter
 implementations and target-specific format policies belong to their support
 packages.
 
+An adapter's `m2m.quantization_manifest.v2` may mark a site `preserved` with a
+nonempty `execution_route` when the selected accelerator path uses its source
+float dtype. This differs from a `host` fallback and from an unsupported
+`skipped` site. The route is target-owned; model2MLIR records it without
+interpreting or certifying the backend. The v1 manifest remains accepted for
+existing adapters.
+
 ## Inspect frontend operations and lowering correspondence
 
 ```python
