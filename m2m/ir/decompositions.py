@@ -793,18 +793,12 @@ def decompose_mm(
 ) -> DecompResult:
     """Decompose aten.mm.default(a, b) -> linalg.matmul."""
     val: Any = meta["val"]
-    result_type = TensorType(_t_elem(operands[0]), _static_shape(val.shape))
-
-    mm_empty = _make_empty(result_type)
-    matmul = MatmulOp(
-        inputs=[operands[0], operands[1]],
-        outputs=[mm_empty.results[0]],
-        res=[result_type],
-    )
+    shape = _static_shape(val.shape)
+    ops, result = _matmul_opmath_2d(operands[0], operands[1], shape[0], shape[1], _t_elem(operands[0]))
     rid = _next_region_id("matmul")
-    _attach_region_id(matmul, rid)
-
-    return DecompResult(ops=[mm_empty, matmul], result=matmul.results[0], region_ids=[rid])
+    for op in ops:
+        _attach_region_id(op, rid)
+    return DecompResult(ops=ops, result=result, region_ids=[rid])
 
 
 def decompose_transpose(
@@ -1230,6 +1224,17 @@ def _opaque_decomp(
     )
 
 
+def _matmul_opmath_inputs(a, b, elem):
+    """Half contractions multiply and accumulate in f32, then narrow once."""
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        aops, a = _cast_tensor(a, _shape_of(a), f32)
+        bops, b = _cast_tensor(b, _shape_of(b), f32)
+        return [*aops, *bops], a, b, f32
+    return [], a, b, elem
+
+
 def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem):
     """N-D batched matmul as a single linalg.generic contraction (family matmul).
 
@@ -1242,6 +1247,8 @@ def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem):
     from xdsl.ir import Block, Region
     from xdsl.ir.affine import AffineExpr, AffineMap
 
+    result_elem = elem
+    prefix, a, b, elem = _matmul_opmath_inputs(a, b, elem)
     D = AffineExpr.dimension
     nb = batch_rank
     m, n, k = nb, nb + 1, nb + 2
@@ -1265,7 +1272,11 @@ def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem):
         iterator_types=[IteratorTypeAttr(par)] * (ndim - 1) + [IteratorTypeAttr(red)],
         result_types=[rt],
     )
-    return [zero, init, gen], gen.results[0]
+    ops, result = [*prefix, zero, init, gen], gen.results[0]
+    if elem != result_elem:
+        narrow, result = _cast_tensor(result, out_shape, result_elem)
+        ops += narrow
+    return ops, result
 
 
 def decompose_scaled_dot_product_attention(operands, meta, node_name):
@@ -1405,40 +1416,13 @@ def decompose_bmm(operands, meta, node_name):
             or any(d < 0 for d in [*sa, *sb, *out_shape]) or _t_elem(b) != elem):
         return _opaque_decomp("aten_bmm", operands, meta, "batch_matmul", pattern_hint="batch_matmul")
 
-    from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp
-    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr
-    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
-    from xdsl.dialects.tensor import SplatOp
-    from xdsl.ir import Block, Region
-    from xdsl.ir.affine import AffineExpr, AffineMap
-
-    result_type = TensorType(elem, out_shape)
-    zero = ConstantOp(FloatAttr(0.0, elem), elem)
-    init = SplatOp(zero.result, [], result_type)
-    D = AffineExpr.dimension  # iteration dims: (b=0, m=1, n=2, k=3)
-    a_map = AffineMap(4, 0, (D(0), D(1), D(3)))
-    b_map = AffineMap(4, 0, (D(0), D(3), D(2)))
-    o_map = AffineMap(4, 0, (D(0), D(1), D(2)))
-    blk = Block(arg_types=[elem, elem, elem])
-    prod = MulfOp(blk.args[0], blk.args[1])
-    acc = AddfOp(blk.args[2], prod.results[0])
-    blk.add_op(prod)
-    blk.add_op(acc)
-    blk.add_op(YieldOp(acc.results[0]))
-    par, red = IteratorType.PARALLEL, IteratorType.REDUCTION
-    gen = GenericOp(
-        inputs=[a, b],
-        outputs=[init.results[0]],
-        body=Region(blk),
-        indexing_maps=[AffineMapAttr(a_map), AffineMapAttr(b_map), AffineMapAttr(o_map)],
-        iterator_types=[IteratorTypeAttr(par), IteratorTypeAttr(par), IteratorTypeAttr(par), IteratorTypeAttr(red)],
-        result_types=[result_type],
-    )
+    ops, result = _batched_matmul(a, b, batch_rank=1, transpose_b=False,
+                                  out_shape=out_shape, elem=elem)
     rid = _next_region_id("matmul")
-    for op in (zero, init, gen):
+    for op in ops:
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("matmul")
-    return DecompResult(ops=[zero, init, gen], result=gen.results[0], region_ids=[rid], pattern_hint="batch_matmul")
+    return DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="batch_matmul")
 
 
 def decompose_int_mm(operands, meta, node_name):
@@ -2973,6 +2957,17 @@ def _matmul_2d(a, b, m: int, n: int, elem: Any):
     return [*z_ops, mm], mm.results[0]
 
 
+def _matmul_opmath_2d(a, b, m: int, n: int, elem: Any):
+    result_elem = elem
+    prefix, a, b, elem = _matmul_opmath_inputs(a, b, elem)
+    body, result = _matmul_2d(a, b, m, n, elem)
+    ops = [*prefix, *body]
+    if elem != result_elem:
+        narrow, result = _cast_tensor(result, [m, n], result_elem)
+        ops += narrow
+    return ops, result
+
+
 def _move_axis_last(src, shape: list[int], axis: int, elem: Any):
     """Permute ``axis`` to the end, then flatten to 2-D ``(prod(rest), shape[axis])``.
 
@@ -4485,20 +4480,13 @@ def decompose_matmul(operands, meta, node_name):
             and len(list(lhs_type.get_shape())) == 2
             and len(list(rhs_type.get_shape())) == 2
         ):
-            result_type = TensorType(_t_elem(operands[0]), _static_shape(shape))
-            init = _make_empty(result_type)
-            mm = MatmulOp(
-                inputs=[lhs, rhs],
-                outputs=[init.results[0]],
-                res=[result_type],
-            )
+            out_shape = _static_shape(shape)
+            ops, result = _matmul_opmath_2d(lhs, rhs, out_shape[0], out_shape[1], _t_elem(lhs))
             rid = _next_region_id("matmul")
-            _attach_region_id(mm, rid)
+            for op in ops:
+                _attach_region_id(op, rid)
             return DecompResult(
-                ops=[init, mm],
-                result=mm.results[0],
-                region_ids=[rid],
-                pattern_hint="matmul",
+                ops=ops, result=result, region_ids=[rid], pattern_hint="matmul",
             )
 
     # N-D matmul: a[*batch, M, K] @ b -> [*batch, M, N]. b may be batched ([*batch, K, N])
@@ -4521,6 +4509,8 @@ def decompose_matmul(operands, meta, node_name):
                 ops, res = _batched_matmul(a, b, batch_rank=out_rank - 2, transpose_b=False,
                                            out_shape=out_shape, elem=elem)
             elif len(sb) == 2:                # plain 2-D weight broadcast over the batch
+                result_elem = elem
+                prefix, a, b, elem = _matmul_opmath_inputs(a, b, elem)
                 nb = out_rank - 2
                 D = AffineExpr.dimension
                 m, n, kk = nb, nb + 1, nb + 2
@@ -4542,7 +4532,10 @@ def decompose_matmul(operands, meta, node_name):
                     indexing_maps=[AffineMapAttr(a_map), AffineMapAttr(b_map), AffineMapAttr(o_map)],
                     iterator_types=[IteratorTypeAttr(par)] * (ndim - 1) + [IteratorTypeAttr(red)],
                     result_types=[rt])
-                ops, res = [zero, init, gen], gen.results[0]
+                ops, res = [*prefix, zero, init, gen], gen.results[0]
+                if elem != result_elem:
+                    narrow, res = _cast_tensor(res, out_shape, result_elem)
+                    ops += narrow
             else:
                 ops = None
             if ops is not None:
