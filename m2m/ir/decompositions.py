@@ -539,6 +539,13 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     # Result dtype = meta dtype; operands are cast to it inside the body (promote=True),
     # so mixed-dtype promotion (e.g. bf16 * f32 -> f32) lowers instead of bailing.
     elem = _element_type_from_meta(meta)
+    result_elem = elem
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+    # Framework mul/div keep Python scalar coefficients at opmath precision.
+    # Add/sub instead round the scalar to the tensor dtype before arithmetic.
+    if (len(operands) == 1 and op_name in {"mul", "div"}
+            and isinstance(elem, (BFloat16Type, Float16Type))):
+        elem = f32
     result_type = TensorType(elem, out_shape)
 
     pre: list[Operation] = []
@@ -579,6 +586,9 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     if em is None:
         return None
     ops, res = em
+    if elem != result_elem:
+        narrow, res = _cast_tensor(res, out_shape, result_elem)
+        ops += narrow
     rid = _next_region_id(op_name)
     for op in (*pre, *ops):
         _attach_region_id(op, rid)
