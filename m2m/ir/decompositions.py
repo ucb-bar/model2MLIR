@@ -1271,19 +1271,35 @@ def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem):
 def decompose_scaled_dot_product_attention(operands, meta, node_name):
     """aten.scaled_dot_product_attention(Q, K, V) -> softmax(Q Kᵀ / √E) V (family attention).
 
-    Handles the no-mask, non-causal case (the captured pi0.5 attention): Q/K/V are
-    [*batch, L, E]. Built from batched matmul + scale + softmax + batched matmul, all
-    standard dialects -- torch-version-independent (doesn't rely on export decomposition)."""
+    Q/K/V are [*batch, L, E]. Supports explicit scale and upper-left causal
+    masking; dropout and grouped-query attention must be decomposed elsewhere.
+    Built from standard dialects without relying on export decomposition."""
     import math
 
     from xdsl.dialects.arith import ConstantOp, MulfOp
     from xdsl.dialects.builtin import FloatAttr
+
+    kwargs = meta.get("_fx_kwargs", {})
+    dropout_p = kwargs.get("dropout_p", _fx_arg(meta, 4, 0.0))
+    is_causal = kwargs.get("is_causal", _fx_arg(meta, 5, False))
+    explicit_scale = kwargs.get("scale")
+    enable_gqa = kwargs.get("enable_gqa", False)
+    if dropout_p != 0.0:
+        raise NotImplementedError("SDPA decomposition does not support nonzero dropout_p")
+    if enable_gqa:
+        raise NotImplementedError("SDPA decomposition does not support enable_gqa=True")
+    if not isinstance(is_causal, bool):
+        raise NotImplementedError("SDPA decomposition requires a static is_causal bool")
+    if explicit_scale is not None and not isinstance(explicit_scale, (int, float)):
+        raise NotImplementedError("SDPA decomposition requires a static numeric scale")
 
     if len(operands) < 3:
         return _opaque_decomp("aten_sdpa", operands[:3], meta, "attention", pattern_hint="sdpa")
     q, k, v = operands[0], operands[1], operands[2]
     # operands[3] (optional) is an additive/boolean attn_mask broadcast over [*batch, L, S].
     mask = operands[3] if len(operands) >= 4 and isinstance(operands[3].type, TensorType) else None
+    if is_causal and mask is not None:
+        raise ValueError("SDPA cannot combine is_causal=True with an explicit attn_mask")
     sq, sk, sv = _shape_of(q), _shape_of(k), _shape_of(v)
     val: Any = meta["val"]
     out_shape = _static_shape(getattr(val, "shape", []))
@@ -1312,8 +1328,7 @@ def decompose_scaled_dot_product_attention(operands, meta, node_name):
     score_ops, scores = _batched_matmul(q, k, batch_rank=batch_rank, transpose_b=True,
                                       out_shape=scores_shape, elem=elem)
     ops += score_ops
-    # scale by 1/sqrt(E)
-    scale = 1.0 / math.sqrt(E)
+    scale = 1.0 / math.sqrt(E) if explicit_scale is None else explicit_scale
     sc = _pointwise([scores], fake(scores_shape),
                     lambda args, oe: ([c := ConstantOp(FloatAttr(scale, oe), oe),
                                        m := MulfOp(args[0], c.results[0])], m.results[0]),
@@ -1322,6 +1337,22 @@ def decompose_scaled_dot_product_attention(operands, meta, node_name):
         return _opaque_decomp("aten_sdpa", operands[:3], meta, "attention", pattern_hint="sdpa")
     ops += sc.ops
     scored = sc.result
+    if is_causal:
+        from xdsl.dialects.arith import CmpiOp, SelectOp
+        from xdsl.dialects.linalg import IndexOp
+
+        def causal_body(args, oe):
+            row, column = IndexOp(batch_rank), IndexOp(batch_rank + 1)
+            allowed = CmpiOp(column.results[0], row.results[0], "ule")
+            ninf = ConstantOp(FloatAttr(float("-inf"), oe), oe)
+            selected = SelectOp(allowed.results[0], args[0], ninf.results[0])
+            return [row, column, allowed, ninf, selected], selected.results[0]
+
+        causal = _pointwise([scored], fake(scores_shape), causal_body, family="attention")
+        if causal is None:
+            raise NotImplementedError("SDPA causal mask could not be represented")
+        ops += causal.ops
+        scored = causal.result
     if mask is not None:
         # float mask: scores + mask ; bool mask: scores where(mask) else -inf
         from xdsl.dialects.arith import AddfOp, ConstantOp as _C, SelectOp

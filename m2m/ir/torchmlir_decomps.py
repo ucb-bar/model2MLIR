@@ -43,6 +43,12 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
     not; expanding it here covers both."""
     import math
 
+    if dropout_p != 0.0:
+        raise NotImplementedError("SDPA decomposition does not support nonzero dropout_p")
+    if enable_gqa:
+        raise NotImplementedError("SDPA decomposition does not support enable_gqa=True")
+    if is_causal and attn_mask is not None:
+        raise ValueError("SDPA cannot combine is_causal=True with an explicit attn_mask")
     output_dtype = query.dtype
     if output_dtype in (torch.float16, torch.bfloat16):
         query, key, value = query.float(), key.float(), value.float()
