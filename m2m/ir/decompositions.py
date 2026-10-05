@@ -1482,6 +1482,23 @@ def build_layer_norm_body(x, weight, bias, *, eps, k):
     if in_shape is None or any(d < 0 for d in in_shape):
         return None
     elem = _t_elem(x)
+    # PyTorch native LayerNorm accumulates and normalizes half inputs in f32.
+    # Keeping even the reduction in bf16 can lose most additions on wide rows.
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        wide_ops = []
+        def widen(value):
+            if value is None:
+                return None
+            cast = _cast_tensor(value, _shape_of(value), f32)
+            wide_ops.extend(cast[0])
+            return cast[1]
+        x_wide, weight_wide, bias_wide = widen(x), widen(weight), widen(bias)
+        built = build_layer_norm_body(x_wide, weight_wide, bias_wide, eps=eps, k=k)
+        if built is None:
+            return None
+        narrow = _cast_tensor(built[1], in_shape, elem)
+        return [*wide_ops, *built[0], *narrow[0]], narrow[1]
     rank = len(in_shape)
     dims = list(range(rank - k, rank))
     keep = list(in_shape)
