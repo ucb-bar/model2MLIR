@@ -7,8 +7,10 @@ rewrites it to an explicit ``quant_ext.dequantize_per_{tensor,channel}`` op, so 
 quantization is first-class and matchable (a target-aware fuse can then map it to a native
 quantized matmul). Symmetric weight-only -> zero_point = 0.
 
-Safe by construction: the whole module is verified after rewriting; on ANY failure the
-original (unfused) module is returned, so this can never regress the portable output.
+Rewrites operate on a clone. Scale dependencies are preflighted for safe motion and SSA
+availability before fusion; unsupported matches are left unchanged. A failed rewrite or
+module verification returns the original module. Verification alone does not prove safe
+motion or SSA dominance.
 """
 
 from __future__ import annotations
@@ -17,7 +19,9 @@ from xdsl.dialects.arith import ConstantOp
 from xdsl.dialects.builtin import IntegerAttr, IntegerType, ModuleOp, StringAttr, TensorType
 from xdsl.dialects.linalg import GenericOp, MatmulOp
 from xdsl.dialects.tensor import SplatOp
+from xdsl.ir import BlockArgument, Operation, SSAValue
 from xdsl.rewriter import InsertPoint, Rewriter
+from xdsl.traits import IsolatedFromAbove, Pure
 
 from m2m.ir.quant.ops import DequantizePerChannelOp, DequantizePerTensorOp
 
@@ -35,10 +39,71 @@ def _producer(value):
     return owner if isinstance(owner, Operation) else None
 
 
+def _available_before(value: SSAValue, anchor: Operation) -> bool:
+    """Check lexical SSA availability, including captures from ancestor blocks.
+
+    Sibling blocks and other CFG dominance relationships are deliberately unsupported.
+    Capturing a value across an isolated operation is never legal.
+    """
+    owner = value.owner
+    block = value.block if isinstance(value, BlockArgument) else (
+        owner.parent_block() if isinstance(owner, Operation) else None
+    )
+    if block is None:
+        return False
+    consumer = anchor
+    while consumer.parent_block() is not block:
+        parent = consumer.parent_op()
+        if parent is None or parent.has_trait(IsolatedFromAbove):
+            return False
+        consumer = parent
+    return isinstance(value, BlockArgument) or (
+        owner is not consumer and owner.is_before_in_block(consumer)
+    )
+
+
+def _plan_producer_hoists_before(
+    value: SSAValue, anchor: Operation
+) -> tuple[Operation, ...] | None:
+    """Preflight the whole dependency closure before moving any operation.
+
+    Only region-free Pure producers in the anchor's block can move. Region captures,
+    effects, missing/foreign definitions and dependencies on the anchor fail closed.
+    The returned order defines every moved operand before its consumer.
+    """
+    block = anchor.parent_block()
+    if block is None:
+        return None
+    planned: list[Operation] = []
+    complete: set[Operation] = set()
+    visiting: set[Operation] = set()
+
+    def visit(operand: SSAValue) -> bool:
+        if _available_before(operand, anchor):
+            return True
+        op = _producer(operand)
+        if (
+            op is None or op is anchor or op.parent_block() is not block
+            or op.regions or not op.has_trait(Pure) or op in visiting
+        ):
+            return False
+        if op in complete:
+            return True
+        visiting.add(op)
+        if not all(visit(dependency) for dependency in op.operands):
+            return False
+        visiting.remove(op)
+        complete.add(op)
+        planned.append(op)
+        return True
+
+    return tuple(planned) if visit(value) else None
+
+
 def fuse_qdq(module: ModuleOp) -> ModuleOp:
     """Fold `dtype_cast(int->float) -> mul(scale)` weight-dequant pairs into
-    `quant_ext.dequantize_*`. Verify-guarded: runs on a clone and returns it only if it
-    still verifies; otherwise returns the original module unchanged (never regresses)."""
+    `quant_ext.dequantize_*`. Preflight motion on a clone and return it only if it
+    verifies; failures return the original module unchanged."""
     work = module.clone()
     try:
         _fuse(work)
@@ -75,6 +140,12 @@ def _fuse(module: ModuleOp) -> None:
         if list(cast.results[0].uses) != [u for u in cast.results[0].uses if u.operation is mm] or \
                 len(list(cast.results[0].uses)) != 1:
             continue  # the cast must feed only this matmul (safe to rewrite)
+
+        # Verification alone does not prove SSA dominance or safe operation motion.
+        # Refuse the whole match before changing its operations or source provenance.
+        hoists = _plan_producer_hoists_before(scale, cast)
+        if hoists is None or not _available_before(w_i8, cast):
+            continue
 
         w_t = rhs.type                            # f32 weight type the matmul expects
         w_rank = len(w_t.get_shape())
@@ -116,6 +187,13 @@ def _fuse(module: ModuleOp) -> None:
             deq.attributes["prov.quant_inner_w"] = _wk
         if _sk is not None:
             deq.attributes["prov.quant_inner_s"] = _sk
+        # `scale`'s producer (e.g. a view/collapse_shape reshaping [N,1] -> [N]) was only
+        # positioned after `mm` because its sole consumer used to be the post-matmul `mul`;
+        # now that `deq` (which needs `scale`) is inserted before `cast`/`mm`, that producer
+        # must be hoisted too, or the emitted IR uses `scale` before it's defined.
+        for producer in hoists:
+            producer.detach()
+            Rewriter.insert_op(producer, InsertPoint.before(cast))
         Rewriter.insert_op([zero, zp, deq], InsertPoint.before(cast))
         cast.results[0].replace_all_uses_with(deq.results[0])   # matmul now reads the dequant
         mul.results[0].replace_all_uses_with(mm.results[0])     # drop the post-matmul scale
