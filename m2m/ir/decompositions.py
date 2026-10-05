@@ -541,9 +541,10 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     elem = _element_type_from_meta(meta)
     result_elem = elem
     from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
-    # Python scalars participate in half arithmetic at opmath precision. Rounding
-    # a scalar (e.g. sqrt(hidden_size)) to bf16 before the operation is observable.
-    if len(operands) == 1 and isinstance(elem, (BFloat16Type, Float16Type)):
+    # Framework mul/div keep Python scalar coefficients at opmath precision.
+    # Add/sub instead round the scalar to the tensor dtype before arithmetic.
+    if (len(operands) == 1 and op_name in {"mul", "div"}
+            and isinstance(elem, (BFloat16Type, Float16Type))):
         elem = f32
     result_type = TensorType(elem, out_shape)
 
