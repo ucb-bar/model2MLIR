@@ -57,6 +57,21 @@ verifies this receipt before reporting capture success. The earlier offline
 capture predates this receipt and is not retroactively certified by it; file
 integrity still does not prove source closure or numerical execution.
 
+For a fresh stagewise PT2E capture, `m2m.capture.source_closure.make_source_snapshot`
+can record explicit, disjoint owners for the M2M package, loader, model code and
+checkpoint files, and runtime support files. Pass that snapshot as
+`source_snapshot=` to `quantize_stagewise_pt2e_session`; the stagewise writer
+rechecks exact membership, hashes, and links before and after conversion, and
+binds `source-snapshot.json` to the stage receipts. An independent process can
+recheck current inputs with
+`python m2m/capture/source_closure.py <new-bundle> --bundle`. Keep the output
+outside all owned roots and prevent Python from writing bytecode into them.
+This is an input snapshot, not a capture-process source closure:
+only a separately sealed, network-disabled execution and replay verifier can
+establish that every runtime read came from those owners. The binding's
+`source_closure_verified` remains false, and old diagnostic bundles cannot be
+upgraded retroactively.
+
 PT2E models may store a weight as `i8` while dequantizing it to `bf16` before a
 floating contraction. Such a contraction is **not** an `i8 x i8 -> i32` operation.
 The frontend preserves its typed `quant_ext.dequantize_per_tensor` operations

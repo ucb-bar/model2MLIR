@@ -49,6 +49,10 @@ from m2m.capture.torchao_pipeline import (
     apply_quantization,
     verify_quant_accuracy,
 )
+from m2m.capture.stagewise_pt2e import (
+    StagewisePT2ESession,
+    quantize_stagewise_pt2e_session,
+)
 
 __all__ = [
     "AccuracyReport",
@@ -68,6 +72,7 @@ __all__ = [
     "GuardObservation",
     "QuantizationConfig",
     "RangeConstraint",
+    "StagewisePT2ESession",
     "apply_quantization",
     "bridge_fx_graph",
     "bridge_fx_graph_or_raise",
@@ -80,6 +85,7 @@ __all__ = [
     "external_runtime_session",
     "make_external_runtime_session",
     "module_to_text",
+    "quantize_stagewise_pt2e_session",
     "torch_mlir_available",
     "validate_export",
     "verify_quant_accuracy",

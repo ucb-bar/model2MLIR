@@ -9,7 +9,7 @@ import sympy
 import torch
 
 from m2m.capture.bundle import _lifted_constants, _opaque_call_count, _tensor_abi, write_bundle
-from m2m.capture.provenance import capture_receipt
+from m2m.capture.provenance import _package_python_sources, capture_receipt
 from m2m.capture.torch_export import _serialize_range_constraints
 
 
@@ -36,8 +36,11 @@ def test_bundle_receipt_binds_source_tool_framework_and_materialized_abi(tmp_pat
     assert receipt["tool"]["commit"]
     assert receipt["tool"]["source_sha256"]["m2m/ir/decompositions.py"]
     assert receipt["tool"]["source_inventory_status"] == "complete"
+    assert receipt["tool"]["source_inventory_scope"] == "m2m_package_python_sources_only"
     assert not receipt["tool"]["unavailable_sources"]
     assert all(name.startswith("m2m/") for name in receipt["tool"]["source_sha256"])
+    assert "m2m/capture/stagewise_pt2e.py" in receipt["tool"]["source_sha256"]
+    assert "m2m/capture/external_runtime.py" in receipt["tool"]["source_sha256"]
     assert receipt["framework"]["torch"] == torch.__version__
     assert receipt["lifted_constants"] == {}
     assert receipt["materialized_abi"] == {"complete": True, "inputs": 1, "lifted_constants": []}
@@ -55,6 +58,27 @@ def test_bundle_receipt_binds_source_tool_framework_and_materialized_abi(tmp_pat
     manifest_path.write_text(json.dumps(manifest))
     np.savez(bundle / "extra.npz", c_lifted_tensor_0=np.array(1.0, dtype=np.float32))
     assert capture_receipt(bundle)["lifted_constants"]["c_lifted_tensor_0"]["shape"] == []
+
+
+def test_python_source_inventory_finds_new_nested_modules_and_flags_links(tmp_path):
+    package = tmp_path / "m2m"
+    nested = package / "capture"
+    nested.mkdir(parents=True)
+    (package / "__init__.py").write_text("# package\n")
+    (nested / "future_stage.py").write_text("VALUE = 1\n")
+    cache = nested / "__pycache__"
+    cache.mkdir()
+    (cache / "generated.py").write_text("VALUE = 0\n")
+
+    hashes, unavailable = _package_python_sources(tmp_path)
+    assert set(hashes) == {"m2m/__init__.py", "m2m/capture/future_stage.py"}
+    assert hashes["m2m/capture/future_stage.py"] == hashlib.sha256(b"VALUE = 1\n").hexdigest()
+    assert unavailable == []
+
+    (nested / "linked.py").symlink_to(nested / "future_stage.py")
+    hashes, unavailable = _package_python_sources(tmp_path)
+    assert "m2m/capture/linked.py" not in hashes
+    assert unavailable == ["m2m/capture/linked.py"]
 
 
 def test_integer_reference_is_bound_to_capture_receipt(tmp_path):

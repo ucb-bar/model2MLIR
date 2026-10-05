@@ -8,9 +8,10 @@ type, plus quantized subclass inner tensors, exactly as the consistent-capture w
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -648,6 +649,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
 
 def write_multi_program_bundle(programs: list[dict], root_session: dict, out: str | Path, *,
                                quant=None, quantization_preapplied: bool = False,
+                               quantization_by_program: Mapping[str, Any] | None = None,
                                capture_trace: bool = False, source_path: str | Path | None = None,
                                metadata: dict | None = None) -> dict:
     """Write several fixed-shape compiled programs plus an ABI-resolved root session contract.
@@ -655,7 +657,8 @@ def write_multi_program_bundle(programs: list[dict], root_session: dict, out: st
     Loader-authored bindings use stable tuple ``input_index`` values.  Each stage conversion can
     prepend hundreds of weight arguments, so this function resolves those indices through that
     stage's emitted manifest and records the numeric ``input_arg`` consumed by Merlin.  Cross-stage
-    output ordinals are already stable exported ABI values.
+    output ordinals are already stable exported ABI values. ``quantization_by_program`` overrides
+    the global policy by stage name; omitted stages remain unquantized.
     """
     import yaml
     from m2m.capture.bundle_integrity import _bundle_files, write_bundle_integrity
@@ -672,15 +675,23 @@ def write_multi_program_bundle(programs: list[dict], root_session: dict, out: st
         raise ValueError("multi-program capture needs plain single-component program names")
     if names != [str(value) for value in root_session.get("stages", ())]:
         raise ValueError("program order must exactly equal the root session stages")
+    if quantization_by_program is not None:
+        if (not isinstance(quantization_by_program, Mapping)
+                or any(name not in names for name in quantization_by_program)):
+            raise ValueError("per-program quantization names must belong to the session")
     stage_records: dict[str, dict] = {}
     summaries = []
     for program in programs:
         name = str(program["name"])
         stage_out = out / "stages" / name
+        stage_quant = (quant if quantization_by_program is None
+                       else quantization_by_program.get(name))
+        stage_preapplied = (quantization_preapplied if quantization_by_program is None
+                            else quantization_preapplied and stage_quant is not None)
         summary = write_bundle(
-            program["model"], tuple(program["inputs"]), stage_out, quant=quant,
+            program["model"], tuple(program["inputs"]), stage_out, quant=stage_quant,
             capture_regions=bool(program.get("capture_regions", False)),
-            session=program.get("session"), quantization_preapplied=quantization_preapplied,
+            session=program.get("session"), quantization_preapplied=stage_preapplied,
             capture_trace=capture_trace, source_path=source_path,
             metadata={**(metadata or {}), **program.get("metadata", {})},
             original_frontend_snapshot=program.get("original_frontend_snapshot"))
@@ -733,3 +744,281 @@ def write_multi_program_bundle(programs: list[dict], root_session: dict, out: st
     return {"out": str(out), "session_kind": contract["kind"], "paper_ready": contract["paper_ready"],
             "n_programs": len(programs), "programs": summaries,
             "n_bindings": len(bindings), "bundle_integrity": str(integrity_path)}
+
+
+def _shared_tensor_inventory(model: nn.Module) -> list[dict]:
+    """Hash the actual shared tensor bytes without serializing another model copy."""
+    inventory = []
+    for name, value in sorted(model.state_dict().items()):
+        if not isinstance(value, torch.Tensor) or value.layout != torch.strided:
+            raise ValueError(f"shared tensor {name!r} cannot be byte-bound")
+        try:
+            tensor = value.detach().cpu().contiguous()
+            raw = memoryview(tensor.reshape(-1).view(torch.uint8).numpy()).cast("B")
+            digest = hashlib.sha256(raw).hexdigest()
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError(f"shared tensor {name!r} cannot be byte-bound") from exc
+        inventory.append({"name": name, "shape": list(value.shape),
+                          "dtype": str(value.dtype), "sha256": digest})
+    if not inventory:
+        raise ValueError("quantized multi-program capture has no shared model tensors")
+    return inventory
+
+
+def _program_output_tensors(program) -> tuple[torch.Tensor, ...]:
+    from torch.utils._pytree import tree_flatten
+
+    with torch.no_grad():
+        result = program.module(*program.inputs)
+    values, _ = tree_flatten(result)
+    if not values or any(not isinstance(value, torch.Tensor) for value in values):
+        raise ValueError(f"program {program.name!r} has a non-tensor output ABI")
+    return tuple(values)
+
+
+def write_quantized_multi_program_bundle(
+    shared_model: nn.Module,
+    transform_shared: Callable[[nn.Module], nn.Module],
+    make_session: Callable[[nn.Module], Any],
+    out: str | Path,
+    *,
+    shared_programs: Sequence[str],
+    quantization: dict,
+    quant=None,
+    capture_trace: bool = True,
+    source_path: str | Path | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Capture a quantized v2 session derived from one transformed shared model.
+
+    ``transform_shared`` runs exactly once. ``make_session`` must construct every
+    weight-sharing stage around its returned model. The caller owns the numeric
+    transformation; this API verifies identity, typed state routes, stable shared
+    weight bytes, and the same-conversion stage receipts before publishing the
+    root binding. It never applies quantization independently to stage wrappers.
+    """
+    import yaml
+
+    from m2m.capture.bundle_integrity import write_bundle_integrity
+    from m2m.capture.external_runtime import ExternalRuntimeSession
+
+    if not isinstance(shared_model, nn.Module) or not callable(transform_shared) or not callable(make_session):
+        raise TypeError("quantized session requires a shared nn.Module and two callables")
+    if not isinstance(quantization, dict) or not quantization:
+        raise ValueError("quantized session requires an explicit quantization policy record")
+    if quant is None:
+        raise ValueError("quantized session requires the selected M2M quantization config")
+    selected = transform_shared(shared_model)
+    if not isinstance(selected, nn.Module):
+        raise TypeError("shared transform must return an nn.Module")
+    session = make_session(selected)
+    if not isinstance(session, ExternalRuntimeSession) or session.version != 2:
+        raise ValueError("quantized capture requires an explicit version-2 session")
+    by_name = {program.name: program for program in session.programs}
+    shared_names = tuple(shared_programs)
+    if not shared_names or len(set(shared_names)) != len(shared_names) or any(name not in by_name for name in shared_names):
+        raise ValueError("shared_programs must name distinct captured programs")
+    for name in shared_names:
+        if not any(module is selected for module in by_name[name].module.modules()):
+            raise ValueError(f"program {name!r} does not reference the transformed shared model")
+
+    outputs = {program.name: _program_output_tensors(program) for program in session.programs}
+    program_abis = {
+        program.name: {
+            "inputs": [{"dtype": str(value.dtype), "shape": list(value.shape)}
+                       for value in program.inputs],
+            "outputs": [{"dtype": str(value.dtype), "shape": list(value.shape)}
+                        for value in outputs[program.name]],
+        }
+        for program in session.programs
+    }
+    route_abis = []
+    for route in session.routes:
+        source = outputs[route.source.program]
+        if route.source.output_index >= len(source):
+            raise ValueError(f"route {route.name!r} selects an absent output")
+        value = source[route.source.output_index]
+        target = by_name[route.target.program].inputs[route.target.input_index]
+        if value.dtype != target.dtype or tuple(value.shape) != tuple(target.shape):
+            raise ValueError(f"route {route.name!r} has a post-quantization dtype/shape mismatch")
+        route_abis.append({"name": route.name,
+                           "from": {"program": route.source.program, "output_index": route.source.output_index},
+                           "to": {"program": route.target.program, "input_index": route.target.input_index},
+                           "dtype": str(value.dtype), "shape": list(value.shape)})
+    tensors = _shared_tensor_inventory(selected)
+    out = Path(out)
+    summary = write_multi_program_bundle(
+        session.bundle_programs(), dict(session.metadata), out,
+        quantization_by_program={name: quant for name in shared_names},
+        quantization_preapplied=True, capture_trace=capture_trace,
+        source_path=source_path, metadata=metadata)
+    if _shared_tensor_inventory(selected) != tensors:
+        raise ValueError("shared model tensors changed during multi-program conversion")
+
+    stage_receipts = {}
+    for name in by_name:
+        stage = out / "stages" / name
+        saved = json.loads((stage / "capture_receipt.json").read_text(encoding="utf-8"))
+        if saved.get("materialized_abi", {}).get("complete") is not True:
+            raise ValueError(f"program {name!r} lacks a complete materialized ABI")
+        stage_receipts[name] = hashlib.sha256((stage / "capture_receipt.json").read_bytes()).hexdigest()
+    binding = {
+        "schema": "m2m.quantized-multi-program-binding.v1",
+        "scope": "one_transformed_shared_model_with_stage_receipts",
+        "source_closure_verified": False,
+        "quantization": quantization,
+        "shared_programs": list(shared_names),
+        "shared_tensors": tensors,
+        "program_abis": program_abis,
+        "routes": route_abis,
+        "stage_receipts": stage_receipts,
+    }
+    binding_path = out / "quantized-session-binding.json"
+    binding_path.write_text(json.dumps(binding, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    contract_path = out / "session_contract.yaml"
+    contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+    contract["quantized_session_binding"] = {
+        "path": binding_path.name,
+        "sha256": hashlib.sha256(binding_path.read_bytes()).hexdigest(),
+    }
+    contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+    summary["quantized_session_binding"] = str(binding_path)
+    summary["bundle_integrity"] = str(write_bundle_integrity(out))
+    return summary
+
+
+def write_stagewise_pt2e_multi_program_bundle(
+    converted: "StagewisePT2ESession",
+    out: str | Path,
+    *,
+    quantization: dict | None = None,
+    capture_trace: bool = True,
+    source_path: str | Path | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Write independently converted PT2E stages with verified source-weight binding.
+
+    Unlike :func:`write_quantized_multi_program_bundle`, the stage GraphModules
+    do not contain one transformed Python module.  The binding describes one
+    source model, byte-verified frozen encodings, and separate stage storage.
+    No source-closure or physical weight aliasing claim is made.
+    """
+    import yaml
+    from dataclasses import asdict
+
+    from m2m.capture.bundle_integrity import write_bundle_integrity
+    from m2m.capture.stagewise_pt2e import (
+        StagewisePT2ESession, _frozen_weights, _stage_abis, _tensor_sha256,
+    )
+    from m2m.capture.source_closure import (
+        verify_source_snapshot, verify_stagewise_source_snapshot_bundle,
+    )
+
+    if not isinstance(converted, StagewisePT2ESession):
+        raise TypeError("stage-wise writer needs a verified PT2E session")
+    snapshot = converted.source_snapshot
+    if snapshot is not None:
+        verify_source_snapshot(snapshot)
+        package = next(owner["root"] for owner in snapshot["owners"]
+                       if owner["role"] == "m2m_package")
+        if Path(package) != Path(__file__).resolve().parents[1]:
+            raise ValueError("source snapshot M2M owner is not the executing package")
+        loader = next(owner["root"] for owner in snapshot["owners"]
+                      if owner["role"] == "loader")
+        if source_path is not None and Path(source_path).absolute() != Path(loader):
+            raise ValueError("stage-wise source path differs from snapshot loader")
+        source_path = loader
+        output = Path(out).absolute()
+        if ".." in output.parts or any(part.is_symlink() for part in (output, *output.parents)):
+            raise ValueError("stage-wise output traverses a parent or symlink")
+        if any(output == Path(owner["root"]) or output.is_relative_to(Path(owner["root"]))
+               or Path(owner["root"]).is_relative_to(output)
+               for owner in snapshot["owners"]):
+            raise ValueError("stage-wise output overlaps a source snapshot owner")
+    selected_policy = asdict(converted.quant)
+    if quantization is not None and quantization != selected_policy:
+        raise ValueError("stage-wise quantization metadata differs from the selected PT2E policy")
+    if tuple(_shared_tensor_inventory(converted.shared_model)) != converted.source_inventory:
+        raise ValueError("stage-wise source weights changed after PT2E")
+    if converted.quant.scheme != "int8_static_act_int8_weight":
+        raise ValueError("stage-wise writer requires static W8A8 PT2E")
+    current_abis, current_routes = _stage_abis(converted.session)
+    if current_abis != converted.program_abis or tuple(current_routes) != converted.routes:
+        raise ValueError("stage-wise ABI or routes changed after PT2E")
+    by_name = {program.name: program for program in converted.session.programs}
+
+    def verify_weights() -> None:
+        for record in converted.frozen_weights:
+            module = by_name[record["stage"]].module
+            frozen = {name: (tensor, scale, zero) for _, name, tensor, scale, zero, _ in
+                      _frozen_weights(record["stage"], module)}
+            values = frozen.get(record["frozen_buffer"])
+            if values is None or tuple(_tensor_sha256(value) for value in values) != (
+                    record["frozen_sha256"], record["scale_sha256"],
+                    record["zero_point_sha256"]):
+                raise ValueError("stage-wise frozen weight encoding changed after PT2E")
+            source = converted.shared_model.get_parameter(record["source_parameter"])
+            if _tensor_sha256(source) != record["source_sha256"]:
+                raise ValueError("stage-wise source parameter changed after PT2E")
+
+    verify_weights()
+    out = Path(out)
+    summary = write_multi_program_bundle(
+        converted.session.bundle_programs(), dict(converted.session.metadata), out,
+        quantization_by_program={name: converted.quant for name in converted.shared_programs},
+        quantization_preapplied=True,
+        capture_trace=capture_trace, source_path=source_path, metadata=metadata)
+    if tuple(_shared_tensor_inventory(converted.shared_model)) != converted.source_inventory:
+        raise ValueError("stage-wise source weights changed during conversion")
+    verify_weights()
+    after_abis, after_routes = _stage_abis(converted.session)
+    if after_abis != converted.program_abis or tuple(after_routes) != converted.routes:
+        raise ValueError("stage-wise ABI or routes changed during conversion")
+    if snapshot is not None:
+        verify_source_snapshot(snapshot)
+    stage_receipts = {}
+    for name in by_name:
+        receipt = (out / "stages" / name / "capture_receipt.json").read_bytes()
+        if json.loads(receipt).get("materialized_abi", {}).get("complete") is not True:
+            raise ValueError(f"stage {name!r} lacks a complete materialized ABI")
+        stage_receipts[name] = hashlib.sha256(receipt).hexdigest()
+    binding = {
+        "schema": "m2m.stagewise-pt2e-binding.v1",
+        "scope": "one_source_model_verified_semantic_weights_separate_stage_storage",
+        "source_closure_verified": False,
+        "physical_weight_aliasing": False,
+        "quantization": selected_policy,
+        "shared_programs": list(converted.shared_programs),
+        "source_tensors": converted.source_inventory,
+        "frozen_weights": converted.frozen_weights,
+        "calibration_counts": converted.calibration_counts,
+        "program_abis": converted.program_abis,
+        "routes": converted.routes,
+        "stage_receipts": stage_receipts,
+    }
+    if snapshot is not None:
+        snapshot_path = out / "source-snapshot.json"
+        snapshot_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+                                 encoding="utf-8")
+        binding["source_snapshot"] = {
+            "path": snapshot_path.name,
+            "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
+            "verified_before_and_after_capture": True,
+            "source_closure_verified": False,
+        }
+    binding_path = out / "quantized-session-binding.json"
+    binding_path.write_text(json.dumps(binding, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    contract_path = out / "session_contract.yaml"
+    contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+    contract["quantized_session_binding"] = {
+        "path": binding_path.name,
+        "sha256": hashlib.sha256(binding_path.read_bytes()).hexdigest(),
+    }
+    contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+    summary["quantized_session_binding"] = str(binding_path)
+    if snapshot is not None:
+        summary["source_snapshot"] = str(snapshot_path)
+    summary["bundle_integrity"] = str(write_bundle_integrity(out))
+    if snapshot is not None:
+        verify_stagewise_source_snapshot_bundle(out)
+    return summary
