@@ -1698,6 +1698,17 @@ def build_softmax_body(x, *, dim):
     if in_shape is None or any(d < 0 for d in in_shape):
         return None
     elem = _t_elem(x)
+    # The framework uses opmath f32 for half softmax, including its sum.
+    # A bf16 sum of 1024 unit exponentials otherwise stalls at 256.
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        wide = _cast_tensor(x, in_shape, f32)
+        built = build_softmax_body(wide[1], dim=dim)
+        if built is None:
+            return None
+        narrow = _cast_tensor(built[1], in_shape, elem)
+        return [*wide[0], *built[0], *narrow[0]], narrow[1]
     dim = int(dim) % len(in_shape)
     keep = list(in_shape)
     keep[dim] = 1
