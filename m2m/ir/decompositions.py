@@ -2734,6 +2734,18 @@ def decompose_convolution(operands, meta, node_name):
 
     ops: list[Operation] = []
     cur_in, cur_w = in_v, w_v
+    # Framework half convolution accumulates and adds bias in f32, then rounds
+    # once. Narrowing the contraction before adding bias introduces double rounding.
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+    result_elem = elem
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        cast_in, cur_in = _cast_tensor(cur_in, in_shape, f32)
+        cast_w, cur_w = _cast_tensor(cur_w, w_shape, f32)
+        ops += cast_in + cast_w
+        if bias_v is not None:
+            cast_bias, bias_v = _cast_tensor(bias_v, _shape_of(bias_v), f32)
+            ops += cast_bias
+        elem = f32
 
     # 1-D -> degenerate 2-D: (N,C,L) -> (N,C,1,L), (F,C,k) -> (F,C,1,k).
     if rank == 3:
@@ -2815,6 +2827,10 @@ def decompose_convolution(operands, meta, node_name):
                                   pattern_hint="convolution")
         ops += back[0]
         res = back[1]
+
+    if elem != result_elem:
+        narrow, res = _cast_tensor(res, _static_shape(val.shape), result_elem)
+        ops += narrow
 
     rid = _next_region_id("conv")
     for op in ops:
