@@ -31,7 +31,9 @@ class QuantizationConfig:
             for modules not matched by ``per_module``.
         calibration_samples: Number of calibration samples.
         group_size: Group size for grouped quantization.
-        extra_args: Additional scheme-specific arguments.
+        extra_args: Additional scheme-specific arguments. Static W8A8 accepts
+            ``weight_granularity="per_channel"`` (default) or ``"per_tensor"``.
+            This changes quantization numerics and requires fresh calibration.
         per_module: Optional mixed-precision map ``{name_substring_or_regex: scheme}``.
             Each rule quantizes modules whose fully-qualified name matches the key with
             the given scheme -- so one network can mix fp8 + int8 (and leave the rest in
@@ -155,7 +157,7 @@ def _apply_pt2e_static_w8a8(
         )
 
     try:
-        from torchao.quantization.pt2e import HistogramObserver, PerChannelMinMaxObserver
+        from torchao.quantization.pt2e import HistogramObserver, MinMaxObserver, PerChannelMinMaxObserver
         from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
         from torchao.quantization.pt2e.quantizer import (
             QuantizationAnnotation,
@@ -164,6 +166,10 @@ def _apply_pt2e_static_w8a8(
         )
     except ImportError as exc:
         raise RuntimeError("TorchAO PT2E quantization is unavailable") from exc
+
+    weight_granularity = config.extra_args.get("weight_granularity", "per_channel")
+    if weight_granularity not in ("per_channel", "per_tensor"):
+        raise ValueError("static W8A8 weight_granularity must be per_channel or per_tensor")
 
     class _PortableW8A8Quantizer(Quantizer):
         def __init__(self, fold_candidates: list | None = None) -> None:
@@ -175,13 +181,15 @@ def _apply_pt2e_static_w8a8(
                 quant_max=127,
                 qscheme=torch.per_tensor_symmetric,
             )
+            per_channel = weight_granularity == "per_channel"
+            weight_observer = PerChannelMinMaxObserver if per_channel else MinMaxObserver
             self.weight = QuantizationSpec(
                 dtype=torch.int8,
-                observer_or_fake_quant_ctr=PerChannelMinMaxObserver.with_args(eps=eps),
+                observer_or_fake_quant_ctr=weight_observer.with_args(eps=eps),
                 quant_min=-127,
                 quant_max=127,
-                qscheme=torch.per_channel_symmetric,
-                ch_axis=0,
+                qscheme=torch.per_channel_symmetric if per_channel else torch.per_tensor_symmetric,
+                ch_axis=0 if per_channel else None,
             )
             self.annotated = 0
             self.fold_candidates = fold_candidates or []
@@ -271,6 +279,7 @@ def _apply_pt2e_static_w8a8(
         pass
     quantized._m2m_quantization_stats = {  # type: ignore[attr-defined]
         "scheme": config.scheme,
+        "weight_granularity": weight_granularity,
         "annotated_contractions": quantizer.annotated,
         "calibration_samples": calibrated,
         "pruned_dead_state_tensors": pruned_state,

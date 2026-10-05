@@ -514,3 +514,48 @@ def test_an_embedding_is_not_quantized_without_an_explicit_rule() -> None:
     model = _EmbedAndNorm().eval()
     quantized = apply_quantization(model, QuantizationConfig(scheme="int8_weight_only"))
     assert quantized.embed_tokens.weight.dtype is torch.float32
+
+
+@pytest.mark.parametrize('granularity', ['per_tensor', 'per_channel'])
+def test_static_weight_granularity_controls_captured_qparams(granularity):
+    from m2m.capture.torchao_pipeline import apply_quantization
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(3, 4, 3)
+            self.fc = nn.Linear(4, 2)
+
+        def forward(self, x):
+            return self.fc(self.conv(x).relu().mean((2, 3)))
+
+    torch.manual_seed(7)
+    inputs = (torch.randn(1, 3, 8, 8),)
+    config = QuantizationConfig('int8_static_act_int8_weight', calibration_samples=1,
+                                extra_args={'weight_granularity': granularity})
+    model = apply_quantization(Net().eval(), config, example_inputs=inputs)
+    assert model._m2m_quantization_stats['weight_granularity'] == granularity
+    dq_tensor = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+    dq_channel = torch.ops.quantized_decomposed.dequantize_per_channel.default
+    contracts = [n for n in model.graph.nodes
+                 if n.target in (torch.ops.aten.conv2d.default, torch.ops.aten.linear.default)]
+    assert len(contracts) == 2
+    for node in contracts:
+        assert node.args[1].target == (dq_channel if granularity == 'per_channel' else dq_tensor)
+    reference = run_pt2e_integer_reference(model, inputs, expected_contractions=2)
+    assert reference.output.shape == (1, 2)
+    assert torch.isfinite(reference.output).all()
+    converted = m2m.convert(model, inputs, backend='fx_importer', decompose=False,
+                            quantization=config, quantization_preapplied=True)
+    assert converted.ok, converted.diagnostics
+    assert '0 opaque' in ' '.join(converted.diagnostics)
+
+
+def test_static_weight_granularity_refuses_unknown_policy():
+    from m2m.capture.torchao_pipeline import apply_quantization
+    with pytest.raises(ValueError, match='weight_granularity'):
+        apply_quantization(nn.Linear(4, 2).eval(),
+                           QuantizationConfig('int8_static_act_int8_weight',
+                                              extra_args={'weight_granularity': 'unknown'}),
+                           example_inputs=(torch.randn(1, 4),))
