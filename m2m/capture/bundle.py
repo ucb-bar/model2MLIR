@@ -605,7 +605,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
 
     extra: dict = {}
     for name, t in runtime_mdl.named_buffers():
-        extra["buf::" + name] = t.detach().float().cpu().numpy()
+        extra["buf::" + name] = _numpy_safe(t)
     for pname, p in runtime_mdl.named_parameters():
         if type(p).__name__ not in ("Parameter", "Tensor") or hasattr(p, "__tensor_flatten__"):
             _flatten_subclass(p, pname, extra)

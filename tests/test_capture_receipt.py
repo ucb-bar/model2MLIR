@@ -180,3 +180,26 @@ def test_static_pt2e_bundle_golden_is_actual_quantized_model(tmp_path, monkeypat
     write_bundle(model, inputs, out, capture_regions=False, capture_trace=True,
                  quant=QuantizationConfig(scheme="int8_static_act_int8_weight"))
     np.testing.assert_array_equal(np.load(out / "golden.npy"), expected_golden)
+
+
+def test_bundle_extra_preserves_registered_buffer_dtypes_and_values(tmp_path):
+    class Buffered(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("large_ids", torch.tensor([2**40 + 1], dtype=torch.int64))
+            self.register_buffer("quantized", torch.tensor([-128, 127], dtype=torch.int8))
+            self.register_buffer("mask", torch.tensor([True, False]))
+            self.register_buffer("wide", torch.tensor([1.0 + 2**-40], dtype=torch.float64))
+            self.register_buffer("bf16", torch.tensor([1.25], dtype=torch.bfloat16))
+
+        def forward(self, x):
+            return x + self.quantized.float().sum()
+
+    model = Buffered().eval()
+    write_bundle(model, (torch.ones(2),), tmp_path, capture_regions=False)
+    with np.load(tmp_path / "extra.npz") as extra:
+        for name, tensor in model.named_buffers():
+            expected = tensor.float().numpy() if tensor.dtype == torch.bfloat16 else tensor.numpy()
+            actual = extra["buf::" + name]
+            assert actual.dtype == expected.dtype
+            np.testing.assert_array_equal(actual, expected)
