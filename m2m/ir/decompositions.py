@@ -1295,8 +1295,23 @@ def decompose_scaled_dot_product_attention(operands, meta, node_name):
     L, E, S = sq[-2], sq[-1], sk[-2]
     scores_shape = [*sq[:-1], S]                       # [*batch, L, S]
     fake = lambda sh: {"val": type("V", (), {"shape": sh, "dtype": None})()}  # noqa: E731
-    ops, scores = _batched_matmul(q, k, batch_rank=batch_rank, transpose_b=True,
-                                  out_shape=scores_shape, elem=elem)
+    # Half SDPA keeps scores, probabilities and both contractions in f32;
+    # narrowing intermediate scores/probabilities changes fused attention semantics.
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+    result_elem = elem
+    ops = []
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        qops, q = _cast_tensor(q, sq, f32)
+        kops, k = _cast_tensor(k, sk, f32)
+        vops, v = _cast_tensor(v, sv, f32)
+        ops += qops + kops + vops
+        if mask is not None and isinstance(_t_elem(mask), (BFloat16Type, Float16Type)):
+            mops, mask = _cast_tensor(mask, _shape_of(mask), f32)
+            ops += mops
+        elem = f32
+    score_ops, scores = _batched_matmul(q, k, batch_rank=batch_rank, transpose_b=True,
+                                      out_shape=scores_shape, elem=elem)
+    ops += score_ops
     # scale by 1/sqrt(E)
     scale = 1.0 / math.sqrt(E)
     sc = _pointwise([scores], fake(scores_shape),
@@ -1336,6 +1351,9 @@ def decompose_scaled_dot_product_attention(operands, meta, node_name):
     o2, out = _batched_matmul(sm[1], v, batch_rank=batch_rank, transpose_b=False,
                               out_shape=out_shape, elem=elem)
     ops += o2
+    if elem != result_elem:
+        narrow, out = _cast_tensor(out, out_shape, result_elem)
+        ops += narrow
     rid = _next_region_id("attention")
     for op in ops:
         _attach_region_id(op, rid)

@@ -43,6 +43,11 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
     not; expanding it here covers both."""
     import math
 
+    output_dtype = query.dtype
+    if output_dtype in (torch.float16, torch.bfloat16):
+        query, key, value = query.float(), key.float(), value.float()
+        if attn_mask is not None and attn_mask.dtype != torch.bool:
+            attn_mask = attn_mask.float()
     L, S = query.size(-2), key.size(-2)
     scale_factor = (1.0 / math.sqrt(query.size(-1))) if scale is None else scale
     attn = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
@@ -55,7 +60,7 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
         else:
             attn = attn + attn_mask
     attn = torch.softmax(attn, dim=-1)
-    return torch.matmul(attn, value)
+    return torch.matmul(attn, value).to(output_dtype)
 
 
 def _dropout(input, p=0.5, train=False):
