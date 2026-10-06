@@ -222,13 +222,30 @@ def _cast_scalar_arg(x, dst):
     src = x.type
     if src == dst:
         return [], x
-    from xdsl.dialects.arith import ExtFOp, ExtSIOp, ExtUIOp, FPToSIOp, SIToFPOp, TruncFOp, TruncIOp
-    from xdsl.dialects.builtin import AnyFloat, IntegerType
+    from xdsl.dialects.arith import (
+        CmpfOp, CmpiOp, ConstantOp, ExtFOp, ExtSIOp, ExtUIOp,
+        FPToSIOp, SIToFPOp, TruncFOp, TruncIOp, UIToFPOp,
+    )
+    from xdsl.dialects.builtin import AnyFloat, FloatAttr, IntegerType
+
+    if isinstance(dst, IntegerType) and dst.width.data == 1:
+        # PyTorch truth conversion is nonzero, not truncation to the low bit.
+        # Unordered comparison keeps NaN true while both signed zeros are false.
+        if isinstance(src, AnyFloat):
+            zero = ConstantOp(FloatAttr(0.0, src))
+            op = CmpfOp(x, zero.result, "une")
+        elif isinstance(src, IntegerType):
+            zero = ConstantOp.from_int_and_width(0, src)
+            op = CmpiOp(x, zero.result, "ne")
+        else:
+            return [], x
+        return [zero, op], op.results[0]
 
     if isinstance(src, AnyFloat) and isinstance(dst, AnyFloat):
         op = TruncFOp(x, dst) if dst.bitwidth < src.bitwidth else ExtFOp(x, dst)
     elif isinstance(src, IntegerType) and isinstance(dst, AnyFloat):
-        op = SIToFPOp(x, dst)
+        # i1 is a boolean: signed conversion would turn True into -1.
+        op = UIToFPOp(x, dst) if src.width.data == 1 else SIToFPOp(x, dst)
     elif isinstance(src, AnyFloat) and isinstance(dst, IntegerType):
         op = FPToSIOp(x, dst)
     elif isinstance(src, IntegerType) and isinstance(dst, IntegerType):
