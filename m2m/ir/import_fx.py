@@ -816,6 +816,28 @@ class FXImporter:
                             "input_node_id": inp.meta.get("_m2m_node_id"),
                         }
                     continue
+            if target_str == "aten.max_pool2d_with_indices.default":
+                # This decomposition emits only the value tensor. Torch export
+                # represents even value-only pooling as a tuple op followed by
+                # getitem(_, 0); its indices result may be omitted ONLY when
+                # that result is dead. A live getitem(_, 1), or a direct tuple
+                # consumer, must not silently become a value-only function.
+                for user in node.users:
+                    pool_getitem = (
+                        user.op == "call_function"
+                        and user.target is operator.getitem
+                        and len(user.args) == 2
+                        and not user.kwargs
+                        and user.args[0] is node
+                    )
+                    if pool_getitem and (user.args[1] == 0 or (user.args[1] == 1 and not user.users)):
+                        continue
+                    self.diagnostics.append(ImportDiagnostic(
+                        fx_node=node.name,
+                        level="error",
+                        message="live max_pool2d indices are unsupported by the value-only decomposition",
+                    ))
+                    break
             # P21: lower a torch.while_loop HOP to scf.for (loop-preserving capture). Additive — only
             # fires for while_loop nodes; on any failure falls through (no loop emitted) without affecting
             # the existing per-node path below.

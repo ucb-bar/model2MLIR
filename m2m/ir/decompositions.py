@@ -3602,13 +3602,13 @@ def _pair_arg(value, default):
 
 
 def decompose_max_pool2d(operands, meta, node_name):
-    """aten.max_pool2d.default -> padded windowed linalg.generic max reduction.
+    """aten.max_pool2d.default -> padded windowed linalg.generic ordered max reduction.
 
     Supports the static NCHW inference form, including stride/padding/dilation. ``ceil_mode`` is
     refused until its asymmetric high-edge extension is represented explicitly; emitting a floor
     pool for that case would be a silent semantic error.
     """
-    from xdsl.dialects.arith import ConstantOp, MaximumfOp
+    from xdsl.dialects.arith import CmpfOp, ConstantOp, OrIOp, SelectOp
     from xdsl.dialects.builtin import AffineMapAttr, FloatAttr, IntegerType
     from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
     from xdsl.dialects.tensor import InsertSliceOp, SplatOp
@@ -3679,9 +3679,17 @@ def decompose_max_pool2d(operands, meta, node_name):
     # value is never read: the body ignores its block argument.
     window = _make_empty(TensorType(elem, [kh, kw]))
     block = Block(arg_types=[elem, elem, elem])
-    maximum = MaximumfOp(block.args[0], block.args[2])
-    block.add_op(maximum)
-    block.add_op(YieldOp(maximum.results[0]))
+    # PyTorch keeps the FIRST equal maximum (including the sign of zero), but
+    # selects the LAST NaN, preserving that input's payload. IEEE maximumf
+    # chooses +0 for either zero order and cannot express those semantics.
+    # Keep the ordered window scan: the result is intentionally not an
+    # associative/reorderable max reduction.
+    is_nan = CmpfOp(block.args[0], block.args[0], "uno")
+    greater = CmpfOp(block.args[0], block.args[2], "ogt")
+    replace = OrIOp(is_nan.result, greater.result)
+    winner = SelectOp(replace.result, block.args[0], block.args[2])
+    block.add_ops([is_nan, greater, replace, winner])
+    block.add_op(YieldOp(winner.result))
     D = AffineExpr.dimension  # n,c,oh,ow,kh,kw
     pool = GenericOp(
         inputs=[source, window.results[0]], outputs=[init.results[0]], body=Region(block),
