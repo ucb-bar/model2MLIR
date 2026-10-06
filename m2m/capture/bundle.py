@@ -428,8 +428,8 @@ def _numpy_safe(x):
 
     `numpy` has no bfloat16 (nor any float8), so `.numpy()` on such a tensor raises
     `TypeError: Got unsupported ScalarType BFloat16`. Measured on smolvla, whose vision tower takes
-    bf16 inputs: the export succeeded, the goldens were written, and the bundle died on `inputs.npz` --
-    the one place here that lacked the conversion `golden.npy` and the buffer writes already do.
+    bf16 inputs: the export succeeded, the goldens were written, and the bundle died on `inputs.npz`.
+    This same conversion also preserves representable output dtypes in `golden.npy`.
 
     ⚠️ NOT a blanket `.float()`. An LLM's `input_ids` are int64, and casting those to float32 corrupts
     the token ids silently -- the input would still load, still have the right shape, and index a
@@ -590,7 +590,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         with torch.no_grad():
             g = runtime_mdl(*inputs)
     golden = g[0] if isinstance(g, (tuple, list)) else g
-    np.save(out / "golden.npy", golden.detach().float().cpu().numpy())
+    np.save(out / "golden.npy", _numpy_safe(golden))
 
     np.savez(out / "inputs.npz",
              **{f"in{i}": _numpy_safe(x) for i, x in enumerate(inputs)})

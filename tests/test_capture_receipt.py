@@ -7,8 +7,13 @@ from types import SimpleNamespace
 import numpy as np
 import sympy
 import torch
-
-from m2m.capture.bundle import _lifted_constants, _opaque_call_count, _tensor_abi, write_bundle
+from m2m.capture.bundle import (
+    _lifted_constants,
+    _numpy_safe,
+    _opaque_call_count,
+    _tensor_abi,
+    write_bundle,
+)
 from m2m.capture.provenance import _package_python_sources, capture_receipt
 from m2m.capture.torch_export import _serialize_range_constraints
 
@@ -20,6 +25,47 @@ class _Tiny(torch.nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+
+class _LiteralRange(torch.nn.Module):
+    def __init__(self, start, end):
+        super().__init__()
+        self.start = start
+        self.end = end
+
+    def forward(self, x):
+        return torch.arange(self.start, self.end, dtype=torch.int64, device=x.device)
+
+
+def test_bundle_preserves_exact_integer_golden_and_receipt(tmp_path):
+    ranges = (
+        (2**24 + 1, 2**24 + 6),
+        (-(2**63) + 9, -(2**63) + 14),
+        (2**63 - 14, 2**63 - 9),
+    )
+    for index, (start, end) in enumerate(ranges):
+        out = tmp_path / f"range-{index}"
+        write_bundle(_LiteralRange(start, end).eval(), (torch.ones(1),), out,
+                     capture_regions=False, capture_trace=True)
+        expected = torch.arange(start, end, dtype=torch.int64).numpy()
+        actual = np.load(out / "golden.npy", allow_pickle=False)
+        assert actual.dtype == np.dtype("int64")
+        np.testing.assert_array_equal(actual.view("uint64"), expected.view("uint64"))
+        assert capture_receipt(out)["artifacts"]["golden.npy"]["sha256"] == hashlib.sha256(
+            (out / "golden.npy").read_bytes()
+        ).hexdigest()
+
+
+def test_bundle_golden_numpy_storage_policy_leaves_representable_dtypes_exact():
+    f32 = torch.tensor([-0.0, 1.25], dtype=torch.float32)
+    i64 = torch.tensor([2**63 - 1, -(2**63)], dtype=torch.int64)
+    np.testing.assert_array_equal(_numpy_safe(f32).view("uint32"), f32.numpy().view("uint32"))
+    np.testing.assert_array_equal(_numpy_safe(i64).view("uint64"), i64.numpy().view("uint64"))
+    assert _numpy_safe(f32).dtype == np.dtype("float32")
+    assert _numpy_safe(i64).dtype == np.dtype("int64")
+    bf16 = torch.tensor([1.25, -0.0], dtype=torch.bfloat16)
+    assert _numpy_safe(bf16).dtype == np.dtype("float32")
+    np.testing.assert_array_equal(_numpy_safe(bf16), bf16.float().numpy())
 
 
 def test_bundle_receipt_binds_source_tool_framework_and_materialized_abi(tmp_path):
