@@ -181,6 +181,10 @@ def test_dynamic_or_nonfinite_channel_scales_cannot_qualify():
 
 def test_bf16_dequant_linear_requires_a_distinct_precision_contract():
     """BF16 Q/DQ rounds each operand before the contraction, unlike W8A8/i32."""
+    from types import SimpleNamespace
+
+    import pytest
+
     class Bf16QDQLinear(nn.Module):
         def __init__(self):
             super().__init__()
@@ -196,6 +200,10 @@ def test_bf16_dequant_linear_requires_a_distinct_precision_contract():
     qx = torch.tensor([[123, 117, -90, 31]], dtype=torch.int8)
     exported = torch.export.export(Bf16QDQLinear(), (qx,)).module()
     portable = exported(qx)
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+
+    reference = run_pt2e_integer_reference(exported, (qx,), expected_contractions=0)
+    torch.testing.assert_close(reference.output, portable, atol=0, rtol=0)
     integer_result = ((qx.int() @ exported.weight.int().T).float() * 0.0137 * 0.0193).to(torch.bfloat16)
     assert abs(float(portable.item()) - float(integer_result.item())) > 0.005
 
@@ -215,6 +223,12 @@ def test_bf16_dequant_linear_requires_a_distinct_precision_contract():
     assert "quant_ext.dequantize_per_tensor" in lowered.mlir_text
     assert "tensor<1x4xbf16>" in lowered.mlir_text
     assert 'prov.aten = "aten._int_mm.default"' not in lowered.mlir_text
+    dequant = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+    bf16_node = next(node for node in exported.graph.nodes
+                     if node.target == dequant and node.kwargs.get("out_dtype") == torch.bfloat16)
+    bf16_node.meta["tensor_meta"] = SimpleNamespace(dtype=torch.float32)
+    with pytest.raises(ValueError, match="dequantize output dtype disagrees with its declaration"):
+        run_pt2e_integer_reference(exported, (qx,), expected_contractions=0)
 
 
 def test_mixed_qdq_precision_records_integer_and_float_lanes():
@@ -239,6 +253,12 @@ def test_mixed_qdq_precision_records_integer_and_float_lanes():
     qx = torch.tensor([[123, 117, -90, 31]], dtype=torch.int8)
     exported = torch.export.export(MixedQDQ(), (qx,)).module()
     portable = exported(qx)
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+
+    reference = run_pt2e_integer_reference(exported, (qx,), expected_contractions=1)
+    assert reference.linear_count == 1
+    assert len(reference.partial_sum_evidence) == 1
+    torch.testing.assert_close(reference.output[1], portable[1], atol=0, rtol=0)
     rewritten, receipt = integerize_pt2e(exported, (qx,))
     assert receipt["quantized_contractions_seen"] == 2
     assert receipt["quantized_contractions_integerized"] == 1
@@ -249,6 +269,8 @@ def test_mixed_qdq_precision_records_integer_and_float_lanes():
     assert {row["decision"] for row in sites} == {"integerized_i32", "preserve_float_qdq"}
     assert next(row for row in sites if row["decision"] == "preserve_float_qdq")["source_dtype"] == "torch.bfloat16"
     actual = rewritten(qx)
+    torch.testing.assert_close(reference.output[0], actual[0], atol=0, rtol=0)
+    torch.testing.assert_close(reference.output[1], actual[1], atol=0, rtol=0)
     torch.testing.assert_close(actual[0], portable[0], atol=0, rtol=0)
     torch.testing.assert_close(actual[1], portable[1], atol=0, rtol=0)
 

@@ -6,10 +6,11 @@ i32 and apply the two scales after the reduction.  Those expressions are algebra
 equivalent over the reals but not bit-identical after a long floating-point network.
 
 This executor keeps every non-contraction operation in Torch and replaces only a
-Conv2d/Linear whose two operands are the corresponding PT2E dequantize operations.  It
-therefore provides a framework-side integer reference without consuming compiler IR,
-target code, or target output.  Unsupported layouts fail closed rather than silently
-falling back while claiming integer coverage.
+Conv2d/Linear whose two operands are float32 PT2E dequantize operations. Other
+dequantize precisions retain their source floating contraction and are not counted
+as integer work. It therefore provides a framework-side integer reference without
+consuming compiler IR, target code, or target output. Unsupported integer layouts
+fail closed rather than silently falling back while claiming integer coverage.
 """
 from __future__ import annotations
 
@@ -136,6 +137,22 @@ def run_pt2e_integer_reference(
         def value(self, item: Any) -> Any:
             return self.env[item] if isinstance(item, Node) else item
 
+        def dequant_precision(self, node: Any) -> Any:
+            """Check declared and executed Q/DQ precision, plus exported metadata if present."""
+            declared = node.kwargs.get("out_dtype", torch.float32) or torch.float32
+            observed = getattr(node.meta.get("tensor_meta") or node.meta.get("val"), "dtype", None)
+            value = self.value(node)
+            if (
+                not isinstance(value, torch.Tensor)
+                or (observed is not None and declared != observed)
+                or value.dtype != declared
+            ):
+                raise ValueError(
+                    "integer reference dequantize output dtype disagrees with its declaration: "
+                    f"declared={declared}, exported={observed}, executed={getattr(value, 'dtype', None)}"
+                )
+            return declared
+
         def qparams(self, node: Any, *, weight_axis: int | None) -> tuple[Any, Any, Any, int | None]:
             if not isinstance(node, Node) or node.op != "call_function" or node.target not in (
                 (dequant_tensor, dequant_channel) if weight_axis is not None else (dequant_tensor,)
@@ -221,6 +238,12 @@ def run_pt2e_integer_reference(
                 and operand.target in (dequant_tensor, dequant_channel)
                 for operand in node.args[:2]
             ):
+                return super().run_node(node)
+            # Integerization preserves non-f32 Q/DQ contractions in their
+            # source floating precision: dequantize first, then contract.
+            # Reassociating either BF16/FP16 operand into i32 changes rounding.
+            precisions = tuple(self.dequant_precision(operand) for operand in node.args[:2])
+            if any(dtype != torch.float32 for dtype in precisions):
                 return super().run_node(node)
 
             args, kwargs = self.fetch_args_kwargs_from_env(node)
