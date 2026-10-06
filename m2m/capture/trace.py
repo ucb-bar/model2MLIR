@@ -171,6 +171,7 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
     sig = getattr(exported, "graph_signature", None)
     input_specs = {getattr(s.arg, "name", None): s for s in getattr(sig, "input_specs", ())}
     records, edges = [], []
+    operator_schemas = {}
     for scope, module in _graph_modules(gm):
         graph_id = f"g:{stage}:{scope}"
         ids = {n: f"{graph_id}:n{i}" for i, n in enumerate(module.graph.nodes)}
@@ -218,6 +219,12 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
                 return _literal(arg)
 
             target = str(node.target)
+            schema = getattr(node.target, "_schema", None) if node.op == "call_function" else None
+            if schema is not None:
+                text = str(schema)
+                if target in operator_schemas and operator_schemas[target] != text:
+                    raise ValueError("frontend operator schema changed during snapshot")
+                operator_schemas[target] = text
             classification = ("aten" if target.startswith("aten.") else
                               "custom" if node.op == "call_function" else
                               "call" if node.op in {"call_method", "call_module"} else "structural")
@@ -234,6 +241,7 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
                             "origin_node_ids": [v for v in prior if v != node_id]})
     body = {"schema": "m2m.frontend_graph.v1", "stage": stage, "status": "complete",
             "graph_id": f"g:{stage}:root", "nodes": records, "edges": edges,
+            "operator_schemas": dict(sorted(operator_schemas.items())),
             "call_count": sum(n["op"] in {"call_function", "call_method", "call_module"}
                               for n in records),
             "counting_unit": "static_captured_call_sites",
@@ -1015,6 +1023,21 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
     if checked is None:
         return None
     producer, original, output = checked
+    from m2m.capture.view_trace import SourceStorageAliases
+
+    aliases = SourceStorageAliases(source)
+    if not aliases.valid or source.get("runtime_versions") != dest.get("runtime_versions"):
+        return None
+
+    def unmodified_input(identity: dict[str, Any], input_node: dict[str, Any]) -> bool:
+        if identity.get("graph_id") != input_node.get("graph_id"):
+            return False
+        state = aliases.last_writer(identity)
+        return (state is not None and
+                (state[1] is None or state[1]["ordinal"] <= input_node["ordinal"]))
+
+    if not unmodified_input(node, producer):
+        return None
     sources = {item["id"]: item for item in source["nodes"]}
     descendants: dict[str, set[str]] = {}
     for item in dest["nodes"]:
@@ -1026,7 +1049,8 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
         if upstream is None:
             return None
         parent, parent_value, parent_output = upstream
-        if parent_output != original or producer["id"] in bypassed:
+        if (parent_output != original or producer["id"] in bypassed
+                or not unmodified_input(producer, parent)):
             return None
         bypassed.add(producer["id"])
         producer, original = parent, parent_value
@@ -1056,7 +1080,8 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
             consumer = sources.get(consumer_id)
             next_link = _forward_identity_value(source, consumer) if consumer else None
             if (next_link is None or next_link[0]["id"] != value_node["id"]
-                    or next_link[1] != value or use.get("argument_path") != "args/0"):
+                    or next_link[1] != value or use.get("argument_path") != "args/0"
+                    or not unmodified_input(consumer, value_node)):
                 return None
             child = terminal_uses(consumer, next_link[2], visited)
             if child is None:
@@ -1310,7 +1335,13 @@ def _inlined_parameter_relations(source: dict[str, Any], dest: dict[str, Any],
 
 def _no_op_dtype_aliases(source: dict[str, Any], dest: dict[str, Any],
                          relations: list[dict[str, Any]], consumed: set[str]) -> list[dict[str, Any]]:
-    """Map a no-copy, same-dtype ``aten.to`` to its already mapped input value."""
+    """Map a no-copy, same-dtype ``aten.to`` to the current storage value."""
+    from m2m.capture.view_trace import SourceStorageAliases
+
+    aliases_of_source = SourceStorageAliases(source)
+    if (not aliases_of_source.valid
+            or source.get("runtime_versions") != dest.get("runtime_versions")):
+        return []
     src_nodes = {node["id"]: node for node in source["nodes"]}
     dst_nodes = {node["id"]: node for node in dest["nodes"]}
     mapped: dict[str, set[str]] = {}
@@ -1331,6 +1362,8 @@ def _no_op_dtype_aliases(source: dict[str, Any], dest: dict[str, Any],
             continue
         producer = src_nodes.get(args[0].get("node_id"))
         if producer is None or len(producer.get("results") or []) != 1 or len(node.get("results") or []) != 1:
+            continue
+        if producer.get("graph_id") != node.get("graph_id"):
             continue
         original = producer["results"][0]
         if (args[0].get("value_id") != original.get("id")
@@ -1354,7 +1387,13 @@ def _no_op_dtype_aliases(source: dict[str, Any], dest: dict[str, Any],
               or kwargs.get("copy", False) is not False
               or kwargs.get("memory_format") is not None):
             continue
-        candidates = [dst_nodes[identity] for identity in mapped.get(producer["id"], set())
+        state = aliases_of_source.last_writer(node)
+        if state is None:
+            continue
+        root, writer = state
+        updated_after_producer = writer is not None and writer["ordinal"] > producer["ordinal"]
+        current = writer if updated_after_producer else producer
+        candidates = [dst_nodes[identity] for identity in mapped.get(current["id"], set())
                       if identity in dst_nodes and specs(dst_nodes[identity]) == specs(producer)]
         if len(candidates) == 1 and all(
             edge.get("producer_value_id") == candidates[0]["results"][0]["id"]
@@ -1370,6 +1409,9 @@ def _no_op_dtype_aliases(source: dict[str, Any], dest: dict[str, Any],
             aliases.append({"source_ids": [node["id"]], "destination_ids": [candidates[0]["id"]],
                             "kind": "value_alias",
                             "proof": {"no_copy_same_dtype": True, "input_node_id": producer["id"],
+                                      "storage_root_node_id": root,
+                                      "last_writer_node_id": writer["id"] if writer else None,
+                                      "updated_after_input": updated_after_producer,
                                       "exact_typed_value": True}})
     return aliases
 
@@ -1385,6 +1427,9 @@ def _anchored_guard_relations(source: dict[str, Any], dest: dict[str, Any],
     """
     src_nodes = {node["id"]: node for node in source["nodes"]}
     dst_nodes = {node["id"]: node for node in dest["nodes"]}
+    from m2m.capture.view_trace import SourceStorageAliases
+
+    aliases = SourceStorageAliases(source)
     inferred = []
 
     def value_index(nodes: dict[str, Any], ref: dict[str, Any]) -> int | None:
@@ -1448,6 +1493,17 @@ def _anchored_guard_relations(source: dict[str, Any], dest: dict[str, Any],
         for node in source["nodes"]:
             if node["id"] in consumed or node["target"] not in _ANCHORED_TARGETS:
                 continue
+            identity = _forward_identity_value(source, node)
+            if identity is not None:
+                producer = identity[0]
+                state = aliases.last_writer(node)
+                if (not aliases.valid
+                        or source.get("runtime_versions") != dest.get("runtime_versions")
+                        or producer.get("graph_id") != node.get("graph_id")
+                        or state is None
+                        or (state[1] is not None
+                            and state[1]["ordinal"] > producer["ordinal"])):
+                    continue
             matches = []
             for other in dest["nodes"]:
                 if (other["id"] in {row["destination_ids"][0] for row in inferred}
@@ -1786,6 +1842,12 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
     consumed.update(identity for relation in selectors for identity in relation["source_ids"])
     unknown = [identity for identity in unknown if identity not in {
         target for relation in selectors for target in relation["destination_ids"]}]
+    from m2m.capture.view_trace import replayed_view_relations
+    views = replayed_view_relations(source, dest, relations, consumed)
+    relations.extend(views)
+    consumed.update(identity for relation in views for identity in relation["source_ids"])
+    unknown = [identity for identity in unknown if identity not in {
+        target for relation in views for target in relation["destination_ids"]}]
     dead = _dead_forward_value_relations(source, consumed)
     relations.extend(dead)
     consumed.update(origin for relation in dead for origin in relation["source_ids"])
