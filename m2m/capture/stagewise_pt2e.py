@@ -26,7 +26,8 @@ from m2m.capture.external_runtime import (
 from m2m.capture.torchao_pipeline import QuantizationConfig, apply_quantization
 
 
-_CONTRACTIONS = {torch.ops.aten.linear.default, torch.ops.aten.conv2d.default}
+_CONTRACTIONS = {torch.ops.aten.linear.default, torch.ops.aten.conv2d.default,
+                 torch.ops.aten.conv2d.padding}
 
 
 def _tensor_sha256(value: torch.Tensor) -> str:
@@ -92,7 +93,12 @@ def _verified_weight_record(stage: str, source: tuple[Any, str, torch.Tensor],
                             frozen: tuple[Any, str, torch.Tensor, torch.Tensor, torch.Tensor, int]) -> dict:
     source_op, source_name, parameter = source
     frozen_op, frozen_name, codes, scales, zero_points, axis = frozen
-    if source_op != frozen_op or axis != 0 or tuple(parameter.shape) != tuple(codes.shape):
+    # The portable pipeline normalizes string padding before PT2E; the weight
+    # parameter is unchanged. Record both overloads instead of losing this
+    # source contraction from the stage inventory or inventing a source alias.
+    normalized_source_op = (torch.ops.aten.conv2d.default
+                            if source_op == torch.ops.aten.conv2d.padding else source_op)
+    if normalized_source_op != frozen_op or axis != 0 or tuple(parameter.shape) != tuple(codes.shape):
         raise ValueError(f"stage {stage!r} frozen weight topology differs from source")
     if (scales.ndim != 1 or zero_points.ndim != 1 or
             scales.numel() != codes.shape[axis] or zero_points.numel() != codes.shape[axis]):
@@ -126,6 +132,7 @@ def _verified_weight_record(stage: str, source: tuple[Any, str, torch.Tensor],
         # is the semantic identity proof used here.
     return {
         "stage": stage, "source_parameter": source_name,
+        "source_operation": str(source_op), "frozen_operation": str(frozen_op),
         "source_sha256": _tensor_sha256(parameter),
         "frozen_buffer": frozen_name, "frozen_sha256": _tensor_sha256(codes),
         "scale_sha256": _tensor_sha256(scales),

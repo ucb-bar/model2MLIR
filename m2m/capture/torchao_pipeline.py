@@ -229,13 +229,29 @@ def _apply_pt2e_static_w8a8(
 
     # PT2E consumes an exported aten graph. prepare_pt2e also performs the
     # inference Conv+BatchNorm fold before observer insertion.
-    exported = torch.export.export(model.eval(), tuple(example_inputs))
+    # Some TorchAO exported-module eval shims mutate mode but return None.
+    # Export the selected module, not the shim's incidental return value.
+    model.eval()
+    exported = torch.export.export(model, tuple(example_inputs))
     if original_frontend_snapshot is not None:
         from m2m.capture.trace import attach_original_identity, snapshot_exported_program
 
         actual = snapshot_exported_program(exported, stage="quantization_input")
         attach_original_identity(exported, original_frontend_snapshot, actual)
     exported_module = exported.module()
+    # Normalize overloads before TorchAO folds BN and inserts observers. This
+    # keeps string-padding Conv2d on the same portable W8A8 path as numeric pads.
+    from m2m.capture.pt2e_padding import normalize_conv2d_padding
+
+    padding_normalizations = normalize_conv2d_padding(exported_module)
+    if original_frontend_snapshot is not None:
+        source_nodes = {row["id"]: row for row in original_frontend_snapshot.get("nodes", ())}
+        for row in padding_normalizations:
+            origins = set(row["source_ids"]).intersection(source_nodes)
+            # Owned precision staging also carries its intermediate identities;
+            # they are not original nodes and must not erase original ancestry.
+            if len(origins) != 1 or source_nodes[next(iter(origins))]["target"] != "aten.conv2d.padding":
+                raise ValueError("Conv2d string-padding normalization lost original source ancestry")
     fold_candidates = []
     if original_frontend_snapshot is not None:
         from m2m.capture.trace import pt2e_conv_bn_fold_candidates
@@ -287,6 +303,7 @@ def _apply_pt2e_static_w8a8(
         "annotated_contractions": quantizer.annotated,
         "calibration_samples": calibrated,
         "pruned_dead_state_tensors": pruned_state,
+        "conv2d_padding_normalizations": padding_normalizations,
     }
     return quantized
 
