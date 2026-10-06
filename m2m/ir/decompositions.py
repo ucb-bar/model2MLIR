@@ -5096,6 +5096,9 @@ def decompose_bucketize(operands, meta, node_name):
 
     out[*s] = #{b : boundaries[b] < input[*s]}  (right=False, the default)
             = #{b : boundaries[b] <= input[*s]} (right=True)
+    For floating input NaN and non-NaN sorted boundaries, torch returns the
+    last bucket for either ``right`` value.  The floating comparison is therefore
+    unordered-or-less-than (or unordered-or-less-or-equal), not ordered-only.
     Emitted as a counting reduction ``linalg.generic`` (family ``search``): a parallel
     loop per input dim plus one reduction over the (sorted) boundary axis, accumulating
     a +1 each time the predicate holds."""
@@ -5107,6 +5110,23 @@ def decompose_bucketize(operands, meta, node_name):
     bnd_shape = _shape_of(bnd)
     if in_shape is None or bnd_shape is None or len(bnd_shape) != 1 \
             or any(d < 0 for d in (*in_shape, *bnd_shape)):
+        return _opaque_decomp("aten_bucketize", operands[:2], meta, "search", pattern_hint="bucketize")
+
+    # MLIR integer types are signless, so the signed comparison below cannot
+    # implement bool or unsigned source operands.  Require exact source dtypes
+    # instead of guessing signedness from i1/i8 or missing FX metadata.
+    import torch
+
+    supported_source_dtypes = {
+        torch.int8, torch.int16, torch.int32, torch.int64,
+        torch.float16, torch.float32, torch.float64, torch.bfloat16,
+    }
+    selected_dtypes = []
+    for index in (0, 1):
+        source_arg = _fx_arg(meta, index)
+        source_value = getattr(source_arg, "meta", {}).get("val") if hasattr(source_arg, "meta") else source_arg
+        selected_dtypes.append(getattr(source_value, "dtype", None))
+    if any(dtype not in supported_source_dtypes for dtype in selected_dtypes):
         return _opaque_decomp("aten_bucketize", operands[:2], meta, "search", pattern_hint="bucketize")
 
     from xdsl.dialects.arith import AddiOp, CmpfOp, CmpiOp, ConstantOp, SelectOp
@@ -5152,7 +5172,7 @@ def decompose_bucketize(operands, meta, node_name):
 
     is_int = isinstance(comparison_elem, IntegerType)
     # predicate: boundaries[b] < input (right=False) or <= input (right=True)
-    pred_kind = ("sle" if right else "slt") if is_int else ("ole" if right else "olt")
+    pred_kind = ("sle" if right else "slt") if is_int else ("ule" if right else "ult")
     blk = Block(arg_types=[in_elem, boundary_elem, out_elem])
     x_casts, x_value = _cast_scalar_arg(blk.args[0], comparison_elem)
     b_casts, b_value = _cast_scalar_arg(blk.args[1], comparison_elem)
