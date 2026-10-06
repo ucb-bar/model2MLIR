@@ -38,11 +38,10 @@ def _static_shape(shape_like: Any) -> list[int]:
     would otherwise surface as ``VerifyException: u6 should be of base
     attribute builtin.int``.
 
-    This helper mirrors the more-narrow
-    :func:`m2m.ir.import_fx._coerce_static_dim`. Symbolic
-    dims become xDSL's dynamic-dim sentinel (``-1``) so import
-    completes; downstream passes that need static shapes handle the
-    dynamic case through their own paths.
+    This older helper uses ``-1`` as an internal marker for paths that
+    require static shapes. It is not xDSL's dynamic-dim sentinel. A path
+    that materializes a dynamic ``TensorType`` must use ``DYNAMIC_INDEX``
+    instead; the cast path below obtains that from the input tensor type.
     """
     out: list[int] = []
     for dim in shape_like:
@@ -271,25 +270,58 @@ def _cast_tensor(x: SSAValue, shape, dst_elem):
     return _elementwise([x], rt, lambda args, oe: _cast_scalar_arg(args[0], oe))
 
 
-def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build, input_maps=None, promote=False):
+def _elementwise(
+    inputs: list[SSAValue], result_type: TensorType, scalar_build, input_maps=None,
+    promote=False, dynamic_extent_source: SSAValue | None = None,
+):
     """Emit a ``linalg.generic`` elementwise op (all-parallel).
 
     ``input_maps`` (one AffineMap per input) enables broadcasting; defaults to identity
-    maps (inputs must then match ``result_type``'s shape). ``scalar_build(args, out_elem)
-    -> (ops, yield_ssa)`` builds the scalar body. Returns ``(ops, result_ssa)`` or None."""
+    maps (inputs must then match ``result_type``'s shape). Dynamic shapes require an
+    explicitly identical ``dynamic_extent_source``; broadcast remains static-only.
+    ``scalar_build(args, out_elem) -> (ops, yield_ssa)`` builds the scalar body.
+    Returns ``(ops, result_ssa)`` or None."""
     shape = result_type.get_shape()
-    if any(d < 0 for d in shape):
-        return None
+
+    # Only an explicitly same-shape caller may materialize dynamic extents. General
+    # pointwise/broadcast operations remain unsupported rather than using example shapes.
+    dynamic = any(d < 0 for d in shape)
+    if dynamic:
+        from xdsl.dialects.builtin import DYNAMIC_INDEX
+
+        if (
+            dynamic_extent_source is None
+            or len(inputs) != 1
+            or inputs[0] is not dynamic_extent_source
+            or input_maps is not None
+            or not isinstance(dynamic_extent_source.type, TensorType)
+            or list(dynamic_extent_source.type.get_shape()) != list(shape)
+            or any(d < 0 and d != DYNAMIC_INDEX for d in shape)
+        ):
+            return None
 
     from xdsl.dialects.builtin import AffineMapAttr
     from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
-    from xdsl.dialects.tensor import EmptyOp
+    from xdsl.dialects.tensor import DimOp, EmptyOp
     from xdsl.ir import Block, Region
     from xdsl.ir.affine import AffineMap
 
     rank = len(shape)
     out_elem = result_type.element_type
-    empty = EmptyOp([], result_type)
+    extent_ops: list[Operation] = []
+    dynamic_sizes: list[SSAValue] = []
+    if dynamic:
+        from xdsl.dialects.arith import ConstantOp
+        from xdsl.dialects.builtin import IndexType, IntegerAttr
+
+        for axis, dim in enumerate(shape):
+            if dim >= 0:
+                continue
+            axis_op = ConstantOp(IntegerAttr(axis, IndexType()), IndexType())
+            dim_op = DimOp(dynamic_extent_source, axis_op.result)
+            extent_ops.extend([axis_op, dim_op])
+            dynamic_sizes.append(dim_op.result)
+    empty = EmptyOp(dynamic_sizes, result_type)
 
     in_elems = [inp.type.element_type for inp in inputs]  # type: ignore[union-attr]
     block = Block(arg_types=[*in_elems, out_elem])
@@ -318,7 +350,7 @@ def _elementwise(inputs: list[SSAValue], result_type: TensorType, scalar_build, 
         iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * rank,
         result_types=[result_type],
     )
-    return [empty, generic], generic.results[0]
+    return [*extent_ops, empty, generic], generic.results[0]
 
 
 def _splat_scalar(scalar: Any, result_type: TensorType):
@@ -522,7 +554,9 @@ def _coerce_static_dim(d: Any) -> int:
     try:
         return int(d)
     except Exception:
-        return -1
+        from xdsl.dialects.builtin import DYNAMIC_INDEX
+
+        return DYNAMIC_INDEX
 
 
 def _shape_of(ssa: SSAValue) -> list[int] | None:
@@ -612,7 +646,9 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     return DecompResult(ops=[*pre, *ops], result=res, region_ids=[rid], pattern_hint=op_name)
 
 
-def _unary_elementwise(operands, meta, op_name, scalar_build, out_elem=None):
+def _unary_elementwise(
+    operands, meta, op_name, scalar_build, out_elem=None, dynamic_same_shape=False,
+):
     """Unary elementwise via linalg.generic. Returns DecompResult or None (opaque).
 
     Result dtype defaults to the operand's dtype (dtype-preserving ops); pass
@@ -622,7 +658,13 @@ def _unary_elementwise(operands, meta, op_name, scalar_build, out_elem=None):
         return None
     val: Any = meta["val"]
     out_shape = [_coerce_static_dim(d) for d in val.shape]
-    if any(d < 0 for d in out_shape):
+    if dynamic_same_shape:
+        # A dtype cast preserves every extent. Compare rank and known static extents;
+        # a dynamic marker does not prove symbolic identity, so runtime extent comes
+        # from the actual operand tensor rather than exported example metadata.
+        if list(src_type.get_shape()) != out_shape:
+            return None
+    elif any(d < 0 for d in out_shape):
         return None
     meta_elem = _element_type_from_meta(meta)
     if out_elem is None:
@@ -634,7 +676,10 @@ def _unary_elementwise(operands, meta, op_name, scalar_build, out_elem=None):
         # cast: result dtype is the explicit target; input dtype may differ (that's the cast).
         elem = out_elem
     result_type = TensorType(elem, out_shape)
-    em = _elementwise([operands[0]], result_type, scalar_build)
+    em = _elementwise(
+        [operands[0]], result_type, scalar_build,
+        dynamic_extent_source=operands[0] if dynamic_same_shape else None,
+    )
     if em is None:
         return None
     ops, res = em
@@ -4621,7 +4666,10 @@ def decompose_to_copy(operands, meta, node_name):
     target_elem = _element_type_from_meta(meta)
     if operands and isinstance(operands[0].type, TensorType) and operands[0].type.element_type == target_elem:
         return DecompResult(ops=[], result=operands[0], pattern_hint="identity")
-    real = _unary_elementwise(operands, meta, "dtype_cast", _cast_scalar_build(target_elem), out_elem=target_elem)
+    real = _unary_elementwise(
+        operands, meta, "dtype_cast", _cast_scalar_build(target_elem),
+        out_elem=target_elem, dynamic_same_shape=True,
+    )
     if real is not None:
         return real
     return _opaque_decomp("aten_to_dtype", operands[:1], meta, "cast", pattern_hint="dtype_cast")

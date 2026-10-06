@@ -148,6 +148,8 @@ CASES = [
 # assert only that they lower to standard dialects (scf + tensor) with no opaque calls.
 DYNAMIC_CASES = [
     ("bool_mask_gather", lambda x, m: x[m], (torch.arange(8), torch.tensor([True, False] * 4))),
+    ("bool_mask_gather_then_cast", lambda x, m: x[m].to(torch.int64),
+     (torch.tensor([True, False] * 8), torch.tensor([True, False] * 8))),
     ("masked_scatter", _masked_scatter := (lambda s, src, m: s.clone().index_put_((m,), src[m])),
      (torch.zeros(8, dtype=torch.int64), torch.arange(8), torch.tensor([True, False] * 4))),
 ]
@@ -167,6 +169,95 @@ def test_dynamic_op_lowers_to_standard_dialects(name, fn, inputs):
     v = validate_op(fn, inputs, name=name)
     assert v.error is None, v.error
     assert v.lowered, f"{name} left opaque calls: {v.opaque_calls}"
+
+
+@pytest.mark.parametrize("selected", [(), (0, 3, 6), tuple(range(7))])
+def test_dynamic_mask_cast_uses_source_extent(selected):
+    import m2m
+    from m2m.coverage import opaque_report
+    from xdsl.dialects.linalg import GenericOp
+    from xdsl.dialects.tensor import DimOp, EmptyOp
+
+    class MaskCast(torch.nn.Module):
+        def forward(self, values, mask):
+            return values[mask].to(torch.int64)
+
+    values = torch.tensor([True, False, True, False, True, False, True])
+    mask = torch.tensor([index in selected for index in range(7)])
+    result = m2m.convert(MaskCast(), (values, mask), backend="fx_importer", capture_trace=True)
+    assert result.ok, result.diagnostics
+    result.module.verify()
+    assert result.capture_trace["status"] == "complete"
+    assert opaque_report(result.mlir_text) == {}
+    assert "tensor<?xi64>" in result.mlir_text
+    assert "tensor<-1" not in result.mlir_text
+
+    def is_cast(op):
+        family = op.attributes.get("prov.family")
+        return family is not None and family.data == "cast"
+
+    cast_empty = next(op for op in result.module.walk() if isinstance(op, EmptyOp) and is_cast(op))
+    cast_generic = next(op for op in result.module.walk() if isinstance(op, GenericOp) and is_cast(op))
+    assert len(cast_empty.dynamic_sizes) == 1
+    dim = cast_empty.dynamic_sizes[0].owner
+    assert isinstance(dim, DimOp)
+    assert dim.source is cast_generic.inputs[0]
+    assert cast_generic.outputs[0] is cast_empty.tensor
+
+
+def test_other_dynamic_elementwise_remains_opaque_but_parseable():
+    import m2m
+    from m2m.coverage import opaque_report
+
+    class MaskSine(torch.nn.Module):
+        def forward(self, values, mask):
+            return torch.sin(values[mask].to(torch.float32))
+
+    values = torch.tensor([True, False, True, False])
+    mask = torch.tensor([True, False, False, True])
+    result = m2m.convert(MaskSine(), (values, mask), backend="fx_importer", capture_trace=True)
+    assert result.ok, result.diagnostics
+    assert opaque_report(result.mlir_text) == {"aten_sin_default": 1}
+    assert "tensor<-1" not in result.mlir_text
+
+
+def test_dynamic_cast_refuses_inconsistent_exported_shape():
+    from xdsl.dialects.builtin import DYNAMIC_INDEX, TensorType, i1, i64
+    from xdsl.ir import Block
+
+    from m2m.ir.decompositions import _cast_scalar_build, _unary_elementwise
+
+    dynamic_input = Block(arg_types=[TensorType(i1, [DYNAMIC_INDEX])]).args[0]
+    inconsistent_meta = {"val": torch.empty(7, dtype=torch.int64)}
+    assert _unary_elementwise(
+        [dynamic_input], inconsistent_meta, "dtype_cast", _cast_scalar_build(i64),
+        out_elem=i64, dynamic_same_shape=True,
+    ) is None
+
+
+def test_dynamic_cast_queries_each_dynamic_axis():
+    from xdsl.dialects.builtin import DYNAMIC_INDEX, TensorType, i1, i64
+    from xdsl.dialects.tensor import DimOp, EmptyOp
+    from xdsl.ir import Block
+
+    from m2m.ir.decompositions import _cast_scalar_build, _unary_elementwise
+
+    class Symbolic:
+        def __int__(self):
+            raise TypeError("symbolic extent")
+
+    meta = {"val": type("MetaTensor", (), {"shape": (Symbolic(), 3, Symbolic()), "dtype": torch.int64})()}
+    source = Block(arg_types=[TensorType(i1, [DYNAMIC_INDEX, 3, DYNAMIC_INDEX])]).args[0]
+    result = _unary_elementwise(
+        [source], meta, "dtype_cast", _cast_scalar_build(i64),
+        out_elem=i64, dynamic_same_shape=True,
+    )
+    assert result is not None
+    dims = [op for op in result.ops if isinstance(op, DimOp)]
+    empty = next(op for op in result.ops if isinstance(op, EmptyOp))
+    assert len(dims) == len(empty.dynamic_sizes) == 2
+    assert [dim.source for dim in dims] == [source, source]
+    assert list(result.result.type.get_shape()) == [DYNAMIC_INDEX, 3, DYNAMIC_INDEX]
 
 
 # The conv variants a consumer's vector schedule can claim. A schedule matches contractions

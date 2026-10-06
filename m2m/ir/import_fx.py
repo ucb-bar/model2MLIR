@@ -290,18 +290,20 @@ def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:
 
 
 def _coerce_static_dim(dim: Any) -> int:
-    """Concrete dim → ``int(dim)``; symbolic / data-dependent dim → ``-1``.
+    """Concrete dim → ``int(dim)``; symbolic dim → xDSL's dynamic sentinel.
 
     xDSL's ``TensorType`` rejects ``SymInt`` (``"u6 should be of base
-    attribute builtin.int"``). For models with dynamic shapes (SmolVLA's
-    image-tile counts, etc.) we emit ``-1`` (xDSL's dynamic-dim convention)
+    attribute builtin.int"``). For models with dynamic shapes we emit the
+    canonical ``DYNAMIC_INDEX`` sentinel (printed as ``?`` by xDSL),
     so capture continues; downstream passes that need static shapes will
     short-circuit through their own dynamic-shape paths.
     """
     try:
         return int(dim)
     except Exception:
-        return -1
+        from xdsl.dialects.builtin import DYNAMIC_INDEX
+
+        return DYNAMIC_INDEX
 
 
 #: The only aten targets whose decompositions are written against the trailing-(re, im) pair
