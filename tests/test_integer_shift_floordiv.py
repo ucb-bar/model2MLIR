@@ -73,6 +73,8 @@ def _eval_body(block, values):
         elif name == "arith.shrsi":
             assert 0 <= args[1] < w, f"shrsi by {args[1]} on i{w} is poison"
             r = args[0] >> args[1]
+        elif name == "arith.andi":
+            r = args[0] & args[1]
         elif name == "arith.floordivsi":
             assert args[1] != 0, "floordivsi by zero"
             r = args[0] // args[1]
@@ -120,6 +122,46 @@ _SHIFT_AMOUNTS = list(range(-3, 67)) + [127, 1000, -1000, 2**40]
 
 
 # ---- right shift --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("spelling", ["operator", "function", "scalar_tensor"])
+@pytest.mark.parametrize("mask", [0, 1, 65535, -1, -(2**63)])
+def test_bitwise_and_python_scalar_preserves_int64_bits(mask, spelling):
+    values = torch.tensor(_I64_EDGES, dtype=torch.int64)
+    fn = {
+        "operator": lambda x: x & mask,
+        "function": lambda x: torch.bitwise_and(x, mask),
+        "scalar_tensor": lambda x: torch.ops.aten.bitwise_and.Scalar_Tensor(mask, x),
+    }[spelling]
+    target = "aten.__and__.Scalar" if spelling == "operator" else (
+        "aten.bitwise_and.Scalar_Tensor" if spelling == "scalar_tensor" else "aten.bitwise_and.Scalar"
+    )
+    exported = torch.export.export(_Un(fn).eval(), (values,))
+    assert any(str(node.target) == target for node in exported.graph.nodes if node.op == "call_function")
+    gen = _capture(_Un(fn), (values,), "bitwise_and")
+    assert any(op.name == "arith.andi" for op in gen.body.block.ops)
+    assert str(gen.results[0].type) == f"tensor<{len(values)}xi64>"
+    assert _run(gen, values.tolist()) == fn(values).tolist()
+
+
+def test_bitwise_and_tensor_int8_does_not_regress():
+    values = torch.tensor(_INT8, dtype=torch.int8)
+    masks = torch.tensor([(index * 7) % 256 - 128 for index in range(len(_INT8))], dtype=torch.int8)
+    # The existing tensor/tensor path retains its historical family provenance.
+    gen = _capture(_Bin(torch.bitwise_and), (values, masks), "bitwise")
+    assert _run(gen, values.tolist(), masks.tolist()) == torch.bitwise_and(values, masks).tolist()
+
+
+def test_bitwise_and_scalar_trace_keeps_source_dtype_and_width():
+    values = torch.tensor([-(2**63), -1, 0, 2**63 - 1], dtype=torch.int64)
+    result = m2m.convert(_Un(lambda x: x & 65535).eval(), (values,), backend="fx_importer", capture_trace=True)
+    assert result.ok and result.capture_trace["status"] == "complete"
+    original = result.capture_trace["graphs"]["original"]["nodes"]
+    assert [(node["target"], node["results"][0]["dtype"]) for node in original
+            if node["target"] == "aten.__and__.Scalar"] == [("aten.__and__.Scalar", "int64")]
+    assert "arith.andi" in result.mlir_text and "tensor<4xi64>" in result.mlir_text
+    assert opaque_report(result.mlir_text) == {}
+    result.module.verify()
 
 
 def test_shift_tensor_int8_exhaustive():

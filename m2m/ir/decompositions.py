@@ -4804,17 +4804,24 @@ def decompose_logical_not(operands, meta, node_name):
 
 
 def decompose_bitwise_and(operands, meta, node_name):
-    """aten.bitwise_and.Tensor(a, b) -> arith.andi via linalg.generic (family bitwise)."""
+    """Tensor/Tensor and signed-integer Tensor/Scalar AND via ``arith.andi``."""
     from xdsl.dialects.arith import AndIOp
 
     def build(args, oe):
         op = AndIOp(args[0], args[1])
         return [op], op.results[0]
 
-    real = _pointwise(operands[:2], meta, build, family="bitwise")
+    real = (
+        _int_binary(operands, meta, "bitwise", lambda a, b, oe: build([a, b], oe))
+        if len(operands) == 1
+        else _pointwise(operands[:2], meta, build, family="bitwise")
+    )
     if real is not None:
+        if len(operands) == 1:
+            real.pattern_hint = "bitwise_and"
         return real
-    return _opaque_decomp("aten_bitwise_and", operands[:2], meta, "bitwise", pattern_hint="bitwise_and")
+    return _opaque_decomp(_opaque_name(meta, node_name), operands[:2], meta, "bitwise",
+                          pattern_hint="bitwise_and")
 
 
 # ---- integer right shift and integer floor / truncating division -------------------------------
@@ -6717,6 +6724,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.detach_.default": _identity_decomp,         # in-place detach = identity
     "aten.flatten.using_ints": decompose_view,        # flatten = reshape (shape from meta)
     "aten.__and__.Tensor": decompose_bitwise_and,
+    "aten.__and__.Scalar": decompose_bitwise_and,
     "aten.arange.start": decompose_arange,            # arange(start, end)
     "aten.ones.default": decompose_ones,
     "aten.new_ones.default": decompose_ones,
@@ -6733,6 +6741,8 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.logical_not.default": decompose_logical_not,
     "aten.logical_and.default": decompose_logical_and,
     "aten.bitwise_and.Tensor": decompose_bitwise_and,
+    "aten.bitwise_and.Scalar": decompose_bitwise_and,
+    "aten.bitwise_and.Scalar_Tensor": decompose_bitwise_and,
     "aten.bitwise_not.default": decompose_bitwise_not,
     "aten.repeat.default": decompose_repeat,
     "aten.any.dim": decompose_any_real,
