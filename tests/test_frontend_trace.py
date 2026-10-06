@@ -631,3 +631,96 @@ def test_identity_dtype_cast_requires_exact_typed_bypass():
                        if n["target"] == "aten.to.dtype")
     assert not any(r["kind"] == "eliminated" and source_cast["id"] in r["source_ids"]
                    for r in changed["transformations"][1]["relations"])
+
+
+def test_type_changing_cast_then_noop_cast_keeps_nested_lineage():
+    class Inner(torch.nn.Module):
+        def forward(self, positions):
+            with torch.set_grad_enabled(False):
+                converted = positions.unsqueeze(1).to(torch.float32)
+                unchanged = converted.to(torch.float32)
+                return torch.matmul(torch.ones(1, 4, 1), unchanged)
+
+    class Outer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = Inner()
+
+        def forward(self, positions):
+            return self.inner(positions)
+
+    result = m2m.convert(
+        Outer().eval(), (torch.arange(8).reshape(1, 8),),
+        backend="fx_importer", capture_trace=True,
+    )
+    assert result.ok, result.diagnostics
+    trace = result.capture_trace
+    source, prepared = trace["graphs"]["quantized"], trace["graphs"]["prepared"]
+    casts = [node for node in source["nodes"] if node["target"] == "aten.to.dtype"]
+    pairs = [
+        (first, second)
+        for first in casts for second in casts
+        if first is not second and isinstance(second["args"][0], dict)
+        and second["args"][0].get("node_id") == first["id"]
+    ]
+    source_nodes = {node["id"]: node for node in source["nodes"]}
+    changing, unchanged = next(
+        (first, second) for first, second in pairs
+        if first["results"][0]["dtype"] == "float32"
+        and source_nodes[first["args"][0]["node_id"]]["results"][0]["dtype"] == "int64"
+    )
+    from m2m.capture.view_trace import SourceStorageAliases
+
+    aliases = SourceStorageAliases(source)
+    assert aliases.root(changing) == changing["id"]
+    assert aliases.root(unchanged) == changing["id"]
+    relation = graph_relation(source, prepared)
+    assert relation["status"] == "complete", relation["unresolved_source_ids"]
+
+    import copy
+
+    def tampered_root(mutator):
+        altered = copy.deepcopy(source)
+        cast = next(node for node in altered["nodes"] if node["id"] == changing["id"])
+        mutator(altered, cast)
+        return SourceStorageAliases(altered).root(cast)
+
+    def changed_root(mutator):
+        return tampered_root(lambda _graph, cast: mutator(cast))
+
+    assert changed_root(lambda cast: cast["args"][1].update(value="torch.float64")) is None
+    assert changed_root(lambda cast: cast["results"][0].update(device="cuda:0")) is None
+    assert changed_root(lambda cast: cast["kwargs"].update(copy=True)) is None
+    assert changed_root(lambda cast: cast["args"][0].update(value_id="unknown")) is None
+    altered_schema = copy.deepcopy(source)
+    altered_schema["operator_schemas"]["aten.to.dtype"] = "not an operator schema"
+    cast = next(node for node in altered_schema["nodes"] if node["id"] == changing["id"])
+    assert SourceStorageAliases(altered_schema).root(cast) is None
+
+    def drop_pair_metadata(graph, cast, field):
+        producer = next(node for node in graph["nodes"] if node["id"] == cast["args"][0]["node_id"])
+        producer["results"][0].pop(field)
+        cast["results"][0].pop(field)
+
+    for field in ("shape", "device", "layout", "stride", "storage_dtype", "compute_dtype"):
+        assert tampered_root(lambda graph, cast: drop_pair_metadata(graph, cast, field)) is None
+
+    assert changed_root(lambda cast: cast["results"][0].update(shape=None)) is None
+
+    assert tampered_root(
+        lambda graph, cast: graph.__setitem__(
+            "edges", [edge for edge in graph["edges"] if edge["consumer_node_id"] != cast["id"]]
+        )
+    ) is None
+    for field, wrong in (("argument_path", "args/1"), ("dtype", "float16"), ("value_kind", "unknown")):
+        def wrong_edge(graph, cast):
+            edge = next(edge for edge in graph["edges"] if edge["consumer_node_id"] == cast["id"])
+            edge[field] = wrong
+
+        assert tampered_root(wrong_edge) is None
+
+    def duplicate_edge(graph, cast):
+        edge = next(edge for edge in graph["edges"] if edge["consumer_node_id"] == cast["id"])
+        graph["edges"].append(copy.deepcopy(edge))
+
+    assert tampered_root(duplicate_edge) is None

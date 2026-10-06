@@ -80,6 +80,74 @@ class SourceStorageAliases:
             return None
         return producer
 
+    def fresh_dtype_conversion(self, node):
+        """Recognize an exact ``to.dtype`` that must allocate new storage.
+
+        The selected schema permits an alias for the no-op case. A changed
+        dtype cannot share tensor storage; keep all other ``to`` forms unknown
+        unless their existing identity proof applies.
+        """
+        if node.get("op") != "call_function" or node.get("target") != "aten.to.dtype":
+            return False
+        args = node.get("args") or []
+        kwargs = node.get("kwargs") or {}
+        if not isinstance(args, list) or not isinstance(kwargs, dict) or not 2 <= len(args) <= 5:
+            return False
+        if set(kwargs) - {"non_blocking", "copy", "memory_format"}:
+            return False
+        if any(name in kwargs for name in ("non_blocking", "copy", "memory_format")[: len(args) - 2]):
+            return False
+        producer = self.tensor_ref(args[0])
+        if producer is None or producer.get("graph_id") != node.get("graph_id"):
+            return False
+        source = _tensor_value(producer)
+        result = _tensor_value(node)
+
+        def complete_tensor(value):
+            if value is None or not isinstance(value.get("id"), str) or not value["id"]:
+                return False
+            if any(
+                not isinstance(value.get(field), str) or not value[field]
+                for field in ("dtype", "storage_dtype", "device", "layout")
+            ):
+                return False
+            if "compute_dtype" not in value or (
+                value["compute_dtype"] is not None and not isinstance(value["compute_dtype"], str)
+            ):
+                return False
+            if value["storage_dtype"] != value["dtype"] or value["layout"] != "torch.strided":
+                return False
+            shape, stride = value.get("shape"), value.get("stride")
+            if not isinstance(shape, list) or not isinstance(stride, list) or len(shape) != len(stride):
+                return False
+            return all(
+                type(dim) in {int, str} and (dim >= 0 if type(dim) is int else bool(dim)) for dim in [*shape, *stride]
+            )
+
+        if not complete_tensor(source) or not complete_tensor(result) or source["dtype"] == result["dtype"]:
+            return False
+        requested = args[1]
+        if requested != {"kind": "dtype", "value": f"torch.{result.get('dtype')}"}:
+            return False
+        if (args[2] if len(args) > 2 else kwargs.get("non_blocking", False)) is not False:
+            return False
+        if (args[3] if len(args) > 3 else kwargs.get("copy", False)) is not False:
+            return False
+        if (args[4] if len(args) > 4 else kwargs.get("memory_format")) is not None:
+            return False
+        if not all(source[field] == result[field] for field in ("kind", "shape", "device", "layout", "stride")):
+            return False
+        incoming = [edge for edge in self.source.get("edges") or [] if edge.get("consumer_node_id") == node["id"]]
+        return (
+            len(incoming) == 1
+            and incoming[0].get("producer_node_id") == producer["id"]
+            and incoming[0].get("producer_value_id") == source["id"]
+            and incoming[0].get("argument_path") == "args/0"
+            and incoming[0].get("value_kind") == "tensor"
+            and incoming[0].get("dtype") == source["dtype"]
+            and incoming[0].get("shape") == source["shape"]
+        )
+
     def root(self, node):
         from m2m.capture.trace import _forward_identity_value
 
@@ -97,9 +165,10 @@ class SourceStorageAliases:
             return None
         if node["target"] in {"aten.to.dtype", "aten.to.dtype_layout"}:
             exact = _forward_identity_value(self.source, node)
-            if exact is None:
-                return None
-            self.roots[identity] = self.root(exact[0])
+            if exact is not None:
+                self.roots[identity] = self.root(exact[0])
+            elif self.fresh_dtype_conversion(node):
+                self.roots[identity] = identity
             return self.roots[identity]
         alias = spec.returns[0].alias_info
         if alias is None:
