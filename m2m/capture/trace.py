@@ -487,12 +487,20 @@ def _structural_rows(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     """Stage-independent exact graph equivalence, not node-name/FQN matching."""
     rows = []
     ids = {n["id"]: i for i, n in enumerate(snapshot.get("nodes", ()))}
+    nodes = {n["id"]: n for n in snapshot.get("nodes", ())}
     def remap(value):
         if isinstance(value, list):
             return [remap(v) for v in value]
         if isinstance(value, dict):
             if "node_id" in value:
-                return {"ordinal": ids[value["node_id"]]}
+                producer = nodes[value["node_id"]]
+                result_id = value.get("value_id")
+                matches = [i for i, result in enumerate(producer.get("results") or ())
+                           if result["id"] == result_id]
+                if result_id is not None and len(matches) != 1:
+                    raise ValueError("frontend edge has no unique typed producer result")
+                return {"ordinal": ids[value["node_id"]],
+                        "result_index": matches[0] if matches else None}
             return {k: remap(v) for k, v in value.items() if k != "id"}
         return value
     for n in snapshot.get("nodes", ()):
@@ -501,40 +509,142 @@ def _structural_rows(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _reordered_graph_identity(original: dict[str, Any], actual: dict[str, Any]) -> dict[str, str] | None:
+    """Prove a unique typed DAG isomorphism when independent FX calls reorder.
+
+    Only exact operators, ordered operands/results and source-owned inputs may
+    match. Repeated indistinguishable owners are ambiguous and fail closed;
+    graph names, module stacks, tensor shapes alone, and node ordinals are not
+    used as evidence for a reordered call. Input targets establish structural
+    ownership, not equality of external parameter/buffer/constant payloads.
+    """
+    source = original.get("nodes") or []
+    observed = actual.get("nodes") or []
+    if len(source) != len(observed):
+        return None
+    source_by_id = {node["id"]: node for node in source}
+    observed_by_id = {node["id"]: node for node in observed}
+    if len(source_by_id) != len(source) or len(observed_by_id) != len(observed):
+        return None
+
+    def placeholder_positions(nodes: list[dict[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        positions = {}
+        for node in nodes:
+            if node["op"] == "placeholder" and node.get("input_target") is None:
+                scope = node["graph_id"].split(":", 2)[-1]
+                positions[node["id"]] = counts.get(scope, 0)
+                counts[scope] = positions[node["id"]] + 1
+        return positions
+
+    source_positions = placeholder_positions(source)
+    observed_positions = placeholder_positions(observed)
+
+    def key(node: dict[str, Any], nodes: dict[str, dict[str, Any]],
+            mapped: dict[str, str], positions: dict[str, int]) -> str:
+        def remap(value: Any) -> Any:
+            if isinstance(value, list):
+                return [remap(item) for item in value]
+            if isinstance(value, dict):
+                if "node_id" in value:
+                    if set(value) != {"node_id", "value_id"}:
+                        raise ValueError("frontend edge has unrecognized fields")
+                    producer_id = value["node_id"]
+                    producer = nodes[producer_id]
+                    result_id = value["value_id"]
+                    matches = [i for i, result in enumerate(producer.get("results") or ())
+                               if result["id"] == result_id]
+                    if result_id is not None and len(matches) != 1:
+                        raise ValueError("frontend edge has no unique typed producer result")
+                    return {"owner": mapped[producer_id],
+                            "result_index": matches[0] if matches else None}
+                return {field: remap(item) for field, item in value.items()}
+            return value
+
+        body = {
+            "scope": node["graph_id"].split(":", 2)[-1],
+            "op": node["op"], "target": node["target"],
+            "args": remap(node["args"]), "kwargs": remap(node["kwargs"]),
+            "results": [{field: value for field, value in result.items() if field != "id"}
+                        for result in node.get("results") or ()],
+            "input_kind": node.get("input_kind"),
+            "input_target": node.get("input_target"),
+            # Positional user inputs are owned by the public graph ABI. Lifted
+            # state is instead owned by its explicit input_target.
+            "input_position": positions.get(node["id"]),
+        }
+        return json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+    try:
+        source_identity = {node_id: node_id for node_id in source_by_id}
+        candidates: dict[str, list[str]] = {}
+        for node in source:
+            candidates.setdefault(key(node, source_by_id, source_identity, source_positions), []).append(node["id"])
+        mapping: dict[str, str] = {}
+        used = set()
+        for node in observed:
+            matches = candidates.get(key(node, observed_by_id, mapping, observed_positions), ())
+            if len(matches) != 1 or matches[0] in used:
+                return None
+            mapping[node["id"]] = matches[0]
+            used.add(matches[0])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return mapping if len(used) == len(source) else None
+
+
 def attach_original_identity(exported: Any, original: dict[str, Any], actual: dict[str, Any]) -> bool:
-    """Attach identities only after whole-graph ordered structural equality."""
-    if original.get("status") != "complete":
+    """Attach structural source identities, never a tensor-payload equality claim.
+
+    Precision and capture receipts independently bind owned lifted constants
+    and materialized weights. This correspondence compares operators, typed
+    edges and input ownership; it does not inspect tensor contents.
+    """
+    if original.get("status") != "complete" or actual.get("status") != "complete":
         return False
     supplied = dict(original)
     claimed_hash = supplied.pop("sha256", None)
     if claimed_hash != _digest(supplied):
         raise ValueError("original frontend snapshot digest does not match its graph")
-    if (_structural_rows(original) != _structural_rows(actual)
-            or original.get("range_constraints") != actual.get("range_constraints")
+    if (original.get("range_constraints") != actual.get("range_constraints")
             or original.get("runtime_versions") != actual.get("runtime_versions")):
         return False
+    # Preserve the established ordered identity path, including duplicate
+    # identical calls. A reordered graph needs unique typed dataflow ownership.
+    try:
+        ordered = _structural_rows(original) == _structural_rows(actual)
+    except (KeyError, TypeError, ValueError):
+        return False
+    if ordered:
+        identities = {observed["id"]: source["id"]
+                      for source, observed in zip(original["nodes"], actual["nodes"], strict=True)}
+    else:
+        identities = _reordered_graph_identity(original, actual)
+    if identities is None:
+        return False
+    graph_nodes = [node for _, module in _graph_modules(exported.graph_module)
+                   for node in module.graph.nodes]
+    if (len(graph_nodes) != len(actual["nodes"])
+            or any(node.meta.get("_m2m_node_id") != row["id"]
+                   for node, row in zip(graph_nodes, actual["nodes"], strict=True))):
+        return False
     # A second exact export is an observation of the same source graph, not a
-    # fourth public trace stage. Normalize only its proven one-to-one identities;
-    # never discard arbitrary lineage or match nodes by names/operators alone.
-    identities = {observed["id"]: source["id"]
-                  for source, observed in zip(original["nodes"], actual["nodes"], strict=True)}
-    original_ids = iter(n["id"] for n in original["nodes"])
-    for _, module in _graph_modules(exported.graph_module):
-        for node in module.graph.nodes:
-            custom = dict(node.meta.get("custom") or {})
-            lineage = list(dict.fromkeys(identities.get(value, value)
-                                        for value in custom.get("m2m_lineage") or ()))
-            prior_id = next(original_ids)
-            if prior_id not in lineage:
-                lineage.append(prior_id)
-            custom["m2m_lineage"] = lineage
-            if custom.get("m2m_node_id") in identities:
-                custom["m2m_node_id"] = identities[custom["m2m_node_id"]]
-            node.meta["custom"] = custom
-            if node.meta.get("_m2m_node_id") in identities:
-                node.meta["_m2m_node_id"] = identities[node.meta["_m2m_node_id"]]
-            node.meta["_m2m_origin_ids"] = [value for value in lineage
-                                            if value != node.meta.get("_m2m_node_id")]
+    # fourth public trace stage. Normalize only proven one-to-one identities.
+    for node, observed in zip(graph_nodes, actual["nodes"], strict=True):
+        custom = dict(node.meta.get("custom") or {})
+        lineage = list(dict.fromkeys(identities.get(value, value)
+                                    for value in custom.get("m2m_lineage") or ()))
+        prior_id = identities[observed["id"]]
+        if prior_id not in lineage:
+            lineage.append(prior_id)
+        custom["m2m_lineage"] = lineage
+        if custom.get("m2m_node_id") in identities:
+            custom["m2m_node_id"] = identities[custom["m2m_node_id"]]
+        node.meta["custom"] = custom
+        if node.meta.get("_m2m_node_id") in identities:
+            node.meta["_m2m_node_id"] = identities[node.meta["_m2m_node_id"]]
+        node.meta["_m2m_origin_ids"] = [value for value in lineage
+                                        if value != node.meta.get("_m2m_node_id")]
     return True
 
 

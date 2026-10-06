@@ -267,3 +267,114 @@ def test_exact_reexport_uses_recorded_original_ids_not_transient_probe_ids():
     recorded_origins = {node["id"] for stage in ("original", "quantized")
                         for node in trace["graphs"][stage]["nodes"]}
     assert all(set(op["origin_node_ids"]) <= recorded_origins for op in trace["mlir"]["operations"])
+
+
+def test_fp32_staged_independent_branches_keep_exact_fold_owners():
+    """Re-export may reorder independent calls, not their typed dataflow."""
+    from m2m.capture.torchao_pipeline import QuantizationConfig
+    from m2m.capture.trace import (_reordered_graph_identity, attach_original_identity,
+                                   pt2e_conv_bn_fold_candidates, snapshot_exported_program)
+
+    class Branches(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = nn.Conv2d(3, 4, 3, padding=1)
+            self.first_norm = nn.BatchNorm2d(4)
+            self.second = nn.Conv2d(4, 4, 3, padding=1)
+            self.second_norm = nn.BatchNorm2d(4)
+            self.skip = nn.Conv2d(3, 4, 1)
+            self.skip_norm = nn.BatchNorm2d(4)
+
+        def forward(self, x):
+            main = self.second_norm(self.second(self.first_norm(self.first(x)).relu()))
+            residual = self.skip_norm(self.skip(x))
+            return (main + residual).relu()
+
+    model = Branches().eval()
+    inputs = (torch.randn(1, 3, 8, 8),)
+    original = m2m.capture_frontend_snapshot(model, inputs)
+    staged, staged_inputs, original, _ = m2m.materialize_frontend_precision(
+        model, inputs, dtype=torch.float32, original_frontend_snapshot=original,
+        retarget_float_dtype_arguments=True)
+    staged.eval()  # the recipe PT2E path makes this transition before its export
+    exported = torch.export.export(staged, staged_inputs)
+    actual = snapshot_exported_program(exported, stage="quantization_input")
+    assert [node["target"] for node in original["nodes"]] != [
+        node["target"] for node in actual["nodes"]]
+    for mutation in ("edge", "constant", "operand_order"):
+        changed = copy.deepcopy(actual)
+        norms = [node for node in changed["nodes"] if node["target"] == "aten.batch_norm.default"]
+        if mutation == "edge":
+            norms[0]["args"][0] = copy.deepcopy(norms[-1]["args"][0])
+        elif mutation == "constant":
+            eps = next(i for i, value in enumerate(norms[0]["args"]) if value == 1e-5)
+            norms[0]["args"][eps] = 2e-5
+        else:
+            add = next(node for node in changed["nodes"] if node["target"] == "aten.add.Tensor")
+            add["args"] = list(reversed(add["args"]))
+        assert _reordered_graph_identity(original, changed) is None, mutation
+    assert attach_original_identity(exported, original, actual)
+    assert len(pt2e_conv_bn_fold_candidates(exported.module(), original)) == 3
+
+    # The generic PT2E entry currently expects eval() to return its receiver;
+    # ExportedProgram.module().eval() mutates in place and returns None.
+    staged, staged_inputs, original, _ = m2m.materialize_frontend_precision(
+        model, inputs, dtype=torch.float32, original_frontend_snapshot=original,
+        retarget_float_dtype_arguments=True)
+    staged.eval()
+    staged.eval = lambda: staged
+    converted = m2m.convert(
+        staged, staged_inputs, backend="fx_importer", capture_trace=True,
+        original_frontend_snapshot=original,
+        quantization=QuantizationConfig(scheme="int8_static_act_int8_weight"))
+    assert converted.ok and converted.capture_trace["status"] == "complete", converted.diagnostics
+    source = converted.capture_trace["graphs"]["original"]
+    quantized = converted.capture_trace["graphs"]["quantized"]
+    source_norms = [node["id"] for node in source["nodes"]
+                    if node["target"] == "aten.batch_norm.default"]
+    assert len(source_norms) == 3
+    for norm_id in source_norms:
+        assert len([node for node in quantized["nodes"]
+                    if node["target"] == "aten.conv2d.default"
+                    and norm_id in node["origin_node_ids"]]) == 1
+
+
+def test_reordered_identity_refuses_indistinguishable_source_owners():
+    from m2m.capture.trace import _reordered_graph_identity, snapshot_exported_program
+
+    class Repeated(nn.Module):
+        def forward(self, x):
+            return torch.sin(x) + torch.sin(x)
+
+    model = Repeated().eval()
+    inputs = (torch.ones(2),)
+    original = m2m.capture_frontend_snapshot(model, inputs)
+    actual = snapshot_exported_program(torch.export.export(model, inputs), stage="quantization_input")
+    assert sum(node["target"] == "aten.sin.default" for node in original["nodes"]) == 2
+    assert _reordered_graph_identity(original, actual) is None
+
+
+def test_structural_source_identity_does_not_claim_lifted_tensor_byte_equality():
+    from m2m.capture.trace import (_structural_rows, attach_original_identity,
+                                   snapshot_exported_program)
+
+    class Lifted(nn.Module):
+        def forward(self, x):
+            return x + torch.tensor([0.25, 0.75])
+
+    model = Lifted().eval()
+    inputs = (torch.ones(2),)
+    source = torch.export.export(model, inputs)
+    original = snapshot_exported_program(source, stage="original")
+    observed = torch.export.export(model, inputs)
+    target = next(iter(observed.constants))
+    source_value = source.constants[target]
+    observed.constants[target] = observed.constants[target] + 1
+    source_bytes = source_value.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+    observed_bytes = observed.constants[target].contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+    assert hashlib.sha256(source_bytes).hexdigest() != hashlib.sha256(observed_bytes).hexdigest()
+    actual = snapshot_exported_program(observed, stage="quantization_input")
+    assert _structural_rows(original) == _structural_rows(actual)
+    # The source graph/owner is still the same; callers must use separate
+    # precision/capture payload receipts before making a value claim.
+    assert attach_original_identity(observed, original, actual)
