@@ -5564,8 +5564,10 @@ def _arg_reduce(x, dim, keepdim, val_elem, *, is_min):
     """Combined value+index reduction over ``dim`` (the argmin/argmax kernel).
 
     Emits ONE two-output ``linalg.generic`` (family ``arg_reduce``): it threads a
-    running (best_value, best_index) pair, updating both when a strictly-better
-    element is seen (strict ``<``/``>`` keeps the first extremum, matching torch).
+    running (best_value, best_index) pair.  A NaN outranks any non-NaN value;
+    otherwise a strict ``<``/``>`` wins, and equal values or two NaNs choose the
+    lower original index.  The explicit index tie-break preserves the first
+    extremum even when the reduction traversal order changes.
     Returns ``(ops, values_ssa, indices_ssa)`` with both reshaped to keepdim shape
     when requested, or ``None`` if shapes are dynamic."""
     in_shape = _shape_of(x)
@@ -5575,7 +5577,7 @@ def _arg_reduce(x, dim, keepdim, val_elem, *, is_min):
     dim = dim % rank
     reduced_shape = [s for i, s in enumerate(in_shape) if i != dim]
 
-    from xdsl.dialects.arith import CmpfOp, CmpiOp, ConstantOp, IndexCastOp, SelectOp
+    from xdsl.dialects.arith import AndIOp, CmpfOp, CmpiOp, ConstantOp, IndexCastOp, OrIOp, SelectOp
     from xdsl.dialects.builtin import (
         AffineMapAttr,
         FloatAttr,
@@ -5593,14 +5595,16 @@ def _arg_reduce(x, dim, keepdim, val_elem, *, is_min):
     val_t = TensorType(val_elem, reduced_shape)
     idx_t = TensorType(idx_elem, reduced_shape)
 
-    # accumulator seeds: +inf/INT_MAX for min, -inf/INT_MIN for max; index 0
+    # The index seed is not a real source position: use the largest i64 so an
+    # equal-valued source element always replaces it, including when a legal
+    # reduction transformation changes the traversal order.
     if is_int:
         bits = val_elem.width.data
         seed = (1 << (bits - 1)) - 1 if is_min else -(1 << (bits - 1))
         vseed = ConstantOp(IntegerAttr(seed, val_elem), val_elem)
     else:
         vseed = ConstantOp(FloatAttr(float("inf") if is_min else float("-inf"), val_elem), val_elem)
-    iseed = ConstantOp(IntegerAttr(0, idx_elem), idx_elem)
+    iseed = ConstantOp(IntegerAttr((1 << 63) - 1, idx_elem), idx_elem)
     vinit = SplatOp(vseed.result, [], val_t)
     iinit = SplatOp(iseed.result, [], idx_t)
 
@@ -5612,11 +5616,35 @@ def _arg_reduce(x, dim, keepdim, val_elem, *, is_min):
     idx = IndexOp(dim)
     idx_cast = IndexCastOp(idx.results[0], idx_elem)
     pred_kind = ("slt" if is_min else "sgt") if is_int else ("olt" if is_min else "ogt")
-    pred = CmpiOp(blk.args[0], blk.args[1], pred_kind) if is_int \
+    better = CmpiOp(blk.args[0], blk.args[1], pred_kind) if is_int \
         else CmpfOp(blk.args[0], blk.args[1], pred_kind)
-    new_val = SelectOp(pred.results[0], blk.args[0], blk.args[1])
-    new_idx = SelectOp(pred.results[0], idx_cast.results[0], blk.args[2])
-    for op in (idx, idx_cast, pred, new_val, new_idx):
+    equal = CmpiOp(blk.args[0], blk.args[1], "eq") if is_int \
+        else CmpfOp(blk.args[0], blk.args[1], "oeq")
+    earlier = CmpiOp(idx_cast.results[0], blk.args[2], "ult")
+    body = [idx, idx_cast, better, equal, earlier]
+    same = equal.results[0]
+    preferred = better.results[0]
+    if not is_int:
+        # Torch's dim extremum propagates the FIRST NaN (including its payload).
+        # A NaN outranks every finite value; two NaNs tie by original index.
+        # Ordered comparisons alone would silently drop NaNs.
+        candidate_nan = CmpfOp(blk.args[0], blk.args[0], "uno")
+        best_nan = CmpfOp(blk.args[1], blk.args[1], "uno")
+        best_finite = CmpfOp(blk.args[1], blk.args[1], "ord")
+        new_nan = AndIOp(candidate_nan.results[0], best_finite.results[0])
+        both_nan = AndIOp(candidate_nan.results[0], best_nan.results[0])
+        same_value = OrIOp(equal.results[0], both_nan.results[0])
+        body.extend([candidate_nan, best_nan, best_finite, new_nan, both_nan, same_value])
+        same = same_value.results[0]
+        preferred_nan = OrIOp(better.results[0], new_nan.results[0])
+        body.append(preferred_nan)
+        preferred = preferred_nan.results[0]
+    earlier_tie = AndIOp(same, earlier.results[0])
+    replace = OrIOp(preferred, earlier_tie.results[0])
+    new_val = SelectOp(replace.results[0], blk.args[0], blk.args[1])
+    new_idx = SelectOp(replace.results[0], idx_cast.results[0], blk.args[2])
+    body.extend([earlier_tie, replace, new_val, new_idx])
+    for op in body:
         blk.add_op(op)
     blk.add_op(YieldOp(new_val.results[0], new_idx.results[0]))
 
@@ -5661,6 +5689,18 @@ def _make_dim_extremum(is_min, indices_only):
         if not operands or not isinstance(operands[0].type, TensorType):
             return _opaque_decomp(name, operands[:1], meta, "arg_reduce", pattern_hint=name)
         x = operands[0]
+        # The MLIR integer element type is signless.  Without source dtype
+        # metadata, i1 (bool) and unsigned inputs would be compared as signed
+        # values by the shared reduction.  Keep them opaque, not miscompiled.
+        import torch
+
+        input_node = _fx_arg(meta, 0)
+        source_dtype = getattr(getattr(input_node, "meta", {}).get("val"), "dtype", None)
+        if source_dtype not in {
+            torch.int8, torch.int16, torch.int32, torch.int64,
+            torch.float16, torch.float32, torch.float64, torch.bfloat16,
+        }:
+            return _opaque_decomp(name, operands[:1], meta, "arg_reduce", pattern_hint=name)
         in_shape = _shape_of(x)
         if in_shape is None:
             return _opaque_decomp(name, operands[:1], meta, "arg_reduce", pattern_hint=name)
