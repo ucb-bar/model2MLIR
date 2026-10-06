@@ -6,9 +6,14 @@ check (lowered + no opaque func.call) otherwise.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import runpy
+from pathlib import Path
+
+import numpy as np
 import pytest
 import torch
-
 from m2m.coverage import validate_op
 
 X = (torch.randn(4, 8),)
@@ -205,6 +210,68 @@ def test_dynamic_mask_cast_uses_source_extent(selected):
     assert cast_generic.outputs[0] is cast_empty.tensor
 
 
+@pytest.mark.parametrize("zero_mask", [False, True], ids=["mixed", "zero"])
+def test_dynamic_mask_cast_scatter_bundle_has_static_result(tmp_path, zero_mask):
+    import m2m
+    from m2m.capture.bundle import write_bundle
+    from m2m.coverage import opaque_report
+    from xdsl.dialects.builtin import DYNAMIC_INDEX, TensorType, i1, i64
+    from xdsl.dialects.func import FuncOp
+    from xdsl.dialects.linalg import GenericOp
+    from xdsl.dialects.tensor import DimOp, EmptyOp
+
+    source = Path(__file__).parent / "fixtures" / "neutral_dynamic_mask_cast_scatter.py"
+    model, (values, mask) = runpy.run_path(str(source))["get_model_and_inputs"]()
+    if zero_mask:
+        mask = torch.zeros_like(mask)
+    inputs = (values, mask)
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    result = m2m.convert(
+        model, inputs, backend="fx_importer", capture_trace=True,
+        weights_path=str(bundle / "weights.safetensors"),
+    )
+    assert result.ok, result.diagnostics
+    result.module.verify()
+    assert result.capture_trace["status"] == "complete"
+    assert opaque_report(result.mlir_text) == {}
+    functions = [op for op in result.module.walk() if isinstance(op, FuncOp)]
+    assert len(functions) == 1
+    assert list(functions[0].function_type.outputs.data) == [TensorType(i64, [6])]
+
+    def is_cast(op):
+        family = op.attributes.get("prov.family")
+        return family is not None and family.data == "cast"
+
+    cast_empty = next(op for op in result.module.walk() if isinstance(op, EmptyOp) and is_cast(op))
+    cast_generic = next(op for op in result.module.walk() if isinstance(op, GenericOp) and is_cast(op))
+    assert cast_generic.inputs[0].type == TensorType(i1, [DYNAMIC_INDEX])
+    assert cast_empty.tensor.type == cast_generic.results[0].type == TensorType(i64, [DYNAMIC_INDEX])
+    assert len(cast_empty.dynamic_sizes) == 1
+    cast_dim = cast_empty.dynamic_sizes[0].owner
+    assert isinstance(cast_dim, DimOp)
+    assert cast_dim.source is cast_generic.inputs[0]
+    assert cast_generic.outputs[0] is cast_empty.tensor
+
+    write_bundle(
+        model, inputs, bundle, source_path=source, capture_regions=False,
+        capture_trace=True, conversion_result=result,
+    )
+    receipt = json.loads((bundle / "capture_receipt.json").read_text())
+    trace = json.loads((bundle / "frontend-trace.json").read_text())
+    metadata = json.loads((bundle / "meta.json").read_text())
+    golden = np.load(bundle / "golden.npy", allow_pickle=False)
+    expected = model(*inputs).detach().numpy()
+    assert trace["status"] == "complete"
+    assert receipt["artifacts"]["model.mlir"]["sha256"] == hashlib.sha256(
+        result.mlir_text.encode()
+    ).hexdigest()
+    assert receipt["source"]["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert metadata["output_abi"] == [{"shape": [6], "dtype": "i64"}]
+    assert golden.dtype == np.int64 and golden.shape == (6,)
+    np.testing.assert_array_equal(golden, expected)
+
+
 def test_other_dynamic_elementwise_remains_opaque_but_parseable():
     import m2m
     from m2m.coverage import opaque_report
@@ -222,10 +289,9 @@ def test_other_dynamic_elementwise_remains_opaque_but_parseable():
 
 
 def test_dynamic_cast_refuses_inconsistent_exported_shape():
+    from m2m.ir.decompositions import _cast_scalar_build, _unary_elementwise
     from xdsl.dialects.builtin import DYNAMIC_INDEX, TensorType, i1, i64
     from xdsl.ir import Block
-
-    from m2m.ir.decompositions import _cast_scalar_build, _unary_elementwise
 
     dynamic_input = Block(arg_types=[TensorType(i1, [DYNAMIC_INDEX])]).args[0]
     inconsistent_meta = {"val": torch.empty(7, dtype=torch.int64)}
@@ -236,11 +302,10 @@ def test_dynamic_cast_refuses_inconsistent_exported_shape():
 
 
 def test_dynamic_cast_queries_each_dynamic_axis():
+    from m2m.ir.decompositions import _cast_scalar_build, _unary_elementwise
     from xdsl.dialects.builtin import DYNAMIC_INDEX, TensorType, i1, i64
     from xdsl.dialects.tensor import DimOp, EmptyOp
     from xdsl.ir import Block
-
-    from m2m.ir.decompositions import _cast_scalar_build, _unary_elementwise
 
     class Symbolic:
         def __int__(self):
