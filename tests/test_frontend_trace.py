@@ -119,12 +119,13 @@ def test_reconstructed_tuple_selector_requires_exact_parent_index_and_type():
     exported = torch.export.export(Model().eval(), (torch.randn(2, 8),))
     source = snapshot_exported_program(exported, stage="original")
     dest = snapshot_exported_program(exported, stage="quantized")
-    parent = next(node for node in source["nodes"] if node["target"] == "aten.split.Tensor")
     selectors = [node for node in dest["nodes"]
                  if node["target"] == "<built-in function getitem>"]
     assert len(selectors) == 2
     for selector in selectors:
-        selector["origin_node_ids"] = [parent["id"]]
+        # Torch may copy a staged parent rather than the original parent ID.
+        # The exact mapped tuple edge, index, type and uniqueness still prove it.
+        selector["origin_node_ids"] = []
     relation = graph_relation(source, dest)
     assert relation["status"] == "complete", relation
     assert sum(row["kind"] == "tuple_selection" for row in relation["relations"]) == 2
@@ -135,6 +136,33 @@ def test_reconstructed_tuple_selector_requires_exact_parent_index_and_type():
     wrong_type = copy.deepcopy(dest)
     next(node for node in wrong_type["nodes"] if node["id"] == selectors[0]["id"])["results"][0]["dtype"] = "float16"
     assert graph_relation(source, wrong_type)["status"] == "diagnostic"
+    wrong_origin = copy.deepcopy(dest)
+    source_selectors = [node for node in source["nodes"]
+                        if node["target"] == "<built-in function getitem>"]
+    other = next(node for node in wrong_origin["nodes"] if node["id"] == selectors[0]["id"])
+    other["origin_node_ids"] = [source_selectors[1]["id"]]
+    assert graph_relation(source, wrong_origin)["status"] == "diagnostic"
+
+
+def test_inactive_dropout_probability_change_requires_exact_input_binding():
+    from m2m.capture.trace import snapshot_exported_program
+
+    class Dropout(torch.nn.Module):
+        def forward(self, value):
+            return torch.ops.aten.dropout.default(value, 0.0, False)
+
+    exported = torch.export.export(Dropout().eval(), (torch.randn(2, 4),))
+    source = snapshot_exported_program(exported, stage="original")
+    dest = snapshot_exported_program(exported, stage="quantized")
+    dropout = next(node for node in dest["nodes"] if node["target"] == "aten.dropout.default")
+    dropout["origin_node_ids"] = []
+    dropout["args"][1] = 0.5
+    relation = graph_relation(source, dest)
+    assert relation["status"] == "complete", relation
+    assert any(row.get("proof", {}).get("inactive_dropout") is True
+               for row in relation["relations"])
+    dropout["args"][2] = True
+    assert graph_relation(source, dest)["status"] == "diagnostic"
 
 
 def test_mixed_precision_source_sites_decomposition_and_final_serialization(tmp_path, monkeypatch):
