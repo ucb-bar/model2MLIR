@@ -4690,10 +4690,23 @@ def decompose_full(operands, meta, node_name):
     return _opaque_decomp("aten_full", [], meta, "fill", pattern_hint="fill")
 
 
+# Bound source-evaluated dense FP32 payloads to 16 KiB; larger or dynamic
+# ranges stay unsupported rather than expanding unbounded MLIR constants.
+_ARANGE_LITERAL_MAX_ELEMENTS = 4096
+
+
 def decompose_arange(operands, meta, node_name):
-    """aten.arange[.start[_step]] -> 1-D iota via linalg.generic + linalg.index (family iota)."""
+    """Lower a static range without changing the source operator's FP32 values.
+
+    Integer ranges remain an index-based iota. A literal FP32 range is evaluated
+    by the selected source runtime and emitted as a bounded constant: PyTorch's
+    CPU arange uses wider accumulation and vector-chunk rounding, so FP32
+    ``start + index * step`` is not generally the same operation.
+    """
+    import math
+
     from xdsl.dialects.arith import AddiOp, ConstantOp, IndexCastOp, MuliOp, SIToFPOp
-    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr, IntegerAttr, IntegerType
+    from xdsl.dialects.builtin import AffineMapAttr, DenseIntOrFPElementsAttr, IntegerAttr, IntegerType
     from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
     from xdsl.dialects.tensor import EmptyOp
     from xdsl.ir import Block, Region
@@ -4703,7 +4716,70 @@ def decompose_arange(operands, meta, node_name):
     out_shape = _static_shape(getattr(val, "shape", []))
     elem = _element_type_from_meta(meta)
     if len(out_shape) != 1 or out_shape[0] < 0:
-        return _opaque_decomp("aten_arange", [], meta, "arange", pattern_hint="arange")
+        raise TypeError("arange requires a static rank-one result")
+
+    if isinstance(elem, Float32Type):
+        import torch
+
+        args = meta.get("_fx_args")
+        kwargs = meta.get("_fx_kwargs", {})
+        if (
+            operands
+            or not isinstance(args, (tuple, list))
+            or len(args) not in (1, 2, 3)
+            or not isinstance(kwargs, dict)
+            or set(kwargs) - {"dtype", "device", "layout", "pin_memory"}
+            or kwargs.get("dtype") not in (None, torch.float32)
+            or kwargs.get("layout") not in (None, torch.strided)
+            or kwargs.get("pin_memory") not in (None, False)
+            or getattr(val, "dtype", None) != torch.float32
+            or getattr(getattr(val, "device", None), "type", None) != "cpu"
+            or out_shape[0] > _ARANGE_LITERAL_MAX_ELEMENTS
+        ):
+            raise TypeError("FP32 arange requires bounded literal CPU operands and result")
+        selected_device = kwargs.get("device")
+        if selected_device is not None and selected_device not in ("cpu", torch.device("cpu")):
+            raise TypeError("FP32 arange requires a selected CPU device")
+        start, end, step = (
+            (0, args[0], 1)
+            if len(args) == 1
+            else (args[0], args[1], args[2] if len(args) == 3 else 1)
+        )
+        if any(type(value) not in (int, float) for value in (start, end, step)):
+            raise TypeError("FP32 arange arguments must be literal numbers")
+        try:
+            finite = all(math.isfinite(float(value)) for value in (start, end, step))
+            span = (float(end) - float(start)) / float(step)
+        except (OverflowError, ZeroDivisionError):
+            finite, span = False, math.inf
+        if not finite or not math.isfinite(span) or span > _ARANGE_LITERAL_MAX_ELEMENTS + 1:
+            raise TypeError("FP32 arange has nonfinite or oversized bounds")
+        cpu_capability = getattr(torch.backends.cpu, "get_cpu_capability", None)
+        if not callable(cpu_capability):
+            raise TypeError("selected Torch CPU capability is unavailable")
+        selected_cpu = (cpu_capability(), torch.get_num_threads(), torch.get_num_interop_threads())
+        if not selected_cpu[0] or selected_cpu[1] < 1 or selected_cpu[2] < 1:
+            raise TypeError("selected Torch CPU execution settings are invalid")
+        try:
+            with torch.no_grad():
+                values = torch.arange(start, end, step, dtype=torch.float32, device="cpu")
+        except (OverflowError, RuntimeError, ValueError):
+            raise TypeError("selected source runtime refused FP32 arange literals") from None
+        if selected_cpu != (cpu_capability(), torch.get_num_threads(), torch.get_num_interop_threads()):
+            raise TypeError("selected Torch CPU execution settings changed during FP32 arange")
+        if tuple(values.shape) != tuple(out_shape) or not bool(torch.isfinite(values).all()):
+            raise TypeError("FP32 arange result disagrees with source result metadata")
+        out_t = TensorType(elem, out_shape)
+        literal = DenseIntOrFPElementsAttr.from_list(out_t, values.tolist())
+        const = ConstantOp(literal, out_t)
+        const.attributes["prov.family"] = StringAttr("iota")
+        const.attributes["prov.source_evaluation"] = StringAttr("torch.arange:cpu:f32")
+        const.attributes["prov.source_runtime"] = StringAttr(str(torch.__version__))
+        const.attributes["prov.source_cpu_capability"] = StringAttr(selected_cpu[0])
+        const.attributes["prov.source_num_threads"] = IntegerAttr(selected_cpu[1], i64)
+        const.attributes["prov.source_num_interop_threads"] = IntegerAttr(selected_cpu[2], i64)
+        return DecompResult(ops=[const], result=const.result, pattern_hint="arange")
+
     nargs = len(meta.get("_fx_args", ()))
     start = _fx_arg(meta, 0, 0) if nargs >= 2 else 0
     step = _fx_arg(meta, 2, 1) if nargs >= 3 else 1
@@ -4725,6 +4801,8 @@ def decompose_arange(operands, meta, node_name):
     else:
         ic = IndexCastOp(idx.results[0], i64)
         f = SIToFPOp(ic.results[0], elem)
+        from xdsl.dialects.builtin import FloatAttr
+
         stepc = ConstantOp(FloatAttr(float(step), elem), elem)
         from xdsl.dialects.arith import AddfOp, MulfOp
 
