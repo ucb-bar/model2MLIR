@@ -26,9 +26,32 @@ from torch import nn
 
 
 def opaque_report(mlir_text: str) -> dict[str, int]:
-    """Return {opaque_func_name: count} for every ``func.call @name`` in the MLIR."""
-    names = re.findall(r"func\.call @([A-Za-z0-9_]+)", mlir_text)
-    return dict(Counter(names))
+    """Count calls without a defined body, independent of MLIR printer syntax.
+
+    FXImporter prints generic ``"func.call"(%x) <{callee = @name}>`` while
+    torch-mlir may print ``func.call @name(%x)``. A text regex can miss the
+    former and falsely report a complete capture. Parse only call-bearing
+    modules; an unparseable call is unknown, never zero opaque work.
+    """
+    if "func.call" not in mlir_text:
+        return {}
+    from xdsl.dialects.func import CallOp, FuncOp
+    from xdsl.traits import SymbolTable
+
+    from m2m.capture.torch_mlir_bridge import _parse_mlir_text_to_xdsl
+
+    module = _parse_mlir_text_to_xdsl(mlir_text)
+    if module is None:
+        raise ValueError("cannot inspect call-bearing MLIR for unresolved externals")
+    module.verify()
+    calls = Counter()
+    for op in module.walk():
+        if not isinstance(op, CallOp):
+            continue
+        callee = SymbolTable.lookup_symbol(op, op.callee)
+        if not isinstance(callee, FuncOp) or not callee.body.blocks:
+            calls[op.callee.string_value()] += 1
+    return dict(calls)
 
 
 @dataclass
