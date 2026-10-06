@@ -15,6 +15,7 @@ def normalize_conv2d_padding(graph_module: Any) -> list[dict[str, Any]]:
     carries ancestry, not a fabricated one-to-one source-node identity.
     """
     import torch
+    from torch._subclasses.fake_tensor import FakeTensor
     from torch.fx import Node
 
     overload = torch.ops.aten.conv2d.padding
@@ -65,10 +66,34 @@ def normalize_conv2d_padding(graph_module: Any) -> list[dict[str, Any]]:
             else:
                 # PyTorch SAME_UPPER: extra padding is on the right/bottom.
                 pad_input = [value for total in reversed(totals) for value in (total // 2, total - total // 2)]
+                input_node = values["input"]
+                input_value = input_node.meta.get("val") if isinstance(input_node, Node) else None
+                if (
+                    not isinstance(input_value, FakeTensor)
+                    or len(input_value.shape) != 4
+                    or any(type(size) is not int or size <= 0 for size in input_value.shape)
+                ):
+                    raise ValueError("asymmetric Conv2d padding requires a static input FakeTensor")
+                # Execute the actual ATen padding operation in the exported
+                # input's FakeTensorMode. The generated edge must have the
+                # exact dtype/device/shape metadata PT2E uses for eligibility;
+                # a guessed shape or a real tensor would not be source proof.
+                with input_value.fake_mode:
+                    padded_value = torch.ops.aten.constant_pad_nd.default(input_value, pad_input, 0.0)
+                if (
+                    not isinstance(padded_value, FakeTensor)
+                    or padded_value.fake_mode is not input_value.fake_mode
+                    or padded_value.dtype != input_value.dtype
+                    or padded_value.device != input_value.device
+                    or len(padded_value.shape) != 4
+                    or any(type(size) is not int or size <= 0 for size in padded_value.shape)
+                ):
+                    raise ValueError("asymmetric Conv2d padding has invalid generated FakeTensor metadata")
                 with graph.inserting_before(node):
                     padded = graph.call_function(
                         torch.ops.aten.constant_pad_nd.default, (values["input"], pad_input, 0.0)
                     )
+                padded.meta["val"] = padded_value
                 custom = node.meta.get("custom") or {}
                 padded.meta["custom"] = {
                     "m2m_lineage": list(custom.get("m2m_lineage") or ()),

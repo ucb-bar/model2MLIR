@@ -1,6 +1,7 @@
 """Real PT2E capture must not silently skip the string-padding Conv2d overload."""
 
 import m2m
+import pytest
 import torch
 from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 from m2m.capture.pt2e_integerize import integerize_pt2e
@@ -9,6 +10,7 @@ from m2m.capture.torchao_pipeline import QuantizationConfig, apply_quantization
 from m2m.capture.trace import snapshot_exported_program
 from m2m.coverage import opaque_report
 from torch import nn
+from torch._subclasses.fake_tensor import FakeTensor
 
 
 class PaddedConv(nn.Module):
@@ -69,6 +71,37 @@ def test_padding_normalization_preserves_float_values_and_keyword_arguments():
         receipt = normalize_conv2d_padding(exported)
         assert len(receipt) == 1 and receipt[0]["padding"] == padding
         torch.testing.assert_close(exported(*inputs), expected, atol=0, rtol=0)
+
+
+def test_asymmetric_padding_has_exact_fake_tensor_metadata_and_source_ancestry():
+    inputs = (torch.randn(1, 3, 9, 9),)
+    exported = torch.export.export(PaddedConv("same", (4, 3)).eval(), inputs).module()
+    conv = next(node for node in exported.graph.nodes if node.target == torch.ops.aten.conv2d.padding)
+    source_input = conv.args[0].meta["val"]
+    conv.meta["custom"] = {"m2m_lineage": ["source-conv"]}
+
+    receipt = normalize_conv2d_padding(exported)
+    padded = next(node for node in exported.graph.nodes if node.target == torch.ops.aten.constant_pad_nd.default)
+    value = padded.meta["val"]
+    assert isinstance(value, FakeTensor)
+    assert value.fake_mode is source_input.fake_mode
+    assert value.shape == (1, 3, 12, 11)
+    assert value.dtype == source_input.dtype and value.device == source_input.device
+    assert padded.meta["custom"] == {
+        "m2m_lineage": ["source-conv"],
+        "m2m_transform": "conv2d_string_padding",
+    }
+    assert "_m2m_node_id" not in padded.meta
+    assert receipt[0]["source_ids"] == ["source-conv"]
+
+
+def test_asymmetric_padding_refuses_missing_input_fake_tensor_metadata():
+    inputs = (torch.randn(1, 3, 9, 9),)
+    exported = torch.export.export(PaddedConv("same", (4, 3)).eval(), inputs).module()
+    conv = next(node for node in exported.graph.nodes if node.target == torch.ops.aten.conv2d.padding)
+    conv.args[0].meta.pop("val")
+    with pytest.raises(ValueError, match="FakeTensor"):
+        normalize_conv2d_padding(exported)
 
 
 def test_string_padding_normalized_before_batch_norm_fold_keeps_source_lineage():
