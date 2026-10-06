@@ -694,7 +694,8 @@ def write_multi_program_bundle(programs: list[dict], root_session: dict, out: st
             session=program.get("session"), quantization_preapplied=stage_preapplied,
             capture_trace=capture_trace, source_path=source_path,
             metadata={**(metadata or {}), **program.get("metadata", {})},
-            original_frontend_snapshot=program.get("original_frontend_snapshot"))
+            original_frontend_snapshot=program.get("original_frontend_snapshot"),
+            conversion_result=program.get("conversion_result"))
         manifest = json.loads((stage_out / "weights.safetensors.manifest.json").read_text())
         input_order = json.loads((stage_out / "input_order.json").read_text())
         stage_records[name] = {

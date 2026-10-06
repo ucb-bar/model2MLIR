@@ -81,6 +81,34 @@ def _session(shared, *, bad_route=False):
     return make_external_runtime_session(version=2, programs=programs, metadata=root)
 
 
+def test_multi_program_bundle_reuses_exact_stage_conversions(tmp_path, monkeypatch):
+    import m2m
+
+    session = _session(Shared().eval())
+    programs = session.bundle_programs()
+    out = tmp_path / "reused"
+    for program in programs:
+        stage = out / "stages" / program["name"]
+        stage.mkdir(parents=True)
+        program["conversion_result"] = m2m.convert(
+            program["model"], program["inputs"], backend="fx_importer",
+            weights_path=str(stage / "weights.safetensors"), capture_trace=True,
+        )
+
+    def refuse_second_conversion(*args, **kwargs):
+        raise AssertionError("a prepared stage must not be exported again")
+
+    monkeypatch.setattr(m2m, "convert", refuse_second_conversion)
+    summary = write_multi_program_bundle(
+        programs, dict(session.metadata), out, capture_trace=True,
+    )
+    assert summary["n_programs"] == len(programs)
+    verify_bundle_integrity(out)
+    for program in programs:
+        saved = (out / "stages" / program["name"] / "model.mlir").read_text()
+        assert saved == program["conversion_result"].mlir_text
+
+
 def test_quantized_session_binds_one_shared_model_and_stage_receipts(tmp_path):
     calls = []
 
