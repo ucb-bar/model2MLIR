@@ -162,14 +162,208 @@ def capture_frontend_snapshot(model: Any, inputs: Any = (), *, stage: str = "ori
                 "counting_unit": "static_captured_call_sites"}
 
 
+def _retarget_captured_float_dtypes(graph_module: Any, dtype: Any,
+                                    original: dict[str, Any]) -> list[dict[str, Any]]:
+    """Retarget only explicit floating ``dtype`` operands of schema-known FX calls."""
+    import torch
+
+    def dtype_literals(value: Any) -> list[Any]:
+        if isinstance(value, torch.dtype):
+            return [value]
+        if isinstance(value, (tuple, list)):
+            return [item for child in value for item in dtype_literals(child)]
+        if isinstance(value, dict):
+            return [item for child in value.values() for item in dtype_literals(child)]
+        return []
+
+    decisions = []
+    seen_ids = set()
+    original_nodes = {node["id"]: node for node in original["nodes"]}
+    for _, module in _graph_modules(graph_module):
+        module_changed = False
+        for node in module.graph.nodes:
+            if node.op != "call_function":
+                if dtype_literals(node.args) or dtype_literals(node.kwargs):
+                    raise ValueError("captured dtype literal lacks a schema-owned call")
+                continue
+            schema = getattr(node.target, "_schema", None)
+            args = list(node.args)
+            kwargs = dict(node.kwargs)
+            node_changed = False
+            node_decisions = 0
+            dtype_positions = ([(i, arg.name) for i, arg in enumerate(schema.arguments)
+                                if arg.name == "dtype"] if schema is not None else [])
+            for index, name in dtype_positions:
+                if name in kwargs:
+                    location, value = "kwargs", kwargs[name]
+                elif index < len(args):
+                    location, value = "args", args[index]
+                else:
+                    continue
+                if not isinstance(value, torch.dtype):
+                    if value is not None:
+                        raise ValueError("captured dtype operand is not a static torch.dtype")
+                    continue
+                if value.is_complex:
+                    raise ValueError("captured complex dtype is not FP32-staged")
+                replacement = dtype if value.is_floating_point else value
+                source_id = node.meta.get("_m2m_node_id")
+                if not isinstance(source_id, str) or not source_id:
+                    raise ValueError("captured dtype operand has no source node identity")
+                if source_id in seen_ids:
+                    raise ValueError("captured dtype operand has duplicate source node identity")
+                seen_ids.add(source_id)
+                source = original_nodes.get(source_id)
+                source_value = (source["kwargs"].get(name) if location == "kwargs"
+                                else source["args"][index]) if source else None
+                if (source is None or source["op"] != "call_function"
+                        or source["target"] != str(node.target)
+                        or source_value != {"kind": "dtype", "value": str(value)}):
+                    raise ValueError("captured dtype operand differs from exact original typed source")
+                decisions.append({"source_node_id": source_id,
+                                  "target": str(node.target), "argument": name,
+                                  "location": location, "from_dtype": str(value),
+                                  "to_dtype": str(replacement)})
+                node_decisions += 1
+                if replacement != value:
+                    if location == "kwargs":
+                        kwargs[name] = replacement
+                    else:
+                        args[index] = replacement
+                    node_changed = True
+            # A floating dtype literal anywhere other than a schema's dtype
+            # operand would otherwise evade both the rewrite and its audit.
+            all_literals = dtype_literals(node.args) + dtype_literals(node.kwargs)
+            if len(all_literals) != node_decisions:
+                raise ValueError("captured dtype literal lacks a schema-owned dtype operand")
+            if node_changed:
+                node.args = tuple(args)
+                node.kwargs = kwargs
+                module_changed = True
+        if module_changed:
+            module.graph.lint()
+            module.recompile()
+    return decisions
+
+
+def _tensor_bytes_sha256(value: Any) -> str:
+    """Hash exact dense tensor storage bytes, including BF16 and integer values."""
+    import torch
+
+    if not isinstance(value, torch.Tensor) or value.layout != torch.strided:
+        raise ValueError("captured constant has no dense tensor storage")
+    raw = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+    return hashlib.sha256(memoryview(raw.numpy()).cast("B")).hexdigest()
+
+
+def _owned_lifted_constant_conversions(exported: Any, graph_module: Any,
+                                        dtype: Any) -> list[dict[str, Any]]:
+    """Clone only floating exported CONSTANT_TENSOR values into the owned module."""
+    import torch
+    from torch.export.graph_signature import InputKind
+
+    rows = []
+    for ordinal, spec in enumerate(exported.graph_signature.input_specs):
+        if spec.kind != InputKind.CONSTANT_TENSOR:
+            continue
+        name = str(spec.target)
+        source = exported.constants.get(name)
+        parent_name, _, local_name = name.rpartition(".")
+        owner = graph_module.get_submodule(parent_name) if parent_name else graph_module
+        materialized = getattr(owner, local_name, None)
+        if not isinstance(source, torch.Tensor) or not isinstance(materialized, torch.Tensor):
+            raise ValueError("captured constant has no owned tensor attribute")
+        if source.is_complex():
+            raise ValueError("captured complex constant is not FP32-staged")
+        source_hash = _tensor_bytes_sha256(source)
+        if (source.dtype != materialized.dtype or source.shape != materialized.shape
+                or source_hash != _tensor_bytes_sha256(materialized)):
+            raise ValueError("captured constant differs from its owned module attribute")
+        converted = (source.detach().to(dtype=dtype, copy=True)
+                     if source.is_floating_point() else materialized)
+        if source.is_floating_point():
+            setattr(owner, local_name, converted)
+        rows.append({"source_input_ordinal": ordinal, "source_target": name,
+                     "from_dtype": str(source.dtype), "to_dtype": str(converted.dtype),
+                     "shape": list(source.shape), "source_sha256": source_hash,
+                     "staged_sha256": _tensor_bytes_sha256(converted)})
+    return rows
+
+
+def _audit_staged_float_precision(exported: Any, graph_module: Any, inputs: Any,
+                                  snapshot: dict[str, Any], dtype: Any) -> dict:
+    """Check actual re-exported tensor types, not the stale pre-rewrite FX metadata."""
+    import torch
+    from torch.utils._pytree import tree_flatten
+
+    state = list(graph_module.named_parameters()) + list(graph_module.named_buffers())
+    captured_state = list((getattr(exported, "state_dict", {}) or {}).values())
+    captured_constants = list((getattr(exported, "constants", {}) or {}).values())
+    input_values = tree_flatten(tuple(inputs))[0]
+    wrong = []
+    checked = 0
+    if snapshot.get("status") != "complete":
+        raise ValueError("staged graph has no complete typed frontend snapshot")
+    for kind, values in (("state", [value for _, value in state]),
+                         ("exported_state", captured_state),
+                         ("exported_constant", captured_constants),
+                         ("input", input_values)):
+        for value in values:
+            if isinstance(value, torch.Tensor) and value.is_complex():
+                raise ValueError(f"{kind} has complex precision outside FP32 staging")
+            if isinstance(value, torch.Tensor) and value.is_floating_point():
+                checked += 1
+                if value.dtype != dtype:
+                    wrong.append(f"{kind}:{value.dtype}")
+    rows = {node["id"]: node for node in snapshot["nodes"]}
+    for _, module in _graph_modules(exported.graph_module):
+        for node in module.graph.nodes:
+            if node.op not in {"call_function", "call_method", "call_module"}:
+                continue
+            schema = getattr(node.target, "_schema", None)
+            tensor_return = bool(schema and any("Tensor" in str(value.type)
+                                                 for value in schema.returns))
+            row = rows.get(node.meta.get("_m2m_node_id"))
+            if row is None:
+                raise ValueError("staged call lacks a typed snapshot identity")
+            if (tensor_return or schema is None) and any(
+                    result.get("kind") == "unknown" for result in row["results"]):
+                raise ValueError("staged call has an unknown tensor result dtype")
+    for node in snapshot["nodes"]:
+        for result in node["results"]:
+            spelling = result.get("dtype")
+            if spelling is None and result.get("kind") == "tensor":
+                raise ValueError("staged tensor result lacks a dtype")
+            if spelling is None:
+                continue
+            value_dtype = getattr(torch, spelling, None)
+            if not isinstance(value_dtype, torch.dtype):
+                raise ValueError(f"staged result has an unrecognized dtype: {spelling}")
+            if value_dtype.is_complex:
+                raise ValueError(f"staged result has complex precision: {node['id']}")
+            if value_dtype.is_floating_point:
+                checked += 1
+                if value_dtype != dtype:
+                    wrong.append(f"{node['id']}:{spelling}")
+    if wrong:
+        raise ValueError(f"staged graph retains non-target floating precision: {wrong[:8]}")
+    return {"status": "complete", "target_dtype": str(dtype),
+            "checked_floating_values": checked, "non_target_floating_values": 0}
+
+
 def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
-                                  original_frontend_snapshot: dict[str, Any] | None = None):
+                                  original_frontend_snapshot: dict[str, Any] | None = None,
+                                  retarget_float_dtype_arguments: bool = False):
     """Cast an owned materialization of a captured static program with exact origins.
 
     Returns ``(graph_module, inputs_tuple, original_snapshot, receipt)``. This is
     precision conversion of the already-captured program, not a claim that
     dtype-dependent Python branches would recapture identically. No graph-name
     matching, source-model mutation, decomposition or quantization takes place.
+    Opt-in retargeting changes only schema-identified floating dtype operands
+    and owned floating lifted constants in that captured graph, then re-exports
+    to audit the resulting real types. Integer/bool values remain unchanged;
+    no numerical-equivalence claim follows from a successful type audit.
     """
     import torch
     from torch.utils._pytree import tree_flatten, tree_map
@@ -194,10 +388,20 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
     # Export's materialization can share Parameter objects with the source model.
     # Register fresh owned Parameters/buffers instead of .to(), which may update
     # an aliased Parameter's data. Convert each distinct object exactly once.
+    constant_targets = set()
+    if retarget_float_dtype_arguments:
+        from torch.export.graph_signature import InputKind
+
+        constant_targets = {str(spec.target) for spec in exported.graph_signature.input_specs
+                            if spec.kind == InputKind.CONSTANT_TENSOR}
     memo = {}
     for parameter, values in ((True, list(gm.named_parameters(remove_duplicate=False))),
                               (False, list(gm.named_buffers(remove_duplicate=False)))):
         for name, value in values:
+            # Some Torch versions register lifted constants as buffers in the
+            # owned module; the exact constant pass below binds those bytes.
+            if name in constant_targets:
+                continue
             converted = memo.get(id(value))
             if converted is None:
                 converted = value.detach().to(dtype=dtype if value.is_floating_point() else value.dtype, copy=True)
@@ -222,10 +426,59 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
                           and v.is_floating_point() else v, tuple(inputs))
     from torch.ao.quantization import allow_exported_model_train_eval
     allow_exported_model_train_eval(gm)
+    decisions = None
+    constants = None
+    staged_snapshot = None
+    staged_audit = None
+    if retarget_float_dtype_arguments:
+        constants = _owned_lifted_constant_conversions(exported, gm, dtype)
+        decisions = _retarget_captured_float_dtypes(gm, dtype, original)
+        prepare_lifted_constant_lineage(gm)
+        staged = torch.export.export(gm, cast_inputs)
+        from torch.export.graph_signature import InputKind
+
+        def verify_constants(program):
+            specs = [spec for spec in program.graph_signature.input_specs
+                     if spec.kind == InputKind.CONSTANT_TENSOR]
+            if len(specs) != len(constants):
+                raise ValueError("staged constant roster differs from captured source")
+            for row, spec in zip(constants, specs, strict=True):
+                value = program.constants.get(str(spec.target))
+                if (not isinstance(value, torch.Tensor) or str(value.dtype) != row["to_dtype"]
+                        or list(value.shape) != row["shape"]
+                        or _tensor_bytes_sha256(value) != row["staged_sha256"]):
+                    raise ValueError("staged constant differs from owned converted source")
+                row["staged_target"] = str(spec.target)
+
+        verify_constants(staged)
+        snapshot_exported_program(staged, stage="staged")
+        gm = staged.module()
+        allow_exported_model_train_eval(gm)
+        prepare_lifted_constant_lineage(gm)
+        # The returned module has its own final lineage/constant metadata.
+        # Bind the receipt to a fresh export of *that* module, rather than an
+        # intermediate program whose graph can differ after materialization.
+        returned = torch.export.export(gm, cast_inputs)
+        if ([spec.kind for spec in returned.graph_signature.input_specs]
+                != [spec.kind for spec in staged.graph_signature.input_specs]
+                or [spec.kind for spec in returned.graph_signature.output_specs]
+                != [spec.kind for spec in staged.graph_signature.output_specs]
+                or returned.call_spec.in_spec != staged.call_spec.in_spec
+                or returned.call_spec.out_spec != staged.call_spec.out_spec):
+            raise ValueError("returned staged module changed input/output structure")
+        verify_constants(returned)
+        staged_snapshot = snapshot_exported_program(returned, stage="staged")
+        staged_audit = _audit_staged_float_precision(returned, gm, cast_inputs,
+                                                      staged_snapshot, dtype)
     receipt = {"schema": "m2m.frontend-precision-conversion.v1",
                "scope": "precision conversion of captured static program",
                "original_graph_sha256": original["sha256"], "target_dtype": str(dtype),
                "state_conversions": conversions, "input_conversions": input_conversions}
+    if retarget_float_dtype_arguments:
+        receipt.update(staged_graph_sha256=staged_snapshot["sha256"],
+                       dtype_decisions=decisions, constant_conversions=constants,
+                       staged_precision_audit=staged_audit,
+                       graph_dtype_retargeting="schema_float_dtype_operands")
     receipt["sha256"] = _digest(receipt)
     return gm, cast_inputs, original, receipt
 
@@ -463,18 +716,9 @@ def tuple_selection_trace_program(exported: Any) -> Any:
     return detached
 
 
-def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
-                                node: dict[str, Any]) -> dict[str, Any] | None:
-    """Prove a vanished forward-value identity at each exact typed use.
-
-    PyTorch export can remove ``aten.to`` before a registered decomposition
-    observes it. Matching operation names or output dtypes alone is insufficient:
-    the destination graph must route the cast's original producer to every
-    corresponding consumer at the same typed argument path. Any missing lineage,
-    changed dtype/shape, requested copy, or layout request leaves it unresolved.
-    ``detach_`` affects autograd metadata, which this forward-value trace does not
-    certify; its captured tensor value may be bypassed under the same edge proof.
-    """
+def _forward_identity_value(source: dict[str, Any], node: dict[str, Any]
+                            ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+    """Return an exact input/output tensor identity for a supported no-op call."""
     target = node.get("target")
     if node.get("op") != "call_function" or target not in {
             "aten.to.dtype", "aten.to.dtype_layout", "aten.to.device", "aten.detach_.default"}:
@@ -537,19 +781,73 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
            ("kind", "dtype", "storage_dtype", "compute_dtype", "shape",
             "device", "layout", "stride")):
         return None
+    return producer, original, output
+
+
+def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
+                                node: dict[str, Any]) -> dict[str, Any] | None:
+    """Prove an eliminated identity chain by exact typed terminal use edges.
+
+    PyTorch can remove both ``detach_`` and an adjacent no-op ``to`` during
+    decomposition. Every skipped link must separately preserve the exact tensor
+    value and metadata, and every terminal use must bypass to the same mapped
+    producer at the same typed consumer argument. Autograd is not certified.
+    """
+    checked = _forward_identity_value(source, node)
+    if checked is None:
+        return None
+    producer, original, output = checked
+    sources = {item["id"]: item for item in source["nodes"]}
     descendants: dict[str, set[str]] = {}
     for item in dest["nodes"]:
         for ancestor in item.get("origin_node_ids") or ():
             descendants.setdefault(ancestor, set()).add(item["id"])
+    bypassed = {node["id"]}
+    while producer["id"] not in descendants:
+        upstream = _forward_identity_value(source, producer)
+        if upstream is None:
+            return None
+        parent, parent_value, parent_output = upstream
+        if parent_output != original or producer["id"] in bypassed:
+            return None
+        bypassed.add(producer["id"])
+        producer, original = parent, parent_value
     corresponding_producers = descendants.get(producer["id"], set())
     if not corresponding_producers:
         return None
     dest_edges = dest.get("edges") or []
     dest_values = {value["id"]: value for item in dest["nodes"]
                    for value in item.get("results") or [] if isinstance(value.get("id"), str)}
-    uses = [edge for edge in source.get("edges") or []
-            if edge.get("producer_node_id") == node["id"]]
-    if not uses or any(edge.get("producer_value_id") != output.get("id") for edge in uses):
+    source_edges = source.get("edges") or []
+
+    def terminal_uses(value_node: dict[str, Any], value: dict[str, Any],
+                      visited: set[str]) -> list[dict[str, Any]] | None:
+        if value_node["id"] in visited:
+            return None
+        visited = {*visited, value_node["id"]}
+        uses = [edge for edge in source_edges
+                if edge.get("producer_node_id") == value_node["id"]]
+        if not uses or any(edge.get("producer_value_id") != value.get("id") for edge in uses):
+            return None
+        terminal = []
+        for use in uses:
+            consumer_id = use.get("consumer_node_id")
+            if consumer_id in descendants:
+                terminal.append(use)
+                continue
+            consumer = sources.get(consumer_id)
+            next_link = _forward_identity_value(source, consumer) if consumer else None
+            if (next_link is None or next_link[0]["id"] != value_node["id"]
+                    or next_link[1] != value or use.get("argument_path") != "args/0"):
+                return None
+            child = terminal_uses(consumer, next_link[2], visited)
+            if child is None:
+                return None
+            terminal.extend(child)
+        return terminal
+
+    uses = terminal_uses(node, output, set())
+    if not uses:
         return None
     matched = []
     for use in uses:
@@ -577,7 +875,7 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
                         edge["argument_path"]) for edge in matching_edges)
     return {"source_ids": [node["id"]], "destination_ids": [], "kind": "eliminated",
             "reason": ("forward tensor-value-preserving detach_ with exact typed consumer-edge bypass"
-                       if target == "aten.detach_.default" else
+                       if node["target"] == "aten.detach_.default" else
                        "type/device/layout-preserving aten.to with exact typed consumer-edge bypass"),
             "proof": {"input_node_id": producer["id"], "typed_bypass_edges": sorted(set(matched)),
                       "scope": "forward tensor values; autograd metadata is not certified"}}

@@ -118,6 +118,25 @@ the source model unchanged. Its deterministic receipt lists exact state/input
 precision conversions. It converts the captured static program, not dtype-dependent
 Python branches: any different Python specialization needs a separate capture.
 
+For a captured graph with explicit floating-point casts or typed factories,
+opt in to audited FP32 staging:
+
+```python
+staged, staged_inputs, original, receipt = m2m.materialize_frontend_precision(
+    model, inputs, dtype=torch.float32, retarget_float_dtype_arguments=True)
+```
+
+The opt-in rewrites only floating `dtype` operands identified by Torch operator
+schemas and copies floating lifted tensor constants into owned FP32 storage.
+Integer and boolean dtype operands and constants retain their values and types;
+complex tensors are refused rather than treated as FP32. The source model and
+captured constants are not mutated. The receipt binds the
+original and staged graph hashes, typed dtype decisions, and source/staged
+constant content hashes. Re-export must verify that no non-FP32 floating tensor
+type remains. This is a precision change, **not** a numerical-equivalence or
+application-accuracy guarantee: compare the source and staged outputs separately
+for the selected inputs, and do not infer behavior of uncaptured Python branches.
+
 ## Portable PT2E integer contractions
 
 ```python
