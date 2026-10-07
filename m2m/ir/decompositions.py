@@ -5541,17 +5541,51 @@ def decompose_sin(operands, meta, node_name):
 def decompose_cumsum(operands, meta, node_name):
     """aten.cumsum.default(input, dim) — prefix sum along ``dim``.
 
-    Lowered as a single masked-reduction ``linalg.generic`` (family ``scan``):
-    out[..., i, ...] = sum_j (j <= i) ? x[..., j, ...] : 0
-    Adds a parallel loop per dim plus one reduction loop ``j`` over the scan dim,
-    using ``linalg.index`` to compare i vs j. Handles a dtype change (e.g. bool
-    ``cumsum`` -> i64 counts) by casting the read element to the output dtype."""
+    Floating CPU scans use an explicitly ordered ``scf.for`` and a separate
+    PyTorch CPU accumulation type. Integer scans retain the existing masked
+    ``linalg.generic`` because modular integer addition is associative.
+    Unsupported/unknown floating device and rank forms are opaque."""
     if not operands or not isinstance(operands[0].type, TensorType):
         return _opaque_decomp("aten_cumsum", operands[:1], meta, "scan", pattern_hint="cumsum")
     x = operands[0]
     in_shape = _shape_of(x)
     if in_shape is None or any(d < 0 for d in in_shape):
         return _opaque_decomp("aten_cumsum", operands[:1], meta, "scan", pattern_hint="cumsum")
+
+    from xdsl.dialects.builtin import AnyFloat, BFloat16Type, Float16Type, Float32Type, Float64Type
+
+    in_elem = x.type.element_type
+    out_elem = _element_type_from_meta(meta)
+    if isinstance(in_elem, AnyFloat) or isinstance(out_elem, AnyFloat):
+        # PyTorch CPU uses f32 accumulation for f16/bf16 outputs, f64 for
+        # f32/f64 outputs.  A result device alone cannot prove the operand
+        # device; require both captured FX values explicitly.
+        args = meta.get("_fx_args") or ()
+        source_meta = getattr(args[0], "meta", None) if args else None
+        source_val = source_meta.get("val") if isinstance(source_meta, dict) else None
+        result_val = meta.get("val")
+        if (getattr(getattr(source_val, "device", None), "type", None) != "cpu"
+                or getattr(getattr(result_val, "device", None), "type", None) != "cpu"):
+            raise TypeError("floating cumsum requires captured CPU input and result devices")
+        import torch
+
+        selected_dtypes = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+        if (getattr(source_val, "dtype", None) not in selected_dtypes
+                or getattr(result_val, "dtype", None) not in selected_dtypes
+                or _element_type_from_meta({"val": source_val}) != in_elem
+                or tuple(getattr(source_val, "shape", ())) != tuple(in_shape)):
+            raise TypeError("floating cumsum requires matching captured input metadata")
+        supported = (BFloat16Type, Float16Type, Float32Type, Float64Type)
+        if not isinstance(in_elem, supported) or not isinstance(out_elem, supported):
+            raise TypeError("floating cumsum has unsupported input or result dtype")
+        if not in_shape:  # scalar scans require a separate rank-zero lowering
+            raise TypeError("floating cumsum scalar shape is not lowered")
+        if tuple(getattr(result_val, "shape", ())) != tuple(in_shape):
+            raise TypeError("floating cumsum result shape differs from captured input")
+        dim_arg = _fx_arg(meta, 1, None)
+        if not isinstance(dim_arg, int) or isinstance(dim_arg, bool) or not -len(in_shape) <= dim_arg < len(in_shape):
+            raise TypeError("floating cumsum requires a static valid axis")
+        return _ordered_cpu_float_cumsum(x, in_shape, dim_arg % len(in_shape), out_elem)
 
     from xdsl.dialects.arith import (
         AddfOp,
@@ -5569,6 +5603,8 @@ def decompose_cumsum(operands, meta, node_name):
     from xdsl.ir.affine import AffineExpr, AffineMap
 
     rank = len(in_shape)
+    if rank == 0:
+        return _opaque_decomp("aten_cumsum", operands[:1], meta, "scan", pattern_hint="cumsum")
     dim = int(_fx_arg(meta, 1, -1) or 0) % rank
     in_elem = x.type.element_type
     out_elem = _element_type_from_meta(meta)
@@ -5626,6 +5662,116 @@ def decompose_cumsum(operands, meta, node_name):
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("scan")
     return DecompResult(ops=ops, result=gen.results[0], region_ids=[rid], pattern_hint="cumsum")
+
+
+def _ordered_cpu_float_cumsum(x, shape, dim, out_elem):
+    """A row-major ordered CPU prefix scan, with a separate wide accumulator.
+
+    The `scf.for` induction visits every source position once.  The prior
+    accumulator for a scan lane is at flat index `i - stride[dim]`; that index
+    has already been visited even when other lanes are interleaved.  No linalg
+    reduction or reassociation is permitted here.  Each prefix is cast only
+    when stored to the public output dtype.
+    """
+    from xdsl.dialects.arith import AddfOp, CmpiOp, ConstantOp, DivUIOp, RemUIOp, SubiOp
+    from xdsl.dialects.builtin import (
+        BFloat16Type,
+        Float16Type,
+        Float32Type,
+        Float64Type,
+        FloatAttr,
+        IndexType,
+        IntegerAttr,
+    )
+    from xdsl.dialects.scf import ForOp, IfOp
+    from xdsl.dialects.scf import YieldOp as ScfYield
+    from xdsl.dialects.tensor import EmptyOp, ExtractOp, InsertOp
+    from xdsl.ir import Block, Region
+
+    # Bound constants and flattened offsets to a signed 64-bit source index.
+    # This is a source-IR validity bound, not proof that a later 32-bit target
+    # can represent the same index values; that needs target-specific checks.
+    source_index_max = (1 << 63) - 1
+    if any(extent < 0 or extent > source_index_max for extent in shape):
+        raise TypeError("floating cumsum shape exceeds 64-bit source index")
+    total = 1
+    for extent in shape:
+        if extent and total > source_index_max // extent:
+            raise TypeError("floating cumsum extent product exceeds 64-bit source index")
+        total *= extent
+    stride = 1
+    for extent in shape[dim + 1:]:
+        if extent and stride > source_index_max // extent:
+            raise TypeError("floating cumsum stride exceeds 64-bit source index")
+        stride *= extent
+    if total == 0:
+        # Empty tensors have no ordered additions; preserve the complete
+        # result shape without synthesizing a divide-by-zero lane coordinate.
+        empty = EmptyOp([], TensorType(out_elem, list(shape)))
+        rid = _next_region_id("scan")
+        _attach_region_id(empty, rid)
+        empty.attributes["prov.family"] = StringAttr("scan")
+        return DecompResult(ops=[empty], result=empty.results[0], region_ids=[rid], pattern_hint="cumsum")
+
+    ops: list[Operation] = []
+    flat, flattened = _flatten_1d(x, shape, x.type.element_type, ops)
+    if flat is None or flattened != total:
+        raise TypeError("floating cumsum input cannot be flattened exactly")
+    accumulator_elem = Float32Type() if isinstance(out_elem, (Float16Type, BFloat16Type)) else Float64Type()
+    out_flat_t = TensorType(out_elem, [total])
+    acc_flat_t = TensorType(accumulator_elem, [total])
+    c0 = ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+    c1 = ConstantOp(IntegerAttr(1, IndexType()), IndexType())
+    cend = ConstantOp(IntegerAttr(total, IndexType()), IndexType())
+    cstride = ConstantOp(IntegerAttr(stride, IndexType()), IndexType())
+    cextent = ConstantOp(IntegerAttr(shape[dim], IndexType()), IndexType())
+    zero = ConstantOp(FloatAttr(0.0, accumulator_elem), accumulator_elem)
+    out_init = EmptyOp([], out_flat_t)
+    acc_init = EmptyOp([], acc_flat_t)
+    ops.extend([c0, c1, cend, cstride, cextent, zero, out_init, acc_init])
+
+    body = Block(arg_types=[IndexType(), out_flat_t, acc_flat_t])
+    iv, out_iter, acc_iter = body.args
+    current = ExtractOp(flat, [iv], x.type.element_type)
+    body.add_op(current)
+    # PyTorch casts to an explicit dtype= before scanning.  Even for an
+    # implicit dtype, the original value has that output type already.
+    input_cast_ops, current_out = _cast_scalar_arg(current.results[0], out_elem)
+    cast_ops, current_wide = _cast_scalar_arg(current_out, accumulator_elem)
+    body.add_ops([*input_cast_ops, *cast_ops])
+    lane_quotient = DivUIOp(iv, cstride.results[0])
+    lane_coordinate = RemUIOp(lane_quotient.results[0], cextent.results[0])
+    first = CmpiOp(lane_coordinate.results[0], c0.results[0], "eq")
+    body.add_ops([lane_quotient, lane_coordinate, first])
+    first_block = Block()
+    first_block.add_op(ScfYield(zero.results[0]))
+    prior_block = Block()
+    prior_index = SubiOp(iv, cstride.results[0])
+    prior_value = ExtractOp(acc_iter, [prior_index.results[0]], accumulator_elem)
+    prior_block.add_ops([prior_index, prior_value, ScfYield(prior_value.results[0])])
+    prior = IfOp(first.results[0], [accumulator_elem], Region(first_block), Region(prior_block))
+    summed = AddfOp(prior.results[0], current_wide)
+    output_cast_ops, output_value = _cast_scalar_arg(summed.results[0], out_elem)
+    body.add_ops([prior, summed])
+    body.add_ops(output_cast_ops)
+    inserted_out = InsertOp(output_value, out_iter, [iv])
+    inserted_acc = InsertOp(summed.results[0], acc_iter, [iv])
+    body.add_ops([inserted_out, inserted_acc, ScfYield(inserted_out.results[0], inserted_acc.results[0])])
+    loop = ForOp(c0.results[0], cend.results[0], c1.results[0],
+                 [out_init.results[0], acc_init.results[0]], Region(body))
+    ops.append(loop)
+    result = loop.results[0]
+    if len(shape) != 1:
+        reshaped = _emit_reshape(result, list(shape), out_elem)
+        if reshaped is None:
+            raise TypeError("floating cumsum output cannot be reshaped exactly")
+        ops.extend(reshaped[0])
+        result = reshaped[1]
+    rid = _next_region_id("scan")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("scan")
+    return DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="cumsum")
 
 
 def _arg_reduce(x, dim, keepdim, val_elem, *, is_min):
