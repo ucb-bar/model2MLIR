@@ -4,6 +4,12 @@ Lower **any** model — PyTorch today, JAX next — to **standard-dialect MLIR**
 for torch; StableHLO for jax) that any downstream MLIR project can consume. The whole point: one
 common output regardless of source framework.
 
+## Publication
+
+Do not open any new pull request without explicit user approval. Permission to
+implement, test, upstream, or finish existing changes does not authorize a new
+pull request. Follow the publication route the user has authorized.
+
 ## Install
 
 Uses [uv](https://docs.astral.sh/uv/). Flat layout — `import m2m` works after a plain install.
