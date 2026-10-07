@@ -81,6 +81,13 @@ def _new_prefill_cache(lm: nn.Module, capacity: int):
     from transformers.cache_utils import Cache, StaticLayer
 
     class _FunctionalPrefillLayer(StaticLayer):
+        def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+            super().lazy_initialization(key_states, value_states)
+            # Some supported StaticLayer versions initialize only keys/values. The functional
+            # prefill stage owns its length tensor regardless of that upstream implementation.
+            if not hasattr(self, "cumulative_length"):
+                self.cumulative_length = torch.zeros((1,), dtype=torch.long, device=key_states.device)
+
         def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs):
             if not self.is_initialized:
                 self.lazy_initialization(key_states, value_states)

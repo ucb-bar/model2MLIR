@@ -27,6 +27,27 @@ def test_fixed_cache_prefill_is_functional_and_exports_fixed_capacity_state():
     assert len(exported.graph_signature.output_specs) == 3
 
 
+def test_fixed_cache_prefill_owns_length_with_older_static_layer(monkeypatch):
+    from transformers.cache_utils import StaticLayer
+
+    initialize = StaticLayer.lazy_initialization
+
+    def without_length(self, key_states, value_states):
+        initialize(self, key_states, value_states)
+        if hasattr(self, "cumulative_length"):
+            del self.cumulative_length
+
+    monkeypatch.setattr(StaticLayer, "lazy_initialization", without_length)
+    stage = FixedCachePrefillStage(_tiny_llama(), capacity=7).eval()
+
+    _, first_cache, first_position = stage(torch.tensor([[1, 2, 3, 4]]))
+    _, second_cache, second_position = stage(torch.tensor([[5, 6]]))
+    assert torch.equal(first_position, torch.full_like(first_position, 4))
+    assert torch.equal(second_position, torch.full_like(second_position, 2))
+    assert torch.count_nonzero(second_cache[..., 2:, :]) == 0
+    assert not torch.equal(first_cache, second_cache)
+
+
 def test_actual_causal_bundle_materializes_real_goldens_before_cache_export(tmp_path):
     from m2m.capture.bundle import write_multi_program_bundle
     from m2m.capture.provenance import capture_receipt
