@@ -87,6 +87,10 @@ def test_preapplied_reference_never_falls_back_to_quantized_golden(tmp_path, sup
     )
     report = json.loads((tmp_path / "quantization-quality.json").read_text())
     assert report["status"] == ("MEASURED" if supplied else "UNKNOWN")
+    if not supplied:
+        assert report["reference_checkpoint_equivalence"] == (
+            "UNKNOWN; no prequant reference available"
+        )
     assert report["reference_origin"] == (
         "caller_supplied" if supplied else "unavailable"
     )

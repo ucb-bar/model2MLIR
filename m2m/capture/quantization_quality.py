@@ -196,7 +196,9 @@ def write_quantization_quality(
         "compiler_correctness_reference": "golden.npy remains the selected quantized model output",
         "acceptance_gate_applied": False,
         "task_quality_or_calibration_claimed": False,
-        "reference_checkpoint_equivalence": "UNKNOWN for externally supplied outputs"
+        "reference_checkpoint_equivalence": "UNKNOWN; no prequant reference available"
+        if reference is None
+        else "UNKNOWN for externally supplied outputs"
         if reference_origin == "caller_supplied"
         else "observed before quantization; pure eval and immutable parameters assumed, opaque Python side effects unproved",
     }
