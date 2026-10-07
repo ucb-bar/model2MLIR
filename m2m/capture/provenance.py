@@ -103,7 +103,7 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
         "inputs.npz", "golden.npy", "extra.npz", "input_order.json",
     )
     artifacts = {name: _file_record(out / name) for name in required}
-    for name in ("frontend-trace.json", "meta.json", "quantization-manifest.json"):
+    for name in ("frontend-trace.json", "meta.json", "quantization-manifest.json", "quantization-quality.json"):
         if (out / name).is_file():
             artifacts[name] = _file_record(out / name)
     if "quantization-manifest.json" not in artifacts and (
@@ -132,6 +132,31 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
             raise ValueError("bundle MLIR does not bind its quantization manifest")
     if "meta.json" in artifacts:
         meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+        quality = meta.get("quantization_quality")
+        if quality is not None:
+            quality_name = "quantization-quality.json"
+            if (not isinstance(quality, dict) or quality.get("path") != quality_name
+                    or quality_name not in artifacts
+                    or quality.get("sha256") != artifacts[quality_name]["sha256"]):
+                raise ValueError("quantization quality report differs from its metadata digest")
+            report = json.loads((out / quality_name).read_text(encoding="utf-8"))
+            if report.get("schema") != "m2m.quantization-quality.v1" or report.get("acceptance_gate_applied") is not False:
+                raise ValueError("quantization quality must be a diagnostic report")
+            for name, expected in report.get("artifacts", {}).items():
+                if name not in ("prequant_reference.npz", "quantization_selected_outputs.npz"):
+                    raise ValueError("quantization quality has an unsupported artifact path")
+                path = out / name
+                if not path.is_file() or path.is_symlink() or expected != {
+                    "path": name, "sha256": _sha256_file(path)
+                }:
+                    raise ValueError("quantization quality output differs from its digest")
+                artifacts[name] = _file_record(path)
+            evidence = report.get("bundle_evidence", {})
+            if set(evidence) != {"golden.npy", "inputs.npz", "model.mlir", "weights.safetensors"}:
+                raise ValueError("quantization quality omitted its bundle evidence")
+            for name, expected in evidence.items():
+                if name not in required or expected != artifacts[name]["sha256"]:
+                    raise ValueError("quantization quality is stale for this bundle")
         agreement = (meta.get("integerization_receipt") or {}).get("golden_agreement") or {}
         reference = agreement.get("output")
         if reference is not None:
