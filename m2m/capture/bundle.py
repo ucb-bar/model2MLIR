@@ -450,7 +450,9 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
                  session: dict | None = None, quantization_preapplied: bool = False,
                  source_path: str | Path | None = None, exported_program=None,
                  capture_trace: bool = False, original_frontend_snapshot: dict | None = None,
-                 metadata: dict | None = None, conversion_result=None) -> dict:
+                 metadata: dict | None = None, conversion_result=None,
+                 capture_quantization_quality: bool = False,
+                 prequant_reference=None) -> dict:
     """Convert ``mdl`` and write the full bundle to ``out``. Returns a summary dict.
 
     ``quant`` is an m2m ``QuantizationConfig`` (or ``None`` for an unquantized/fp bundle). The golden
@@ -460,6 +462,13 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     ``region_goldens.npz`` (keyed by the ``prov.fqn`` modules the export tagged) — the shared substrate
     for per-region equivalence + standalone-section profiling. Captured in the SAME golden forward.
 
+    ``capture_quantization_quality`` optionally snapshots all eager outputs before
+    quantization and writes a separate diagnostic report. It does not change a
+    compiler/accuracy gate. Auto capture requires a pure eval forward and immutable
+    parameters; stateful or
+    prequantized callers supply ``prequant_reference`` or use session trajectories.
+    Missing prequantized references remain UNKNOWN, never the selected golden.
+
     ``capture_trace`` writes byte-bound frontend correspondence beside ``model.mlir``.
     ``conversion_result`` reuses an existing conversion without exporting again; its
     weights must already live in this output directory, and the caller must provide
@@ -467,10 +476,26 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     """
     import m2m
 
+    if prequant_reference is not None and not capture_quantization_quality:
+        raise ValueError("prequant_reference requires capture_quantization_quality")
+    if capture_quantization_quality and (quant is None or session is not None):
+        raise ValueError("ordinary quantization quality requires quant and no session; sessions use trajectory quality")
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     mdl.eval()
     inputs = tuple(inputs)
+
+    prequant_outputs = None
+    prequant_origin = "unavailable"
+    if capture_quantization_quality:
+        if prequant_reference is not None:
+            prequant_outputs = tuple(value.detach().cpu().clone() for value in _tensor_outputs(prequant_reference))
+            prequant_origin = "caller_supplied"
+        elif not quantization_preapplied:
+            from m2m.capture.quantization_quality import capture_prequant_outputs
+            baseline_mdl = mdl.module() if isinstance(mdl, torch.export.ExportedProgram) else mdl
+            prequant_outputs = capture_prequant_outputs(baseline_mdl, inputs, _tensor_outputs)
+            prequant_origin = "observed_before_quantization"
 
     quality_reference = None
     if session is not None:
@@ -589,6 +614,8 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     else:
         with torch.no_grad():
             g = runtime_mdl(*inputs)
+    selected_quality_outputs = (tuple(value.detach().cpu().clone() for value in _tensor_outputs(g))
+                                if capture_quantization_quality else None)
     golden = g[0] if isinstance(g, (tuple, list)) else g
     np.save(out / "golden.npy", _numpy_safe(golden))
 
@@ -632,6 +659,17 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
             runtime_mdl, inputs, out, manifest=man, input_order=order, session=session,
             quality_reference=quality_reference)
 
+    quantization_quality_pointer = None
+    if capture_quantization_quality:
+        from m2m.capture.quantization_quality import write_quantization_quality
+        quantization_quality_pointer = write_quantization_quality(
+            out, prequant_outputs, selected_quality_outputs, reference_origin=prequant_origin,
+            quantization=quant, numpy_safe=_numpy_safe, tensor_abi=_tensor_abi)
+        meta_path = out / "meta.json"
+        merged = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        merged["quantization_quality"] = quantization_quality_pointer
+        meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
+
     from m2m.capture.provenance import write_capture_receipt
 
     write_capture_receipt(out, source_path=source_path)
@@ -644,6 +682,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         "golden_shape": list(golden.shape), "linalg": r.mlir_text.count("linalg."),
         "input_order": order, "n_regions": n_regions, **session_summary,
         **({"frontend_trace": trace_pointer} if trace_pointer is not None else {}),
+        **({"quantization_quality": quantization_quality_pointer} if quantization_quality_pointer is not None else {}),
     }
 
 
