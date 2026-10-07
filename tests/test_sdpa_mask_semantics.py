@@ -38,11 +38,11 @@ def _mask(kind, dtype=torch.float32):
     )
 
 
-def _direct(mask_shape, mask_elem):
+def _direct(mask_shape, mask_elem, query_elem=builtin.f32):
     shapes = ((1, 2, 3, 4), (1, 2, 5, 4), (1, 2, 5, 6))
-    types = [builtin.TensorType(builtin.f32, shape) for shape in shapes]
+    types = [builtin.TensorType(query_elem, shape) for shape in shapes]
     types.append(builtin.TensorType(mask_elem, mask_shape))
-    result_type = builtin.TensorType(builtin.f32, (1, 2, 3, 6))
+    result_type = builtin.TensorType(query_elem, (1, 2, 3, 6))
     block = Block(arg_types=types)
     result = decompose_scaled_dot_product_attention(
         list(block.args), {"val": torch.empty(1, 2, 3, 6)}, "masked_attention"

@@ -1384,11 +1384,13 @@ def decompose_scaled_dot_product_attention(operands, meta, node_name):
     L, E, S = sq[-2], sq[-1], sk[-2]
     scores_shape = [*sq[:-1], S]                       # [*batch, L, S]
     if mask is not None:
-        from xdsl.dialects.builtin import AnyFloat, i1
+        from xdsl.dialects.builtin import AnyFloat, f32, i1
 
         mask_elem = _t_elem(mask)
         if mask_elem != i1 and not isinstance(mask_elem, AnyFloat):
             raise TypeError("SDPA mask must be boolean or floating point")
+        if mask_elem not in (i1, f32, elem):
+            raise TypeError("SDPA floating mask must be f32 or match query dtype")
         if _broadcast_map(_shape_of(mask), scores_shape) is None:
             raise ValueError("SDPA mask cannot broadcast to the score tensor")
     fake = lambda sh: {"val": type("V", (), {"shape": sh, "dtype": None})()}  # noqa: E731
@@ -1402,10 +1404,10 @@ def decompose_scaled_dot_product_attention(operands, meta, node_name):
         kops, k = _cast_tensor(k, sk, f32)
         vops, v = _cast_tensor(v, sv, f32)
         ops += qops + kops + vops
-        if mask is not None and isinstance(_t_elem(mask), (BFloat16Type, Float16Type)):
-            mops, mask = _cast_tensor(mask, _shape_of(mask), f32)
-            ops += mops
         elem = f32
+    if mask is not None and _t_elem(mask) != i1 and _t_elem(mask) != elem:
+        mops, mask = _cast_tensor(mask, _shape_of(mask), elem)
+        ops += mops
     score_ops, scores = _batched_matmul(q, k, batch_rank=batch_rank, transpose_b=True,
                                       out_shape=scores_shape, elem=elem)
     ops += score_ops
@@ -1413,7 +1415,7 @@ def decompose_scaled_dot_product_attention(operands, meta, node_name):
     sc = _pointwise([scores], fake(scores_shape),
                     lambda args, oe: ([c := ConstantOp(FloatAttr(scale, oe), oe),
                                        m := MulfOp(args[0], c.results[0])], m.results[0]),
-                    family="matmul")
+                    family="matmul", out_elem=elem)
     if sc is None:
         return _opaque_decomp("aten_sdpa", operands[:3], meta, "attention", pattern_hint="sdpa")
     ops += sc.ops
@@ -1429,7 +1431,7 @@ def decompose_scaled_dot_product_attention(operands, meta, node_name):
             selected = SelectOp(allowed.results[0], args[0], ninf.results[0])
             return [row, column, allowed, ninf, selected], selected.results[0]
 
-        causal = _pointwise([scored], fake(scores_shape), causal_body, family="attention")
+        causal = _pointwise([scored], fake(scores_shape), causal_body, family="attention", out_elem=elem)
         if causal is None:
             raise NotImplementedError("SDPA causal mask could not be represented")
         ops += causal.ops
