@@ -65,7 +65,11 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
             attn = attn.masked_fill(~attn_mask, float("-inf"))
         else:
             attn = attn + attn_mask
+    # SDPA defines an all-negative-infinity score row as zero probabilities.
+    # Ordinary softmax alone yields NaNs; do not clear genuine NaN/+inf rows.
+    empty = torch.amax(attn, dim=-1, keepdim=True) == float("-inf")
     attn = torch.softmax(attn, dim=-1)
+    attn = torch.where(empty, 0.0, attn)
     return torch.matmul(attn, value).to(output_dtype)
 
 

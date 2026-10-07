@@ -1383,6 +1383,14 @@ def decompose_scaled_dot_product_attention(operands, meta, node_name):
     batch_rank = len(sq) - 2
     L, E, S = sq[-2], sq[-1], sk[-2]
     scores_shape = [*sq[:-1], S]                       # [*batch, L, S]
+    if mask is not None:
+        from xdsl.dialects.builtin import AnyFloat, i1
+
+        mask_elem = _t_elem(mask)
+        if mask_elem != i1 and not isinstance(mask_elem, AnyFloat):
+            raise TypeError("SDPA mask must be boolean or floating point")
+        if _broadcast_map(_shape_of(mask), scores_shape) is None:
+            raise ValueError("SDPA mask cannot broadcast to the score tensor")
     fake = lambda sh: {"val": type("V", (), {"shape": sh, "dtype": None})()}  # noqa: E731
     # Half SDPA keeps scores, probabilities and both contractions in f32;
     # narrowing intermediate scores/probabilities changes fused attention semantics.
@@ -1429,26 +1437,25 @@ def decompose_scaled_dot_product_attention(operands, meta, node_name):
     if mask is not None:
         # float mask: scores + mask ; bool mask: scores where(mask) else -inf
         from xdsl.dialects.arith import AddfOp, ConstantOp as _C, SelectOp
-        from xdsl.dialects.builtin import IntegerType
         mshape = _shape_of(mask) or []
         mmap = _broadcast_map(mshape, scores_shape)
         smap = _broadcast_map(scores_shape, scores_shape)
-        if mmap is not None:
-            if isinstance(mask.type.element_type, IntegerType):  # bool mask
-                def mb(args, oe):
-                    ninf = _C(FloatAttr(float("-inf"), oe), oe)
-                    s = SelectOp(args[1], args[0], ninf.results[0])
-                    return [ninf, s], s.results[0]
-                me = _elementwise([scored, mask], TensorType(elem, scores_shape), mb,
-                                  input_maps=[smap, mmap])
-            else:
-                me = _elementwise([scored, mask], TensorType(elem, scores_shape),
-                                  lambda args, oe: ([a := AddfOp(args[0], args[1])], a.results[0]),
-                                  input_maps=[smap, mmap])
-            if me is not None:
-                ops += me[0]
-                scored = me[1]
-    sm = build_softmax_body(scored, dim=len(scores_shape) - 1)
+        if _t_elem(mask) == i1:
+            def mb(args, oe):
+                ninf = _C(FloatAttr(float("-inf"), oe), oe)
+                s = SelectOp(args[1], args[0], ninf.results[0])
+                return [ninf, s], s.results[0]
+            me = _elementwise([scored, mask], TensorType(elem, scores_shape), mb,
+                              input_maps=[smap, mmap])
+        else:
+            me = _elementwise([scored, mask], TensorType(elem, scores_shape),
+                              lambda args, oe: ([a := AddfOp(args[0], args[1])], a.results[0]),
+                              input_maps=[smap, mmap])
+        if me is None:
+            raise NotImplementedError("SDPA mask could not be represented exactly")
+        ops += me[0]
+        scored = me[1]
+    sm = build_softmax_body(scored, dim=len(scores_shape) - 1, safe_empty_rows=True)
     if sm is None:
         return _opaque_decomp("aten_sdpa", operands[:3], meta, "attention", pattern_hint="sdpa")
     ops += sm[0]
@@ -1822,12 +1829,14 @@ def build_dequantize_body(inp, scales, zps, *, axis, out_shape, out_elem):
                         input_maps=[id_map, chan_map, chan_map])
 
 
-def build_softmax_body(x, *, dim):
+def build_softmax_body(x, *, dim, safe_empty_rows=False):
     """Pure softmax lowering (max/sub/exp/sum/div over ``dim``) on an SSA tensor.
 
     The single source of truth for softmax: called both by ``decompose_softmax`` (the
     importer/standard path) and by the high-level expansion pass (linalg_ext.softmax ->
-    standard). Returns ``(ops, result_ssa)`` or ``None`` if shapes are dynamic."""
+    standard). ``safe_empty_rows`` is SDPA's zero probability rule for rows whose
+    scores are all negative infinity; ordinary softmax retains NaNs there.
+    Returns ``(ops, result_ssa)`` or ``None`` if shapes are dynamic."""
     from xdsl.dialects.arith import AddfOp, DivfOp, MaximumfOp, SubfOp
     from xdsl.dialects.math import ExpOp
 
@@ -1841,7 +1850,7 @@ def build_softmax_body(x, *, dim):
 
     if isinstance(elem, (BFloat16Type, Float16Type)):
         wide = _cast_tensor(x, in_shape, f32)
-        built = build_softmax_body(wide[1], dim=dim)
+        built = build_softmax_body(wide[1], dim=dim, safe_empty_rows=safe_empty_rows)
         if built is None:
             return None
         narrow = _cast_tensor(built[1], in_shape, elem)
@@ -1855,6 +1864,22 @@ def build_softmax_body(x, *, dim):
 
     ops, mx, rsh = _reduce(x, in_shape, [dim], float("-inf"), MaximumfOp, elem)
     mx = _keepdim_reshape(ops, mx, rsh, keep, elem)
+    if safe_empty_rows and mx is not None:
+        from xdsl.dialects.arith import CmpfOp, ConstantOp, SelectOp
+        from xdsl.dialects.builtin import FloatAttr
+
+        def safe_maximum(args, oe):
+            negative_infinity = ConstantOp(FloatAttr(float("-inf"), oe), oe)
+            zero = ConstantOp(FloatAttr(0.0, oe), oe)
+            empty = CmpfOp(args[0], negative_infinity.result, "oeq")
+            selected = SelectOp(empty.result, zero.result, args[0])
+            return [negative_infinity, zero, empty, selected], selected.result
+
+        safe_max = _elementwise([mx], TensorType(elem, keep), safe_maximum)
+        if safe_max is None:
+            return None
+        ops += safe_max[0]
+        mx = safe_max[1]
     sub = _elementwise([x, mx], rt, _bin_build(SubfOp), input_maps=[id_map, keep_map]) if mx is not None else None
     if sub is None:
         return None
@@ -1864,6 +1889,19 @@ def build_softmax_body(x, *, dim):
     o2, s, rsh2 = _reduce(ex[1], in_shape, [dim], 0.0, AddfOp, elem)
     ops += o2
     s = _keepdim_reshape(ops, s, rsh2, keep, elem)
+    if safe_empty_rows and s is not None:
+        def safe_denominator(args, oe):
+            zero = ConstantOp(FloatAttr(0.0, oe), oe)
+            one = ConstantOp(FloatAttr(1.0, oe), oe)
+            empty = CmpfOp(args[0], zero.result, "oeq")
+            selected = SelectOp(empty.result, one.result, args[0])
+            return [zero, one, empty, selected], selected.result
+
+        safe_sum = _elementwise([s], TensorType(elem, keep), safe_denominator)
+        if safe_sum is None:
+            return None
+        ops += safe_sum[0]
+        s = safe_sum[1]
     div = _elementwise([ex[1], s], rt, _bin_build(DivfOp), input_maps=[id_map, keep_map]) if s is not None else None
     if div is None:
         return None
