@@ -107,7 +107,7 @@ _reg("compare", "compare")
 _reg("select", "where")
 _reg("minmax", "maximum", "minimum", "minmax")
 _reg("logical", "logical_and", "logical_not")
-_reg("bitwise", "bitwise_and", "bitwise_not", "bitwise_right_shift")
+_reg("bitwise", "bitwise_and", "bitwise_xor", "bitwise_not", "bitwise_right_shift")
 _reg("reduce", "reduce", "reduce_sum", "reduce_mean", "sum", "mean", "any", "bool_reduce")
 _reg("arg_reduce", "aten_min_dim", "aten_max_dim", "aten_argmin", "aten_argmax")
 _reg("contraction", "matmul", "batch_matmul", "int_matmul", "addmm", "linear",

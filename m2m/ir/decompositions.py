@@ -4967,6 +4967,58 @@ def decompose_bitwise_and(operands, meta, node_name):
                           pattern_hint="bitwise_and")
 
 
+def decompose_bitwise_xor(operands, meta, node_name):
+    """Tensor/Tensor XOR with exact Boolean or supported integer promotion."""
+    import torch
+    from xdsl.dialects.arith import XOrIOp
+    from xdsl.dialects.builtin import IntegerType
+
+    def opaque():
+        return _opaque_decomp(_opaque_name(meta, node_name), operands[:2], meta, "bitwise",
+                              pattern_hint="bitwise_xor")
+
+    if len(operands) != 2 or any(
+        not isinstance(operand.type, TensorType)
+        or not isinstance(operand.type.element_type, IntegerType)
+        for operand in operands
+    ):
+        return opaque()
+    widths = {torch.bool: 1, torch.int8: 8, torch.int16: 16, torch.int32: 32,
+              torch.int64: 64, torch.uint8: 8}
+    source = []
+    for index, operand in enumerate(operands):
+        arg = _fx_arg(meta, index)
+        value = getattr(arg, "meta", {}).get("val") if hasattr(arg, "meta") else None
+        dtype = getattr(value, "dtype", None)
+        source.append(dtype)
+        if operand.type.element_type.width.data != widths.get(dtype):
+            return opaque()
+    result_dtype = getattr(meta.get("val"), "dtype", None)
+    result_elem = _element_type_from_meta(meta)
+    if not isinstance(result_elem, IntegerType) or result_elem.width.data != widths.get(result_dtype):
+        return opaque()
+
+    signed_or_bool = {torch.bool, torch.int8, torch.int16, torch.int32, torch.int64}
+    if all(dtype in signed_or_bool for dtype in source) and result_dtype in signed_or_bool:
+        if result_elem.width.data < max(operand.type.element_type.width.data for operand in operands):
+            return opaque()
+        promote = True  # i1 zero-extends; signed integer widths sign-extend.
+    elif source == [torch.uint8, torch.uint8] and result_dtype == torch.uint8:
+        promote = False  # same-width bit pattern; no unsigned widening ambiguity.
+    else:
+        return opaque()
+
+    def build(args, _out_elem):
+        op = XOrIOp(args[0], args[1])
+        return [op], op.results[0]
+
+    real = _pointwise(operands, meta, build, family="bitwise", promote=promote)
+    if real is None:
+        return opaque()
+    real.pattern_hint = "bitwise_xor"
+    return real
+
+
 # ---- integer right shift and integer floor / truncating division -------------------------------
 #
 # Both are exact integer operations. Before these existed they were OPAQUE, so a capture that needed
@@ -7092,6 +7144,8 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.bitwise_and.Tensor": decompose_bitwise_and,
     "aten.bitwise_and.Scalar": decompose_bitwise_and,
     "aten.bitwise_and.Scalar_Tensor": decompose_bitwise_and,
+    "aten.bitwise_xor.Tensor": decompose_bitwise_xor,
+    "aten.__xor__.Tensor": decompose_bitwise_xor,
     "aten.bitwise_not.default": decompose_bitwise_not,
     "aten.repeat.default": decompose_repeat,
     "aten.any.dim": decompose_any_real,
