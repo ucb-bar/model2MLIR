@@ -151,3 +151,86 @@ def test_external_exported_program_materializes_bundle(tmp_path, monkeypatch):
     (bundle / "quantization-manifest.json").unlink()
     with pytest.raises(ValueError, match="quantization manifest"):
         capture_receipt(bundle)
+
+
+class _FakeQuantLinear(nn.Module):
+    """A replacement module carrying no lineage back to the original node it replaces."""
+
+    def __init__(self, linear):
+        super().__init__()
+        self.weight = nn.Parameter(torch.round(linear.weight.detach() * 16) / 16)
+
+    def forward(self, x):
+        return (torch.round(x * 16) / 16) @ self.weight.t()
+
+
+def _replacing_adapter(calls):
+    def adapter(model, inputs, *, contract_bytes, policy_bytes, original_frontend_snapshot):
+        calls.append(len(inputs))
+        model.linear = _FakeQuantLinear(model.linear)
+        return model, {
+            "schema": "m2m.quantization_manifest.v1", "adapter_id": "fixture",
+            "contract_sha256": hashlib.sha256(contract_bytes).hexdigest(),
+            "policy_sha256": hashlib.sha256(policy_bytes).hexdigest(),
+            "sites": [{"site_id": "module:linear", "status": "quantized", "format": "fixture"}],
+        }
+
+    return adapter
+
+
+def _selected(tmp_path):
+    contract = tmp_path / "contract.yaml"
+    policy = tmp_path / "policy.yaml"
+    contract.write_bytes(b"contract: selected\n")
+    policy.write_bytes(b"policy: selected\n")
+    return ExternalQuantizationConfig("fixture", contract, policy)
+
+
+def test_trace_reports_a_replacing_quantizer_without_lineage_as_diagnostic(tmp_path, monkeypatch):
+    """Module replacement leaves both graphs complete but their correspondence unproven.
+
+    The trace must say so: `diagnostic` with the original -> quantized blocker, never `complete`,
+    even though the MLIR itself has no opaque calls.
+    """
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(32, 32, bias=False)
+
+        def forward(self, x):
+            return self.linear(x) @ x.transpose(-1, -2)
+
+    calls = []
+    monkeypatch.setattr("m2m.capture.external_quantization._entry_point",
+                        lambda _: _Entry(_replacing_adapter(calls)))
+    result = convert(Tiny().eval(), (torch.ones(32, 32),), quantization=_selected(tmp_path),
+                     backend="fx_importer", capture_trace=True)
+    assert result.ok, result.diagnostics
+    assert result.capture_trace["status"] == "diagnostic"
+    assert "original -> quantized correspondence incomplete" in result.capture_trace["blockers"]
+    assert result.capture_trace["graphs"]["original"]["status"] == "complete"
+    assert result.capture_trace["graphs"]["quantized"]["status"] == "complete"
+    assert calls == [1]
+
+
+def test_coverage_report_quantizes_once_with_the_example_inputs(tmp_path, monkeypatch):
+    from m2m.api import coverage_report
+
+    calls = []
+    monkeypatch.setattr("m2m.capture.external_quantization._entry_point",
+                        lambda _: _Entry(_replacing_adapter(calls)))
+    report = coverage_report(_Model32().eval(), (torch.ones(32, 32),), quantization=_selected(tmp_path))
+    assert report["valid"] is True
+    assert report["num_ops"] > 0
+    # One adapter call, and it received the example inputs (an external quantizer requires them).
+    assert calls == [1]
+
+
+class _Model32(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(32, 32)
+
+    def forward(self, x):
+        return self.linear(x)
