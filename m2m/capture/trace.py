@@ -62,6 +62,106 @@ def _graph_modules(gm: Any):
             yield name, sub
 
 
+def _constant_input_paths(node: Any, constant: Any) -> list[list[Any]]:
+    """The exact FX operand positions using a lifted constant."""
+    paths = []
+
+    def visit(value: Any, path: list[Any]) -> None:
+        if value is constant:
+            paths.append(path)
+        elif isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                visit(item, [*path, index])
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                visit(item, [*path, str(key)])
+
+    visit(node.args, ["args"])
+    visit(node.kwargs, ["kwargs"])
+    return paths
+
+
+def defer_lifted_constant_user_lineage(graph_module: Any, exported: Any) -> int:
+    """Make single-user constants safe for Torch's placeholder metadata copy.
+
+    Torch can copy a direct consumer's custom metadata onto a lifted constant
+    placeholder, then reject the different metadata of the source ``get_attr``.
+    Defer only that consumer's ancestry across export. The snapshotter restores
+    it after checking the exact constant bytes, target, and FX input binding.
+    """
+    from torch.export.graph_signature import InputKind
+
+    targets = {str(spec.target) for spec in exported.graph_signature.input_specs
+               if spec.kind == InputKind.CONSTANT_TENSOR}
+    deferred = 0
+    for _, module in _graph_modules(graph_module):
+        for constant in module.graph.nodes:
+            if constant.op != "get_attr" or str(constant.target) not in targets:
+                continue
+            if len(constant.users) != 1:
+                continue
+            consumer = next(iter(constant.users))
+            if consumer.op != "call_function":
+                continue
+            left = dict(constant.meta.get("custom") or {})
+            right = dict(consumer.meta.get("custom") or {})
+            rows = list(right.get("m2m_deferred_constant_users") or ())
+            lineage = list(right.get("m2m_lineage") or (rows[0]["lineage"] if rows else ()))
+            consumer_id = right.get("m2m_node_id") or (lineage[-1] if lineage else None)
+            if not left.get("m2m_lineage") or not lineage:
+                continue
+            if left.get("m2m_node_id") == consumer_id:
+                continue
+            paths = _constant_input_paths(consumer, constant)
+            if not paths:
+                raise ValueError("lifted constant consumer has no direct FX input binding")
+            parent, _, name = str(constant.target).rpartition(".")
+            owner = module.get_submodule(parent) if parent else module
+            value = getattr(owner, name)
+            if rows and any(row["lineage"] != lineage for row in rows):
+                raise ValueError("lifted constant consumer has inconsistent deferred ancestry")
+            rows.append({"constant_target": str(constant.target),
+                         "constant_sha256": _tensor_bytes_sha256(value),
+                         "consumer_target": str(consumer.target),
+                         "input_paths": paths, "lineage": lineage})
+            right.pop("m2m_node_id", None)
+            right.pop("m2m_lineage", None)
+            right["m2m_deferred_constant_users"] = rows
+            consumer.meta["custom"] = right
+            deferred += 1
+    return deferred
+
+
+def _restore_deferred_constant_user(exported: Any, node: Any, custom: dict[str, Any]) -> None:
+    """Admit deferred ancestry only for an unchanged constant-to-call edge."""
+    from torch.export.graph_signature import InputKind
+
+    rows = custom.pop("m2m_deferred_constant_users", None)
+    if rows is None or node.op == "placeholder":
+        return
+    if node.op != "call_function" or not isinstance(rows, list) or not rows:
+        raise ValueError("deferred constant ancestry is not on a call")
+    specs = {str(spec.target): spec for spec in exported.graph_signature.input_specs
+             if spec.kind == InputKind.CONSTANT_TENSOR}
+    graph_nodes = {candidate.name: candidate for candidate in exported.graph_module.graph.nodes}
+    for row in rows:
+        if not isinstance(row, dict) or str(node.target) != row.get("consumer_target"):
+            raise ValueError("deferred constant consumer target changed")
+        spec = specs.get(row.get("constant_target"))
+        constant = graph_nodes.get(spec.arg.name) if spec is not None else None
+        value = exported.constants.get(row.get("constant_target"))
+        if (constant is None or constant.op != "placeholder" or len(constant.users) != 1
+                or node not in constant.users or not isinstance(row.get("input_paths"), list)
+                or _constant_input_paths(node, constant) != row["input_paths"]
+                or value is None or _tensor_bytes_sha256(value) != row.get("constant_sha256")):
+            raise ValueError("deferred constant ancestry lost its exact binding or bytes")
+        lineage = row.get("lineage")
+        if not isinstance(lineage, list) or not lineage or not all(
+                isinstance(identity, str) and identity for identity in lineage):
+            raise ValueError("deferred constant ancestry is incomplete")
+        custom["m2m_lineage"] = list(dict.fromkeys([*custom.get("m2m_lineage", ()), *lineage]))
+
+
 def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
     """Snapshot and stamp exactly this program, for the subsequent lowering."""
     from torch.fx import Node
@@ -80,6 +180,7 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
             # replaces the outer call's provenance.
             node.meta = dict(node.meta)
             custom = dict(node.meta.get("custom") or {})
+            _restore_deferred_constant_user(exported, node, custom)
             prior = list(custom.get("m2m_lineage") or ())
             if node_id not in prior:
                 prior.append(node_id)
@@ -434,6 +535,7 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
         constants = _owned_lifted_constant_conversions(exported, gm, dtype)
         decisions = _retarget_captured_float_dtypes(gm, dtype, original)
         prepare_lifted_constant_lineage(gm)
+        defer_lifted_constant_user_lineage(gm, exported)
         staged = torch.export.export(gm, cast_inputs)
         from torch.export.graph_signature import InputKind
 
@@ -455,6 +557,7 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
         gm = staged.module()
         allow_exported_model_train_eval(gm)
         prepare_lifted_constant_lineage(gm)
+        defer_lifted_constant_user_lineage(gm, staged)
         # The returned module has its own final lineage/constant metadata.
         # Bind the receipt to a fresh export of *that* module, rather than an
         # intermediate program whose graph can differ after materialization.
@@ -470,6 +573,9 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
         staged_snapshot = snapshot_exported_program(returned, stage="staged")
         staged_audit = _audit_staged_float_precision(returned, gm, cast_inputs,
                                                       staged_snapshot, dtype)
+        # Return an export-safe module; the next traced conversion restores
+        # these call origins from exact constant signatures and bytes.
+        defer_lifted_constant_user_lineage(gm, returned)
     receipt = {"schema": "m2m.frontend-precision-conversion.v1",
                "scope": "precision conversion of captured static program",
                "original_graph_sha256": original["sha256"], "target_dtype": str(dtype),

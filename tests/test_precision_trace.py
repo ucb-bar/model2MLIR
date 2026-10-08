@@ -2,12 +2,53 @@
 
 import copy
 import hashlib
+import os
+from pathlib import Path
 
 import pytest
 import torch
 from torch import nn
 
 import m2m
+
+
+def test_real_tiny_prefill_lifted_constant_keeps_exact_staged_origin(monkeypatch):
+    """The actual causal loader exercises a constant consumed by zeros_like."""
+    cache = os.environ.get("MERLIN_TINY_HF_CACHE")
+    if not cache or not Path(cache).is_dir():
+        pytest.skip("explicit offline TinyLlama cache is required")
+    monkeypatch.setenv("HF_HUB_CACHE", cache)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    monkeypatch.setenv("M2M_LLAMA_LAYERS", "1")
+    monkeypatch.setenv("M2M_LLAMA_ATTENTION", "eager")
+    monkeypatch.setenv("M2M_LLAMA_SESSION", "e2e")
+    monkeypatch.setenv("M2M_PREFILL_TOKENS", "16")
+    monkeypatch.setenv("M2M_DECODE_TOKENS", "2")
+    from workloads.tiny_llama.loader import get_model_and_inputs
+    from m2m.capture.external_runtime import external_runtime_session
+    from m2m.capture.trace import snapshot_exported_program
+
+    model, inputs = get_model_and_inputs()
+    program = external_runtime_session(model, inputs).programs[0]
+    exported = torch.export.export(program.module.eval(), program.inputs)
+    original = snapshot_exported_program(exported, stage="original")
+    constant = next(row for row in original["nodes"]
+                    if row["input_target"] == "lifted_tensor_0")
+    consumer = next(row for row in original["nodes"]
+                    if row["target"] == "aten.zeros_like.default")
+    staged, staged_inputs, source, receipt = m2m.materialize_frontend_precision(
+        exported, program.inputs, dtype=torch.float32,
+        original_frontend_snapshot=original,
+        retarget_float_dtype_arguments=True,
+    )
+    assert source["sha256"] == original["sha256"]
+    actual = snapshot_exported_program(torch.export.export(staged, staged_inputs), stage="staged")
+    staged_constant = next(row for row in actual["nodes"]
+                           if row["input_target"] == "lifted_tensor_0")
+    assert constant["id"] in staged_constant["origin_node_ids"]
+    assert consumer["id"] not in staged_constant["origin_node_ids"]
+    assert receipt["staged_precision_audit"]["non_target_floating_values"] == 0
 
 
 def test_owned_fp32_graph_retargeting_changes_only_float_dtype_decisions():
