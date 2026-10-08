@@ -5,11 +5,10 @@ import hashlib
 import os
 from pathlib import Path
 
+import m2m
 import pytest
 import torch
 from torch import nn
-
-import m2m
 
 
 def test_real_tiny_prefill_lifted_constant_keeps_exact_staged_origin(monkeypatch):
@@ -25,9 +24,9 @@ def test_real_tiny_prefill_lifted_constant_keeps_exact_staged_origin(monkeypatch
     monkeypatch.setenv("M2M_LLAMA_SESSION", "e2e")
     monkeypatch.setenv("M2M_PREFILL_TOKENS", "16")
     monkeypatch.setenv("M2M_DECODE_TOKENS", "2")
-    from workloads.tiny_llama.loader import get_model_and_inputs
     from m2m.capture.external_runtime import external_runtime_session
     from m2m.capture.trace import snapshot_exported_program
+    from workloads.tiny_llama.loader import get_model_and_inputs
 
     model, inputs = get_model_and_inputs()
     program = external_runtime_session(model, inputs).programs[0]
@@ -44,6 +43,7 @@ def test_real_tiny_prefill_lifted_constant_keeps_exact_staged_origin(monkeypatch
     )
     assert source["sha256"] == original["sha256"]
     actual = snapshot_exported_program(torch.export.export(staged, staged_inputs), stage="staged")
+    assert actual["sha256"] == receipt["staged_graph_sha256"]
     staged_constant = next(row for row in actual["nodes"]
                            if row["input_target"] == "lifted_tensor_0")
     assert constant["id"] in staged_constant["origin_node_ids"]
