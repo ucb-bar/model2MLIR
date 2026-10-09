@@ -77,6 +77,12 @@ A loader is a `.py` exposing `get_model_and_inputs() -> (model_or_fn, tuple_of_i
 
 ## Coverage / adding op support
 
+Frontend snapshots preserve historical `results` slots and add versioned
+`result_metadata` describing actual FX `val` presence, container and every
+existing result ordinal. Missing metadata stays unobserved; explicit None is
+recorded separately. This provenance grants no numerical or operator-effect
+semantics and does not infer absent runtime outputs.
+
 ```python
 from m2m.coverage import opaque_report, validate_op, differential_op
 opaque_report(r.mlir_text)                 # {opaque_func: count} — the worklist

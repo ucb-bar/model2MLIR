@@ -54,6 +54,34 @@ def _types(value: Any, node_id: str) -> list[dict[str, Any]]:
     return result
 
 
+def _result_metadata(
+    metadata: dict[str, Any], results: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Record actual metadata presence without changing historical value slots.
+
+    A missing ``val`` and an explicitly observed Python None formerly had the
+    same unknown result type. This additional record distinguishes them and
+    binds every observed value to its existing ordinal. Metadata is not native
+    execution, numerical equivalence or an operator-effect proof.
+    """
+    record: dict[str, Any] = {"schema": "m2m.frontend_result_metadata.v1"}
+    if "val" not in metadata:
+        return {**record, "status": "unobserved"}
+    value = metadata["val"]
+    values = list(value) if isinstance(value, (tuple, list)) else [value]
+    return {
+        **record,
+        "status": "observed",
+        "container": (
+            type(value).__name__ if isinstance(value, (tuple, list)) else "single"
+        ),
+        "values": [
+            {"result_id": result["id"], "kind": "none" if val is None else result["kind"]}
+            for val, result in zip(values, results, strict=True)
+        ],
+    }
+
+
 def _graph_modules(gm: Any):
     """Include GraphModule bodies in graph-scoped identities, without double counting."""
     yield "root", gm
@@ -229,11 +257,13 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
                               "custom" if node.op == "call_function" else
                               "call" if node.op in {"call_method", "call_module"} else "structural")
             spec = input_specs.get(node.name) if scope == "root" else None
+            results = _types(node.meta.get("val"), node_id)
             records.append({"id": node_id, "graph_id": graph_id, "ordinal": ordinal,
                             "op": node.op, "target": target, "classification": classification,
                             "args": encode(node.args, "args"),
                             "kwargs": encode(node.kwargs, "kwargs"),
-                            "results": _types(node.meta.get("val"), node_id),
+                            "results": results,
+                            "result_metadata": _result_metadata(node.meta, results),
                             "module_stack": _literal(node.meta.get("nn_module_stack") or {}),
                             "input_kind": str(getattr(spec, "kind", "")).removeprefix("InputKind.") or None,
                             "input_target": getattr(spec, "target", None),
