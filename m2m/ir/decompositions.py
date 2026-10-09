@@ -6847,15 +6847,28 @@ def _make_compare(kind: str):
     return f
 
 
-def decompose_relu(operands, meta, node_name):
-    """aten.relu.default(x) -> max(x, 0) via arith.maximumf (family: minmax)."""
-    from xdsl.dialects.arith import ConstantOp, MaximumfOp
+def _float_clamp_bound(value, bound, out_elem, *, lower):
+    """Apply a scalar bound, retaining the input on equal/unordered compares.
+
+    PyTorch's CPU scalar clamp uses std::min/std::max with the input first;
+    its vector paths retain that same winner. IEEE minimum/maximum operations
+    have different signed-zero tie rules. A single NaN bound retains the input.
+    """
+    from xdsl.dialects.arith import CmpfOp, ConstantOp, SelectOp
     from xdsl.dialects.builtin import FloatAttr
 
+    bound = float(bound)
+    constant = ConstantOp(FloatAttr(bound, out_elem), out_elem)
+    beyond = CmpfOp(value, constant.result, "olt" if lower else "ogt")
+    selected = SelectOp(beyond.result, constant.result, value)
+    return [constant, beyond, selected], selected.result
+
+
+def decompose_relu(operands, meta, node_name):
+    """aten.relu.default(x): clamp at zero, retaining ties/unordered input."""
+
     def build(args, oe):
-        z = ConstantOp(FloatAttr(0.0, oe), oe)
-        m = MaximumfOp(args[0], z.results[0])
-        return [z, m], m.results[0]
+        return _float_clamp_bound(args[0], 0.0, oe, lower=True)
 
     real = _pointwise(operands[:1], meta, build, family="minmax", promote=True)
     if real is not None:
@@ -6864,26 +6877,31 @@ def decompose_relu(operands, meta, node_name):
 
 
 def decompose_clamp(operands, meta, node_name):
-    """aten.clamp.default(x, min?, max?) -> minimumf(maximumf(x,min),max) (family: minmax)."""
-    from xdsl.dialects.arith import ConstantOp, MaximumfOp, MinimumfOp
+    """Scalar clamp applies ordered bounds and retains the input on ties."""
+    import math
+
+    from xdsl.dialects.arith import ConstantOp
     from xdsl.dialects.builtin import FloatAttr
 
     lo = _fx_arg(meta, 1, None)
     hi = _fx_arg(meta, 2, None)
 
     def build(args, oe):
+        # The two-bound scalar operator fills NaN if either bound is NaN.
+        # Its single-bound forms instead keep the input on unordered compares.
+        if lo is not None and hi is not None and (
+            math.isnan(float(lo)) or math.isnan(float(hi))
+        ):
+            nan = ConstantOp(FloatAttr(float("nan"), oe), oe)
+            return [nan], nan.result
         cur = args[0]
         ops = []
         if lo is not None:
-            c = ConstantOp(FloatAttr(float(lo), oe), oe)
-            mx = MaximumfOp(cur, c.results[0])
-            ops += [c, mx]
-            cur = mx.results[0]
+            lower_ops, cur = _float_clamp_bound(cur, lo, oe, lower=True)
+            ops += lower_ops
         if hi is not None:
-            c = ConstantOp(FloatAttr(float(hi), oe), oe)
-            mn = MinimumfOp(cur, c.results[0])
-            ops += [c, mn]
-            cur = mn.results[0]
+            upper_ops, cur = _float_clamp_bound(cur, hi, oe, lower=False)
+            ops += upper_ops
         return ops, cur
 
     real = _pointwise(operands[:1], meta, build, family="minmax", promote=True)
