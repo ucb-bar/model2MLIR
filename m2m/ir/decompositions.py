@@ -1605,10 +1605,21 @@ def _make_amin_amax(is_min):
 
 
 def decompose_round(operands, meta, node_name):
-    """aten.round.default — round half-to-even (math.roundeven), family elementwise."""
+    """Round floating values half to even; copy unchanged integer values."""
+    from xdsl.dialects.builtin import IntegerType
     from xdsl.dialects.math import RoundEvenOp
 
-    real = _unary_elementwise(operands, meta, "round", _un_build(RoundEvenOp))
+    element = (
+        operands[0].type.element_type
+        if operands and isinstance(operands[0].type, TensorType) else None
+    )
+    if isinstance(element, IntegerType) and element.width.data > 1:
+        # A fresh logical output preserves ordinary tensor value semantics.
+        def build(args, _oe):
+            return [], args[0]
+    else:
+        build = _un_build(RoundEvenOp)
+    real = _unary_elementwise(operands, meta, "round", build)
     if real is not None:
         return real
     return _opaque_decomp("aten_round", operands[:1], meta, "elementwise", pattern_hint="round")
@@ -6864,11 +6875,59 @@ def _float_clamp_bound(value, bound, out_elem, *, lower):
     return [constant, beyond, selected], selected.result
 
 
+def _activation_unsigned(operands, meta):
+    """Read integer signedness from FX provenance, never signless MLIR width."""
+    import torch
+    from xdsl.dialects.builtin import IntegerType
+
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return None
+    element = operands[0].type.element_type
+    if not isinstance(element, IntegerType):
+        return False
+    arg = _fx_arg(meta, 0)
+    value = getattr(arg, "meta", {}).get("val") if hasattr(arg, "meta") else arg
+    dtype = getattr(value, "dtype", None)
+    widths = {torch.int8: 8, torch.uint8: 8, torch.int16: 16,
+              torch.int32: 32, torch.int64: 64}
+    if element.width.data != widths.get(dtype):
+        return None
+    return dtype == torch.uint8
+
+
+def _activation_cast(value, out_elem, *, unsigned):
+    from xdsl.dialects.arith import UIToFPOp
+    from xdsl.dialects.builtin import AnyFloat, IntegerType
+
+    if unsigned and isinstance(value.type, IntegerType) and isinstance(out_elem, AnyFloat):
+        cast = UIToFPOp(value, out_elem)
+        return [cast], cast.result
+    return _cast_scalar_arg(value, out_elem)
+
+
+def _activation_clamp_bound(value, bound, out_elem, *, lower, unsigned):
+    from xdsl.dialects.arith import CmpiOp, ConstantOp, SelectOp
+    from xdsl.dialects.builtin import IntegerAttr, IntegerType
+
+    if not isinstance(out_elem, IntegerType):
+        return _float_clamp_bound(value, bound, out_elem, lower=lower)
+    # Bounds were range-checked before building the scalar body. Preserve exact
+    # integer values, including int64 bounds beyond binary64's exact range.
+    constant = ConstantOp(IntegerAttr(bound, out_elem), out_elem)
+    predicate = ("ult" if lower else "ugt") if unsigned else ("slt" if lower else "sgt")
+    beyond = CmpiOp(value, constant.result, predicate)
+    selected = SelectOp(beyond.result, constant.result, value)
+    return [constant, beyond, selected], selected.result
+
+
 def decompose_relu(operands, meta, node_name):
     """aten.relu.default(x): clamp at zero, retaining ties/unordered input."""
+    unsigned = _activation_unsigned(operands, meta)
+    if unsigned is None:
+        return _opaque_decomp("aten_relu", operands[:1], meta, "elementwise", pattern_hint="relu")
 
     def build(args, oe):
-        return _float_clamp_bound(args[0], 0.0, oe, lower=True)
+        return _activation_clamp_bound(args[0], 0, oe, lower=True, unsigned=unsigned)
 
     real = _pointwise(operands[:1], meta, build, family="minmax", promote=True)
     if real is not None:
@@ -6881,30 +6940,51 @@ def decompose_clamp(operands, meta, node_name):
     import math
 
     from xdsl.dialects.arith import ConstantOp
-    from xdsl.dialects.builtin import FloatAttr
+    from xdsl.dialects.builtin import FloatAttr, IntegerType
 
-    lo = _fx_arg(meta, 1, None)
-    hi = _fx_arg(meta, 2, None)
+    kwargs = meta.get("_fx_kwargs", {})
+    lo = kwargs.get("min", _fx_arg(meta, 1, None))
+    hi = kwargs.get("max", _fx_arg(meta, 2, None))
+    unsigned = _activation_unsigned(operands, meta)
+    element = _element_type_from_meta(meta)
+    if unsigned is None or (lo is None and hi is None) or any(
+        bound is not None and not isinstance(bound, (int, float)) for bound in (lo, hi)
+    ):
+        return _opaque_decomp("aten_clamp", operands[:1], meta, "elementwise", pattern_hint="clamp")
+    if isinstance(element, IntegerType):
+        if operands[0].type.element_type != element:
+            return _opaque_decomp("aten_clamp", operands[:1], meta, "elementwise", pattern_hint="clamp")
+        width = element.width.data
+        maximum = (1 << width) - 1 if unsigned else (1 << (width - 1)) - 1
+        # PyTorch's checked integral scalar conversion permits negative uint8
+        # bounds down to -255, then wraps them to their unsigned bit patterns.
+        minimum = -maximum if unsigned else -(1 << (width - 1))
+        if any(bound is not None and (
+            not isinstance(bound, int) or not minimum <= bound <= maximum
+        ) for bound in (lo, hi)):
+            return _opaque_decomp("aten_clamp", operands[:1], meta, "elementwise", pattern_hint="clamp")
+        if unsigned:
+            lo = lo % (1 << width) if lo is not None else None
+            hi = hi % (1 << width) if hi is not None else None
 
     def build(args, oe):
         # The two-bound scalar operator fills NaN if either bound is NaN.
         # Its single-bound forms instead keep the input on unordered compares.
-        if lo is not None and hi is not None and (
+        if not isinstance(oe, IntegerType) and lo is not None and hi is not None and (
             math.isnan(float(lo)) or math.isnan(float(hi))
         ):
             nan = ConstantOp(FloatAttr(float("nan"), oe), oe)
             return [nan], nan.result
-        cur = args[0]
-        ops = []
+        ops, cur = _activation_cast(args[0], oe, unsigned=unsigned)
         if lo is not None:
-            lower_ops, cur = _float_clamp_bound(cur, lo, oe, lower=True)
+            lower_ops, cur = _activation_clamp_bound(cur, lo, oe, lower=True, unsigned=unsigned)
             ops += lower_ops
         if hi is not None:
-            upper_ops, cur = _float_clamp_bound(cur, hi, oe, lower=False)
+            upper_ops, cur = _activation_clamp_bound(cur, hi, oe, lower=False, unsigned=unsigned)
             ops += upper_ops
         return ops, cur
 
-    real = _pointwise(operands[:1], meta, build, family="minmax", promote=True)
+    real = _pointwise(operands[:1], meta, build, family="minmax")
     if real is not None:
         return real
     return _opaque_decomp("aten_clamp", operands[:1], meta, "elementwise", pattern_hint="clamp")

@@ -26,6 +26,8 @@ class Activation(torch.nn.Module):
     def forward(self, x):
         if self.operation == "relu":
             return torch.relu(x)
+        if self.operation == "round":
+            return torch.round(x)
         return torch.clamp(x, min=self.lower, max=self.upper)
 
 
@@ -86,7 +88,9 @@ def native_activation(tmp_path, model, array, optimization):
     ], check=True, capture_output=True)
     entry = ctypes.CDLL(str(library))._mlir_ciface_forward
     entry.argtypes, entry.restype = [ctypes.c_void_p, ctypes.c_void_p], None
-    output = np.empty_like(array)
+    # Scalar floating bounds can promote an integer input to floating output.
+    # The output descriptor must follow the captured result dtype, not the input.
+    output = np.empty_like(model(example).numpy())
     entry(ctypes.byref(descriptor(array)), ctypes.byref(descriptor(output)))
     return output
 
