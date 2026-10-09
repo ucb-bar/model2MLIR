@@ -6865,14 +6865,21 @@ def _float_clamp_bound(value, bound, out_elem, *, lower):
     its vector paths retain that same winner. IEEE minimum/maximum operations
     have different signed-zero tie rules. A single NaN bound retains the input.
     """
-    from xdsl.dialects.arith import CmpfOp, ConstantOp, SelectOp
-    from xdsl.dialects.builtin import FloatAttr
+    from xdsl.dialects.arith import CmpfOp, ConstantOp, SelectOp, SIToFPOp
+    from xdsl.dialects.builtin import Float32Type, FloatAttr, IntegerAttr, i64
 
-    bound = float(bound)
-    constant = ConstantOp(FloatAttr(bound, out_elem), out_elem)
-    beyond = CmpfOp(value, constant.result, "olt" if lower else "ogt")
-    selected = SelectOp(beyond.result, constant.result, value)
-    return [constant, beyond, selected], selected.result
+    if type(bound) is int and isinstance(out_elem, Float32Type) and -(1 << 63) <= bound < (1 << 63):
+        # Preserve the original signed scalar until its single storage conversion.
+        # Python int -> binary64 -> binary32 can round a near-midpoint bound twice.
+        constant = ConstantOp(IntegerAttr(bound, i64), i64)
+        converted = SIToFPOp(constant.result, out_elem)
+        ops, limit = [constant, converted], converted.result
+    else:
+        constant = ConstantOp(FloatAttr(float(bound), out_elem), out_elem)
+        ops, limit = [constant], constant.result
+    beyond = CmpfOp(value, limit, "olt" if lower else "ogt")
+    selected = SelectOp(beyond.result, limit, value)
+    return [*ops, beyond, selected], selected.result
 
 
 def _activation_unsigned(operands, meta):
