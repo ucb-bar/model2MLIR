@@ -355,8 +355,8 @@ def _elementwise(
 
 def _splat_scalar(scalar: Any, result_type: TensorType):
     """Build a full-shape constant tensor by splatting a scalar (for binary-with-scalar)."""
-    from xdsl.dialects.arith import ConstantOp
-    from xdsl.dialects.builtin import FloatAttr, IntegerAttr, IntegerType
+    from xdsl.dialects.arith import ConstantOp, SIToFPOp
+    from xdsl.dialects.builtin import Float32Type, FloatAttr, IntegerAttr, IntegerType, i64
     from xdsl.dialects.tensor import SplatOp
 
     elem = result_type.element_type
@@ -364,10 +364,18 @@ def _splat_scalar(scalar: Any, result_type: TensorType):
         return None
     if isinstance(elem, IntegerType):
         const = ConstantOp(IntegerAttr(int(scalar), elem), elem)
+        ops, value = [const], const.result
+    elif type(scalar) is int and isinstance(elem, Float32Type) and -(1 << 63) <= scalar < (1 << 63):
+        # Keep the original integer until its single conversion to f32. Going
+        # through Python binary64 can round a near-midpoint coefficient twice.
+        const = ConstantOp(IntegerAttr(scalar, i64), i64)
+        converted = SIToFPOp(const.result, elem)
+        ops, value = [const, converted], converted.result
     else:
         const = ConstantOp(FloatAttr(float(scalar), elem), elem)
-    splat = SplatOp(const.result, [], result_type)
-    return [const, splat], splat.results[0]
+        ops, value = [const], const.result
+    splat = SplatOp(value, [], result_type)
+    return [*ops, splat], splat.results[0]
 
 
 def _cast_scalar_build(target_elem):
