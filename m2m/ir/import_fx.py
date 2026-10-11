@@ -1183,7 +1183,7 @@ class FXImporter:
     def get_ir_text(self, module: ModuleOp) -> str:
         """Get the IR text representation of a module."""
         stream = io.StringIO()
-        Printer(stream=stream).print(module)
+        Printer(stream=stream).print_op(module)
         return stream.getvalue()
 
 

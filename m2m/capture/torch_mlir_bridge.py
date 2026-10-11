@@ -317,7 +317,7 @@ def module_to_text(module: ModuleOp, *, generic: bool = False) -> str:
     buf = io.StringIO()
     # Custom printers for e.g. tensor.empty historically discard attributes.
     # Traced artifacts must retain exact source IDs across serialization.
-    Printer(stream=buf, print_generic_format=generic).print(module)
+    Printer(stream=buf, print_generic_format=generic).print_op(module)
     text = buf.getvalue()
     for shim, native in _NATIVE_F8.items():
         if shim in text:
