@@ -9,6 +9,8 @@ python workloads/capture.py <model> --level high-level   # structured (linalg_ex
 python workloads/capture.py <model> --sections      # also emit per-source-module .mlir
 python workloads/capture.py --all                   # every model
 python workloads/capture.py --list                  # what's available
+python workloads/capture.py tiny_llama --formats fp32 --output-root "$TASK_DIR/.tmp/captures" \
+  --env M2M_LLAMA_LAYERS= --env HF_HOME=/path/to/hf-cache
 ```
 
 Output per model/format:
@@ -23,6 +25,18 @@ Output per model/format:
 `convert()` options: `level` (linalg-on-tensors | high-level), `quantization`, `preserve_qdq`,
 `fully_standard` (pure core MLIR, no `*_ext`), `weights_path` (externalize to safetensors).
 `.mlir`/`.safetensors` are gitignored (build artifacts).
+
+`--output-root` keeps large bundles outside the source checkout, under
+`<root>/<model>/`. Repeat `--env KEY=VALUE` to override `capture.toml` defaults
+for one invocation; an empty value clears a smoke layer-count setting.
+`--python /path/to/venv/bin/python` selects an existing environment without
+building a venv in the loader directory. The
+TinyLlama, Gemma 2, and DeepSeek Qwen loaders support full-checkpoint
+`e2e` captures with separate prefill/decode programs and explicit KV/position
+state. Set the Qwen `M2M_QWEN_SESSION=e2e` mode (the loader default in its
+`capture.toml`) and leave `M2M_QWEN_LAYERS` unset for the full checkpoint.
+These bundles record capture and ABI integrity; they do not establish target
+execution or numerical agreement.
 
 ## What a model directory contains
 

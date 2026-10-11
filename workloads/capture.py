@@ -206,12 +206,17 @@ def _capture_multi_program(mdl, model_dir: Path, stem: str, quant) -> dict:
     }
 
 
-def _inner_capture(model: str, formats: list[str], level: str) -> None:
+def _inner_capture(model: str, formats: list[str], level: str, *,
+                   output_root: Path | None = None) -> None:
     """Runs inside the model's venv: capture each format and emit a JSON summary."""
     import m2m
     from m2m.coverage import family_histogram, opaque_report
 
     model_dir = WORKLOADS / model
+    destination = model_dir if output_root is None else output_root / model
+    if destination.is_symlink():
+        raise ValueError("capture destination must not be a symlink")
+    destination.mkdir(parents=True, exist_ok=True)
     cfg = _load_toml(model_dir)
     sys.path.insert(0, str(model_dir))
     from loader import get_model_and_inputs  # type: ignore
@@ -234,15 +239,15 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
                 if os.environ.get("M2M_EMIT_SECTIONS"):
                     raise ValueError("multi-program capture does not support --sections")
                 results[fmt] = _capture_multi_program(
-                    mdl, model_dir, f"{model}{suffix[fmt]}", q)
+                    mdl, destination, f"{model}{suffix[fmt]}", q)
                 continue
             if fmt in DTYPE_CAST:  # base-weight dtype cast (bf16/fp16); no torchao
                 import torch
                 mdl = mdl.to(getattr(torch, DTYPE_CAST[fmt]))
-            weights_path = str(model_dir / f"{model}{suffix[fmt]}.safetensors")
+            weights_path = str(destination / f"{model}{suffix[fmt]}.safetensors")
             r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=q, level=level,
                             weights_path=weights_path)
-            path = model_dir / f"{model}{suffix[fmt]}.mlir"
+            path = destination / f"{model}{suffix[fmt]}.mlir"
             path.write_text(r.mlir_text)
             opaque = opaque_report(r.mlir_text)
             n_sections = 0
@@ -250,7 +255,7 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
                 try:
                     from m2m.api import module_to_text
                     from m2m.transforms import split_by_section
-                    secdir = model_dir / "sections"
+                    secdir = destination / "sections"
                     secdir.mkdir(exist_ok=True)
                     secs = split_by_section(r.module)
                     for sname, smod in secs.items():
@@ -272,13 +277,20 @@ def _inner_capture(model: str, formats: list[str], level: str) -> None:
     print("__CAPTURE_RESULT__ " + json.dumps(results))
 
 
-def _run_one(model: str, formats: list[str], level: str, *, build: bool) -> dict:
+def _run_one(model: str, formats: list[str], level: str, *, build: bool,
+             output_root: Path | None = None, env_overrides: dict[str, str] | None = None,
+             python: Path | None = None) -> dict:
     cfg = _load_toml(WORKLOADS / model)
-    py = _ensure_venv(model, cfg, build=build)
+    py = python if python is not None else _ensure_venv(model, cfg, build=build)
+    if not py.is_file():
+        raise ValueError(f"selected capture Python does not exist: {py}")
     env = dict(os.environ)
     env.update({k: str(v) for k, v in cfg.get("env", {}).items()})
+    env.update(env_overrides or {})
     cmd = [str(py), str(Path(__file__).resolve()), "--_inner", model,
            "--formats", ",".join(formats), "--level", level]
+    if output_root is not None:
+        cmd += ["--output-root", str(output_root)]
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
     for line in proc.stdout.splitlines():
         if line.startswith("__CAPTURE_RESULT__ "):
@@ -300,8 +312,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--list", action="store_true", help="list available models")
     ap.add_argument("--no-venv", action="store_true", help="don't build missing venvs (fail instead)")
     ap.add_argument("--sections", action="store_true", help="also emit per-source-module section .mlir files")
+    ap.add_argument("--output-root", type=Path, help="write captures under this root instead of beside loaders")
+    ap.add_argument("--python", type=Path, help="use an existing Python environment for the worker")
+    ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                    help="override a capture.toml environment default for this invocation")
     ap.add_argument("--_inner", dest="inner", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+
+    env_overrides = {}
+    for assignment in args.env:
+        key, sep, value = assignment.partition("=")
+        if not sep or not key.isidentifier():
+            ap.error(f"--env requires KEY=VALUE, got {assignment!r}")
+        env_overrides[key] = value
+    if args.output_root is not None:
+        root = args.output_root
+        if root.is_symlink():
+            ap.error("--output-root must not be a symlink")
+        root = root.resolve()
+        root.mkdir(parents=True, exist_ok=True)
+    else:
+        root = None
 
     if args.list:
         print("\n".join(_all_models()))
@@ -313,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"unknown formats: {bad} (valid: {list(SCHEME)})")
 
     if args.inner:  # in-venv worker
-        _inner_capture(args.model, formats, args.level)
+        _inner_capture(args.model, formats, args.level, output_root=root)
         return 0
 
     if args.sections:
@@ -326,7 +357,9 @@ def main(argv: list[str] | None = None) -> int:
     failures = 0
     for model in models:
         try:
-            res = _run_one(model, formats, args.level, build=not args.no_venv)
+            res = _run_one(model, formats, args.level, build=not args.no_venv,
+                           output_root=root, env_overrides=env_overrides,
+                           python=args.python)
             for fmt, r in res.items():
                 clean = r["ok"] and r["opaque"] == 0
                 if not clean:

@@ -176,3 +176,53 @@ def test_driver_rejects_root_contract_tamper_after_bundle_receipt():
             assert "integrity receipt does not bind session_contract.yaml" in str(exc)
         else:
             raise AssertionError("session capture accepted a tampered root contract")
+
+
+def test_capture_driver_passes_output_root_and_explicit_env_after_toml_defaults(monkeypatch, tmp_path):
+    called = {}
+    monkeypatch.setattr(capture, "_ensure_venv", lambda *_args, **_kwargs: Path(sys.executable))
+
+    def run(command, *, env, capture_output, text):
+        called.update(command=command, env=env)
+        return types.SimpleNamespace(stdout='__CAPTURE_RESULT__ {"fp32": {"ok": true}}\n')
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    output_root = tmp_path / "captures"
+    capture._run_one("tiny_llama", ["fp32"], "linalg-on-tensors", build=False,
+                     output_root=output_root,
+                     env_overrides={"M2M_LLAMA_LAYERS": ""})
+    assert called["env"]["M2M_LLAMA_LAYERS"] == ""
+    assert called["command"][-2:] == ["--output-root", str(output_root)]
+
+
+def test_capture_driver_uses_explicit_worker_python_without_creating_venv(monkeypatch):
+    monkeypatch.setattr(capture, "_ensure_venv", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("must not create a venv")))
+    seen = {}
+
+    def run(command, *, env, capture_output, text):
+        seen["command"] = command
+        return types.SimpleNamespace(stdout='__CAPTURE_RESULT__ {"fp32": {"ok": true}}\n')
+
+    monkeypatch.setattr(capture.subprocess, "run", run)
+    capture._run_one("tiny_llama", ["fp32"], "linalg-on-tensors", build=False,
+                     python=Path(sys.executable))
+    assert seen["command"][0] == sys.executable
+
+
+def test_capture_driver_places_session_under_requested_root(monkeypatch, tmp_path):
+    loader = types.ModuleType("loader")
+    loader.get_model_and_inputs = lambda: (types.SimpleNamespace(write_bundle=lambda *_a, **_k: {}), ())
+    monkeypatch.setitem(sys.modules, "loader", loader)
+    seen = {}
+
+    def capture_session(_model, output_dir, stem, _quant):
+        seen["output_dir"] = output_dir
+        seen["stem"] = stem
+        return {"ok": True, "opaque": 0}
+
+    monkeypatch.setattr(capture, "_capture_multi_program", capture_session)
+    root = tmp_path / "captures"
+    with contextlib.redirect_stdout(io.StringIO()):
+        capture._inner_capture("smolvla", ["fp32"], "linalg-on-tensors", output_root=root)
+    assert seen == {"output_dir": root / "smolvla", "stem": "smolvla"}
