@@ -91,7 +91,7 @@ def test_exact_midpoint_neighbor_exposes_binary64_double_rounding(exponent, sign
 
 
 @pytest.mark.parametrize(
-    "original", [-(1 << 63), (1 << 60) + (1 << 36) + 1, (1 << 63) - 1]
+    "original", [-(1 << 63) + 1, (1 << 60) + (1 << 36) + 1, (1 << 63) - 1]
 )
 def test_f32_splat_retains_original_signed64_constant(original):
     result_type = TensorType(f32, [3, 5])
@@ -142,3 +142,19 @@ def test_other_scalar_splat_paths_keep_existing_constant_roster(original, elemen
 
 def test_dynamic_scalar_splat_keeps_existing_refusal():
     assert _splat_scalar(1, TensorType(f32, [-1, 3])) is None
+
+
+@pytest.mark.parametrize("original", [0, 4, -4, (1 << 24), (1 << 24) + 2, -(1 << 63), (1 << 60)])
+def test_exact_f32_integer_coefficient_materializes_without_conversion(original):
+    operations, result = _splat_scalar(original, TensorType(f32, [2, 3]))
+    assert [operation.name for operation in operations] == ["arith.constant", "tensor.splat"]
+    for operation in operations:
+        operation.verify()
+    assert emitted_coefficient_bits(operations) == direct_f32_bits(original)
+
+
+@pytest.mark.parametrize("original", [(1 << 24) + 1, -((1 << 24) + 1)])
+def test_inexact_f32_integer_coefficient_retains_single_conversion(original):
+    operations, result = _splat_scalar(original, TensorType(f32, [2, 3]))
+    assert [operation.name for operation in operations] == ["arith.constant", "arith.sitofp", "tensor.splat"]
+    assert emitted_coefficient_bits(operations) == direct_f32_bits(original)

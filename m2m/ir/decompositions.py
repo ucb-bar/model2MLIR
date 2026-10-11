@@ -365,6 +365,18 @@ def _splat_scalar(scalar: Any, result_type: TensorType):
     if isinstance(elem, IntegerType):
         const = ConstantOp(IntegerAttr(int(scalar), elem), elem)
         ops, value = [const], const.result
+    elif (
+        type(scalar) is int
+        and isinstance(elem, Float32Type)
+        and -(1 << 63) <= scalar < (1 << 63)
+        and abs(scalar) % (1 << max(0, abs(scalar).bit_length() - 24)) == 0
+    ):
+        # A binary32 value has 24 significant bits. Divisibility by its
+        # integer spacing proves this coefficient is exactly representable;
+        # both Python binary64 and the target binary32 then retain it exactly.
+        # Materialize the target constant without runtime integer conversion.
+        const = ConstantOp(FloatAttr(float(scalar), elem), elem)
+        ops, value = [const], const.result
     elif type(scalar) is int and isinstance(elem, Float32Type) and -(1 << 63) <= scalar < (1 << 63):
         # Keep the original integer until its single conversion to f32. Going
         # through Python binary64 can round a near-midpoint coefficient twice.
