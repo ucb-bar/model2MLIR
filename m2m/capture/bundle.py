@@ -122,6 +122,26 @@ def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> Non
         print(f"[warn] lifted-constant export failed: {exc}\n{traceback.format_exc()[-800:]}")
 
 
+def _bind_lifted_constants_to_manifest(extra: dict, manifest: dict) -> None:
+    """Keep exactly the constants used by the converted graph's input ABI.
+
+    Torch export can retain a lifted constant after decomposition eliminates its
+    only user. The converter's manifest is the runtime ABI; a trailing unused
+    export constant must not turn an otherwise complete capture into an extra
+    runtime argument. Missing manifest constants remain a hard failure.
+    """
+    expected = {
+        str(entry.get("name")) for entry in manifest.values()
+        if isinstance(entry, dict) and str(entry.get("name", "")).startswith("c_lifted_tensor_")
+    }
+    observed = {name for name in extra if name.startswith("c_lifted_tensor_")}
+    missing = expected - observed
+    if missing:
+        raise ValueError(f"converted graph has unmaterialized lifted constants: {sorted(missing)}")
+    for name in observed - expected:
+        del extra[name]
+
+
 def _extract_prov_fqns(mlir_text: str) -> list[str]:
     """The distinct ``prov.fqn`` module paths the export tagged, in first-seen order.
 
@@ -639,9 +659,10 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
             _flatten_subclass(p, pname, extra)
     _lifted_constants(runtime_mdl, inputs, extra,
                       exported_program=r.exported_program if r.exported_program is not None else exported_program)
+    man = json.loads(Path(weights_path + ".manifest.json").read_text())
+    _bind_lifted_constants_to_manifest(extra, man)
     np.savez(out / "extra.npz", **extra)
 
-    man = json.loads(Path(weights_path + ".manifest.json").read_text())
     order: dict = {}
     k = 0
     for i in range(len(man)):

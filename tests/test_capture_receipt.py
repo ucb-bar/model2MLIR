@@ -5,9 +5,11 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import sympy
 import torch
 from m2m.capture.bundle import (
+    _bind_lifted_constants_to_manifest,
     _lifted_constants,
     _numpy_safe,
     _opaque_call_count,
@@ -173,6 +175,17 @@ def test_original_export_supplies_lifted_constants_without_second_export():
     extra = {}
     _lifted_constants(None, (), extra, exported_program=exported)
     assert extra["c_lifted_tensor_0"].tolist() == [True, False]
+
+
+def test_converter_manifest_owns_lifted_constant_runtime_abi():
+    extra = {"c_lifted_tensor_0": np.array(1), "c_lifted_tensor_1": np.array(2),
+             "buf::other": np.array(3)}
+    manifest = {"0": {"kind": "input", "name": "c_lifted_tensor_0"}}
+    _bind_lifted_constants_to_manifest(extra, manifest)
+    assert set(extra) == {"c_lifted_tensor_0", "buf::other"}
+    manifest["1"] = {"kind": "input", "name": "c_lifted_tensor_2"}
+    with pytest.raises(ValueError, match="unmaterialized"):
+        _bind_lifted_constants_to_manifest(extra, manifest)
 
 
 def test_traced_bundle_and_reused_conversion_bind_exact_bytes_without_recapture(tmp_path, monkeypatch):
