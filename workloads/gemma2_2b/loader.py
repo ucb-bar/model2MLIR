@@ -30,7 +30,8 @@ Env:
     M2M_GEMMA_PAPER_READY=1
                          opt in only with the full checkpoint and an attributed external corpus
 
-Weights come from the local HF cache (google/gemma-2-2b-it); HF_HOME is set by capture.toml.
+Weights come from the Hugging Face cache (google/gemma-2-2b-it). Set HF_HOME
+or pass --env HF_HOME=/path/to/cache to the capture driver if needed.
 
 WHAT THIS ARCHITECTURE ADDS over the Llama-family loaders beside it, since each item is a place the
 lowering can diverge rather than fail:

@@ -36,9 +36,24 @@ PY
 ```
 
 The generic workload driver can instead invoke the loader's three-program
-session contract: `python workloads/capture.py smolvla --formats fp32`.
-It reads `capture.toml`, writes `workloads/smolvla/smolvla_session/` with separate
-stage MLIR and capture receipts. This is the loader's three-stage capture path,
+session contract. For the complete pretrained checkpoint, use an existing
+environment with LeRobot and model2MLIR installed:
+
+```sh
+python workloads/capture.py smolvla --formats fp32 \
+  --python /path/to/capture-environment/bin/python \
+  --output-root /path/to/captures \
+  --env M2M_SMOLVLA_SESSION=e2e --env M2M_SMOLVLA_PRETRAINED=1 \
+  --env M2M_SMOLVLA_VLM_LAYERS= --env M2M_SMOLVLA_EXPERT_LAYERS=
+```
+
+The [MX Gemmini + VPU guide](https://github.com/ucb-bar/mx-gemmini-mlir/blob/handwritten-implementation/docs/compile_e2e_models.md)
+continues from this capture through Merlin stage compilation, session linking,
+and Spike execution.
+
+It reads `capture.toml`, writes
+`/path/to/captures/smolvla/smolvla_session/` with separate stage MLIR and
+capture receipts. This is the loader's three-stage capture path,
 not the small smoke command above. An offline run with the full checkpoint and
 synthetic inputs produced all three stage bundles with zero opaque operations;
 each stage also lowered to LLVM IR. Those checks did not execute compiled code.

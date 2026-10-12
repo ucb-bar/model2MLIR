@@ -1,14 +1,11 @@
-venv = "/scratch/agustin/projects/model2MLIR/.venv"
+venv = ".venv"
 python = "3.12"
 deps = ["transformers"]
 
 [env]
-# The real 4.9 GB checkout lives in the scratch2 cache; the default HF_HOME on this host holds only a
-# metadata stub for this repo, and a capture pointed there would try to download 4.9 GB (and fail on a
-# full root filesystem) instead of reading what is already present.
-HF_HOME = "/scratch2/agustin/hf_cache"
-# Layer count for a capture. Gemma 2 2B is 26 decoder layers; a smoke capture sets this to 2 to get the
-# same architecture (every op family, both attention variants) at a size that compiles in seconds.
-# Unset = the full 26-layer model with its real pretrained weights.
+# Set HF_HOME in the environment or pass --env HF_HOME=/path/to/cache when
+# capturing a locally cached checkpoint.
+# A smoke capture uses two decoder layers with random weights. Clear this
+# value with --env M2M_GEMMA_LAYERS= for the full pretrained model.
 M2M_GEMMA_LAYERS = "2"
 M2M_GEMMA_SESSION = "e2e"

@@ -1,5 +1,11 @@
 # Workloads — the standardized model→MLIR capture flow
 
+For complete TinyLlama, DeepSeek-R1-Distill-Qwen-1.5B, Gemma 2 2B, and
+SmolVLA sessions targeting MX Gemmini with VPU, see the
+[capture, compile, link, and Spike guide](https://github.com/ucb-bar/mx-gemmini-mlir/blob/handwritten-implementation/docs/compile_e2e_models.md).
+Those captures use the pretrained checkpoints and write multiple stage
+programs; the small random-weight examples below are frontend smoke tests.
+
 One command captures any model to MLIR in every datatype/quant format:
 
 ```bash
@@ -9,7 +15,7 @@ python workloads/capture.py <model> --level high-level   # structured (linalg_ex
 python workloads/capture.py <model> --sections      # also emit per-source-module .mlir
 python workloads/capture.py --all                   # every model
 python workloads/capture.py --list                  # what's available
-python workloads/capture.py tiny_llama --formats fp32 --output-root "$TASK_DIR/.tmp/captures" \
+python workloads/capture.py tiny_llama --formats fp32 --output-root /path/to/captures \
   --env M2M_LLAMA_LAYERS= --env HF_HOME=/path/to/hf-cache
 ```
 
@@ -38,6 +44,15 @@ state. Set the Qwen `M2M_QWEN_SESSION=e2e` mode (the loader default in its
 These bundles record capture and ABI integrity; they do not establish target
 execution or numerical agreement.
 
+Some other workloads import an external upstream checkout. Set the path in
+their loader environment before capture: `M2M_RDT_ROOT`, `M2M_RDT2_ROOT`,
+`M2M_GROOT_ROOT`, `M2M_BITVLA_ROOT`, or `M2M_XR0_ROOT` for those named loaders;
+`MOLMOACT_REPO`, `DIFFJSCC_DIR`, `VITFLY_DIR`, and `SPECTFORMER_DIR` for the
+corresponding upstream projects. Paths shown as `/path/to/...` in workload
+examples are placeholders to replace with your checkout locations. Each
+`capture.toml` uses a local `.venv` by default; `--python` can select an
+existing environment instead.
+
 ## What a model directory contains
 
 ```
@@ -52,12 +67,14 @@ workloads/<model>/
 def get_model_and_inputs() -> tuple[torch.nn.Module, tuple[torch.Tensor, ...]]:
     """Build the model and example inputs such that model(*inputs) runs eagerly."""
 ```
-Rules that make capture stable and scalable:
+Rules for a quick smoke capture:
 - **Small config, no big/gated downloads.** Build the real architecture from a *reduced*
-  config (fewer layers/hidden/vocab) and random init — capture is about the op set, not weights.
-- **Capture ONE unit.** A single `forward` / denoise step — not generation loops or sampling.
-- **`sys.path` the upstream repo** (cloned at `/scratch/agustin/projects/<Repo>`, a sibling of
-  `model2MLIR`). Stub out heavy side-effect imports if the package `__init__` pulls the world.
+  config (fewer layers/hidden/vocab) and random init when checking the op set.
+- **Capture one unit.** A single `forward` or denoise step is enough for an
+  initial frontend check. Loaders with `write_bundle` can capture a complete
+  multi-program session instead.
+- **Make the upstream package importable** in the selected capture environment.
+  Stub out heavy side-effect imports if the package `__init__` pulls the world.
 - **Eager attention**, `use_cache=False` — keep the traced graph export-friendly.
 
 ### `capture.toml` — environment (optional)
@@ -66,7 +83,7 @@ venv   = ".venv"          # default: workloads/<model>/.venv (the STANDARD locat
                           # may be an absolute path to reuse an existing dedicated venv.
 python = "3.11"           # python version for a fresh venv
 deps   = ["torch==2.7.1", "transformers==4.53.3", ...]   # pip specs for a fresh venv
-upstream = "/scratch/agustin/projects/<Repo>"            # documentation
+upstream = "/path/to/upstream/repo"
 [env]                     # env vars set for the capture (e.g. small-config knobs)
 M2M_<MODEL>_LAYERS = "4"
 ```
@@ -98,7 +115,7 @@ lowers it back). Quantization is QDQ-preserved by default (`quant_ext.dequantize
 weight); fp8 renders the native `f8E4M3FN` spelling.
 
 ## Adding a new model (the whole recipe)
-1. `git clone <upstream>` → `/scratch/agustin/projects/<Repo>`.
+1. Obtain the upstream source in a separate checkout or install its package.
 2. `mkdir workloads/<model>` ; write `loader.py` (the contract above).
 3. Write `capture.toml` (deps + any small-config env vars).
 4. `python workloads/capture.py <model>` → three `.mlir` files at 0 opaque.
