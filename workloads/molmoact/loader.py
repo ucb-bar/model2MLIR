@@ -37,7 +37,7 @@ import torch
 from torch import nn
 
 # The model code lives in the (un-installed) molmoact repo; make it importable.
-_MOLMOACT_REPO = os.environ.get("MOLMOACT_REPO", "/scratch/agustin/projects/molmoact")
+_MOLMOACT_REPO = os.environ.get("MOLMOACT_REPO", "/path/to/molmoact")
 if _MOLMOACT_REPO not in sys.path:
     sys.path.insert(0, _MOLMOACT_REPO)
 

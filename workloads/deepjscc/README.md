@@ -31,7 +31,7 @@ installing a training stack, and they are deliberately not listed as deps.
 
 ## Run
 ```bash
-cd /scratch/agustin/projects/model2MLIR
+cd /path/to/model2MLIR
 python workloads/capture.py deepjscc --formats fp32,int8
 .venv/bin/python workloads/capture_consistent.py deepjscc int8 \
     <merlin>/out/artifacts/recaptures/deepjscc_int8_full

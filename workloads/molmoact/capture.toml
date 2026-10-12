@@ -1,7 +1,7 @@
 # Standard capture config for molmoact. venv defaults to ./.venv (the standard location).
 python = "3.11"
 deps = ["torch==2.7.1", "transformers==4.53.3", "einops", "numpy"]
-upstream = "/scratch/agustin/projects/molmoact"   # on sys.path by loader.py
+upstream = "/path/to/molmoact"   # on sys.path by loader.py
 [env]
 M2M_MOLMOACT_LAYERS = "4"
 M2M_MOLMOACT_VOCAB = "4096"

@@ -30,14 +30,14 @@ m2m requires `enum.StrEnum` -> Python **3.11+**. torchao 0.17 needs `torch>=2.8`
 (`torch.utils._pytree.register_constant`) and `torch.int1` (`torch>=2.6`), so the
 whole stack is pinned to torch 2.8 / torchvision 0.23.
 ```bash
-cd /scratch/agustin/projects/bitvla_capture
+cd /path/to/bitvla_capture
 uv venv --python 3.11
 # VENDORED transformers fork (hardcodes BitNet + Siglip + use_bi_attn) + OFT deps:
-uv pip install -e /scratch/agustin/projects/BitVLA/transformers
+uv pip install -e /path/to/BitVLA/transformers
 uv pip install "torch==2.8.0" "torchvision==0.23.0" --index-url https://download.pytorch.org/whl/cpu
 uv pip install numpy timm accelerate
 # m2m + deps (NOTE: torchao 0.17 / torch 2.8):
-uv pip install -e /scratch/agustin/projects/model2MLIR --no-deps
+uv pip install -e /path/to/model2MLIR --no-deps
 uv pip install xdsl structlog ml_dtypes "torchao==0.17.0"
 ```
 Note: `bitvla_for_action_prediction` imports `prismatic.vla.constants` and
@@ -60,12 +60,12 @@ transformers `_LazyModule`).
 
 ## Run
 ```bash
-cd /scratch/agustin/projects/bitvla_capture
-BITVLA_LLM_LAYERS=2 uv run --no-sync python -c "
-import m2m, sys; sys.path.insert(0,'/scratch/agustin/projects/model2MLIR/workloads/bitvla')
+cd /path/to/bitvla_capture
+M2M_BITVLA_ROOT=/path/to/BitVLA BITVLA_LLM_LAYERS=2 uv run --no-sync python -c "
+import m2m, sys; sys.path.insert(0,'/path/to/model2MLIR/workloads/bitvla')
 from loader import get_model_and_inputs
 m,i=get_model_and_inputs(); r=m2m.convert(m,i)
-open('/scratch/agustin/projects/model2MLIR/workloads/bitvla/bitvla.mlir','w').write(r.mlir_text)
+open('/path/to/model2MLIR/workloads/bitvla/bitvla.mlir','w').write(r.mlir_text)
 print(r.path_taken, r.mlir_text.count('linalg.'))"
 ```
 

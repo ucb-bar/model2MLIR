@@ -1,6 +1,6 @@
-venv = "/scratch/agustin/projects/RDT2/.venv"
+venv = ".venv"
 python = "3.11"
 deps = ["torch", "timm==1.0.15", "numpy==1.26.4"]
-upstream = "/scratch/agustin/projects/RDT2"
+upstream = "/path/to/RDT2"
 [env]
 M2M_RDT2_DEPTH = "2"

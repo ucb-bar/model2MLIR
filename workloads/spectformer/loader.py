@@ -32,7 +32,7 @@ from torch import nn
 _IMG, _PATCH, _DIM, _DEPTH, _HEADS = 224, 16, 256, 12, 4
 
 _UPSTREAM = Path(
-    os.environ.get("SPECTFORMER_DIR", "/scratch/agustin/projects/SpectFormers")
+    os.environ.get("SPECTFORMER_DIR", "/path/to/SpectFormers")
 ) / "vanilla_architecture"
 
 #: A trained SpectFormer-Ti (300 epochs, 73.14% top-1 / 91.56% top-5 ImageNet, 9,158,376

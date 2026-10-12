@@ -29,7 +29,7 @@ import torch
 from torch import nn
 
 # Make the upstream repo importable without requiring an editable install of gr00t.
-_GROOT_REPO = "/scratch/agustin/projects/Isaac-GR00T"
+_GROOT_REPO = os.environ.get("M2M_GROOT_ROOT", "/path/to/Isaac-GR00T")
 if _GROOT_REPO not in sys.path:
     sys.path.insert(0, _GROOT_REPO)
 

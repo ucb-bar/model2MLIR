@@ -18,7 +18,7 @@ paper-ready capture requires the complete published state dict loaded strictly, 
 trajectory with exactly the requested number of frames, desired velocities, and unit quaternions.
 
 Env:
-    VITFLY_DIR   upstream checkout (default: /scratch/agustin/projects/vitfly)
+    VITFLY_DIR   upstream checkout (default: /path/to/vitfly)
     VITFLY_CKPT           complete trained LSTMNetVIT state_dict (required for paper capture)
     VITFLY_SESSION_NPZ    arrays: frames, desired_velocity, quaternions
     VITFLY_SESSION_SOURCE stable provenance label for the trajectory
@@ -38,7 +38,7 @@ import numpy as np
 import torch
 from torch import nn
 
-_UPSTREAM = Path(os.environ.get("VITFLY_DIR", "/scratch/agustin/projects/vitfly")) / "models"
+_UPSTREAM = Path(os.environ.get("VITFLY_DIR", "/path/to/vitfly")) / "models"
 _PAPER_CHECKPOINT = "vitfly/LSTMNetVIT/published_pretrained"
 
 

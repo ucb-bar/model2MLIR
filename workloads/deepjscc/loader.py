@@ -16,7 +16,7 @@ the golden unreproducible. What is captured is encode -> (power normalize) -> de
 the deterministic compute; the channel is a runtime input in the real system.
 
 Env:
-    DIFFJSCC_DIR   upstream checkout (default: /scratch/agustin/projects/DiffJSCC)
+    DIFFJSCC_DIR   upstream checkout (default: /path/to/DiffJSCC)
     M2M_JSCC_SIZE  square input resolution (default: 64; the paper trains at 256, which makes
                    the im2col intermediates large -- raise deliberately, not by habit)
     M2M_JSCC_NGF   base width (default: 16; upstream uses 64)
@@ -34,7 +34,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-_UPSTREAM = Path(os.environ.get("DIFFJSCC_DIR", "/scratch/agustin/projects/DiffJSCC"))
+_UPSTREAM = Path(os.environ.get("DIFFJSCC_DIR", "/path/to/DiffJSCC"))
 
 
 def _stub_training_deps() -> None:

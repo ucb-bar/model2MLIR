@@ -12,7 +12,7 @@ that repo (only example clients/servers for DROID and bimanual YAM robots, plus 
 YAM/EVA_DROID git submodules, none fetched). MolmoAct2 uses a flow-matching action head.
 
 The full PyTorch model definition lives in https://github.com/allenai/molmoact (the `olmo`
-training package), cloned at /scratch/agustin/projects/molmoact. This loader builds against
+training package), cloned at /path/to/molmoact. This loader builds against
 that — the autoregressive MolmoAct (v1) lineage, same ViT+LLM backbone.
 
 Model classes (in `olmo/hf_model/molmoact/modeling_molmoact.py`):
@@ -45,15 +45,15 @@ the repo on `sys.path` (no `pip install -e` of olmo needed) via `MOLMOACT_REPO`.
 
 ```bash
 # molmoact already cloned (shallow, LFS skipped):
-#   GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/allenai/molmoact /scratch/agustin/projects/molmoact
-uv venv --python 3.11 --directory /scratch/agustin/projects/model2MLIR/workloads/molmoact
+#   GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/allenai/molmoact /path/to/molmoact
+uv venv --python 3.11 --directory /path/to/model2MLIR/workloads/molmoact
 # minimal capture deps. NOTE: transformers MUST be 4.5x, NOT 5.x:
 # transformers 5.x removed the "default" key from ROPE_INIT_FUNCTIONS, and the
 # model file does ROPE_INIT_FUNCTIONS["default"] -> KeyError. 4.53.3 verified working.
 uv pip install "torch==2.7.*" "transformers==4.53.*" einops numpy
 # frontend (FXImporter mode) + quant:
 uv pip install xdsl structlog ml_dtypes torchao
-uv pip install -e /scratch/agustin/projects/model2MLIR --no-deps
+uv pip install -e /path/to/model2MLIR --no-deps
 ```
 
 NOTE: invoke the workload venv explicitly (`./.venv/bin/python`); `uv run` from this
@@ -61,13 +61,13 @@ dir walks up and picks the parent `model2MLIR/.venv` instead.
 
 ## Run
 ```bash
-MOLMOACT_REPO=/scratch/agustin/projects/molmoact \
+MOLMOACT_REPO=/path/to/molmoact \
 M2M_MOLMOACT_LAYERS=4 M2M_MOLMOACT_VOCAB=4096 \
 uv run --no-sync python -c "
-import m2m, sys; sys.path.insert(0,'/scratch/agustin/projects/model2MLIR/workloads/molmoact')
+import m2m, sys; sys.path.insert(0,'/path/to/model2MLIR/workloads/molmoact')
 from loader import get_model_and_inputs
 m,i=get_model_and_inputs(); r=m2m.convert(m,i)
-open('/scratch/agustin/projects/model2MLIR/workloads/molmoact/molmoact.mlir','w').write(r.mlir_text)
+open('/path/to/model2MLIR/workloads/molmoact/molmoact.mlir','w').write(r.mlir_text)
 print(r.path_taken, r.mlir_text.count('linalg.'))"
 ```
 

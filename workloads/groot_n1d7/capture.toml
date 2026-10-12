@@ -1,6 +1,6 @@
-venv = "/scratch/agustin/projects/Isaac-GR00T/.venv"
+venv = ".venv"
 python = "3.11"
 deps = ["torch==2.7.1", "transformers==4.57.3", "diffusers", "dm-tree", "tyro", "numpy", "torchao==0.11.0"]
-upstream = "/scratch/agustin/projects/Isaac-GR00T"
+upstream = "/path/to/Isaac-GR00T"
 [env]
 M2M_GROOT_LAYERS = "2"

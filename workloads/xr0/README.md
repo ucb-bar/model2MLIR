@@ -30,30 +30,30 @@ excluded). The full `XR0.forward(batch)` is NOT exportable (Euler `for`-loop,
 
 ## Venv (dedicated)
 ```bash
-cd /scratch/agustin/projects/xr0_capture
+cd /path/to/xr0_capture
 uv venv --python 3.12
 uv pip install torch==2.8.0 torchvision==0.23.0 \
   --index-url https://download.pytorch.org/whl/cpu
 uv pip install transformers==4.57.1 mmengine==0.10.7 numpy
-uv pip install -e /scratch/agustin/projects/Xiaomi-Robotics-0/xr0 --no-deps
+uv pip install -e /path/to/Xiaomi-Robotics-0/xr0 --no-deps
 # m2m + torch-mlir:
 uv pip install xdsl structlog ml_dtypes
 uv pip install --pre torch-mlir \
   --extra-index-url https://download.pytorch.org/whl/nightly/cpu \
   -f https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels
-uv pip install -e /scratch/agustin/projects/model2MLIR --no-deps
+uv pip install -e /path/to/model2MLIR --no-deps
 ```
 Note: `flash-attn` is only needed for the full VLM forward, which we do NOT
 capture — CPU export of the DiT step does not require it.
 
 ## Run
 ```bash
-cd /scratch/agustin/projects/xr0_capture
-XR0_DIT_LAYERS=2 uv run --no-sync python -c "
-import m2m, sys; sys.path.insert(0,'/scratch/agustin/projects/model2MLIR/workloads/xr0')
+cd /path/to/xr0_capture
+M2M_XR0_ROOT=/path/to/Xiaomi-Robotics-0/xr0 XR0_DIT_LAYERS=2 uv run --no-sync python -c "
+import m2m, sys; sys.path.insert(0,'/path/to/model2MLIR/workloads/xr0')
 from loader import get_model_and_inputs
 m,i=get_model_and_inputs(); r=m2m.convert(m,i)
-open('/scratch/agustin/projects/model2MLIR/workloads/xr0/xr0.mlir','w').write(r.mlir_text)
+open('/path/to/model2MLIR/workloads/xr0/xr0.mlir','w').write(r.mlir_text)
 print(r.path_taken, r.mlir_text.count('linalg.'))"
 ```
 

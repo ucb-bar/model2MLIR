@@ -20,23 +20,23 @@ action expert you only need torch + timm (`Mlp`) + numpy. Capturing the full VLA
 (Qwen2.5-VL-7B) would need the heavy stack + a ~15GB checkpoint — out of scope here.
 
 ```bash
-git clone https://github.com/thu-ml/RDT2 /scratch/agustin/projects/RDT2
-cd /scratch/agustin/projects/RDT2
+git clone https://github.com/thu-ml/RDT2 /path/to/RDT2
+cd /path/to/RDT2
 uv venv --python 3.11   # m2m imports enum.StrEnum, which needs Python 3.11+
 uv pip install torch timm==1.0.15 numpy==1.26.4
 # frontend (FXImporter mode; a matching cp310 torch-mlir wheel can be added too)
 uv pip install xdsl structlog ml_dtypes
-uv pip install -e /scratch/agustin/projects/model2MLIR --no-deps
+uv pip install -e /path/to/model2MLIR --no-deps
 ```
 
 ## Run
 ```bash
-cd /scratch/agustin/projects/RDT2
-M2M_RDT2_DEPTH=2 uv run --no-sync python -c "
-import m2m, sys; sys.path.insert(0,'/scratch/agustin/projects/model2MLIR/workloads/rdt2')
+cd /path/to/RDT2
+M2M_RDT2_ROOT=/path/to/RDT2 M2M_RDT2_DEPTH=2 uv run --no-sync python -c "
+import m2m, sys; sys.path.insert(0,'/path/to/model2MLIR/workloads/rdt2')
 from loader import get_model_and_inputs
 m,i=get_model_and_inputs(); r=m2m.convert(m,i)
-open('/scratch/agustin/projects/model2MLIR/workloads/rdt2/rdt2.mlir','w').write(r.mlir_text)
+open('/path/to/model2MLIR/workloads/rdt2/rdt2.mlir','w').write(r.mlir_text)
 print(r.path_taken, r.mlir_text.count('linalg.'))"
 ```
 Env: `M2M_RDT2_DEPTH=N` (number of RDT blocks; default 2 smoke, real default = 14).

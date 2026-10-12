@@ -1,7 +1,7 @@
-venv = "/scratch/agustin/projects/model2MLIR/.venv"
+venv = ".venv"
 python = "3.12"
 deps = ["timm"]
-upstream = "/scratch/agustin/projects/DiffJSCC"
+upstream = "/path/to/DiffJSCC"
 
 # Upstream's deepjscc_cnn.py imports a training stack (pytorch_lightning, LPIPS,
 # pytorch_msssim, einops) at module scope for its LightningModule. loader.py stubs those --

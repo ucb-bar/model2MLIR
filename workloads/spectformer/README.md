@@ -22,7 +22,7 @@ The main `model2MLIR/.venv` (torch + timm + torch-mlir).
 
 ## Run
 ```bash
-cd /scratch/agustin/projects/model2MLIR
+cd /path/to/model2MLIR
 python workloads/capture.py spectformer --formats fp32,int8
 .venv/bin/python workloads/capture_consistent.py spectformer int8 \
     <merlin>/out/artifacts/recaptures/spectformer_int8_full

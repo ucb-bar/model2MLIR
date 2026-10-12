@@ -42,8 +42,9 @@ from torch import nn
 # Make the OFT bitvla *modeling* code importable. The modeling file uses flat
 # imports (`from configuration_bit_vla import ...`, `from bitvla_for_action_prediction
 # import ...`), so both the package dir and its `model/` subdir go on sys.path.
-_BITVLA_PKG = "/scratch/agustin/projects/BitVLA/openvla-oft/bitvla"
-_BITVLA_MODEL = "/scratch/agustin/projects/BitVLA/openvla-oft/bitvla/model"
+_BITVLA_ROOT = os.environ.get("M2M_BITVLA_ROOT", "/path/to/BitVLA")
+_BITVLA_PKG = os.path.join(_BITVLA_ROOT, "openvla-oft/bitvla")
+_BITVLA_MODEL = os.path.join(_BITVLA_PKG, "model")
 for _p in (_BITVLA_PKG, _BITVLA_MODEL):
     if _p not in sys.path:
         sys.path.insert(0, _p)

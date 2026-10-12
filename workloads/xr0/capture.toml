@@ -1,4 +1,4 @@
-venv = "/scratch/agustin/projects/xr0_capture/.venv"
+venv = ".venv"
 python = "3.12"
 deps = ["torch==2.8.0", "torchvision==0.23.0", "transformers==4.57.1", "mmengine==0.10.7", "numpy"]
-upstream = "/scratch/agustin/projects/Xiaomi-Robotics-0"
+upstream = "/path/to/Xiaomi-Robotics-0"

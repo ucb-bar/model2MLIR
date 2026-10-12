@@ -14,23 +14,23 @@ RDT pins torch + transformers 4.41 + diffusers 0.27.2 + timm 1.0.3. Only torch +
 (for `Attention`/`Mlp`/`RmsNorm`) + diffusers are needed to instantiate `RDT`.
 
 ```bash
-git clone https://github.com/thu-ml/RoboticsDiffusionTransformer /scratch/agustin/projects/RoboticsDiffusionTransformer
-cd /scratch/agustin/projects/RoboticsDiffusionTransformer
+git clone https://github.com/thu-ml/RoboticsDiffusionTransformer /path/to/RoboticsDiffusionTransformer
+cd /path/to/RoboticsDiffusionTransformer
 uv venv --python 3.10
 uv pip install torch timm==1.0.3 diffusers==0.27.2 transformers==4.41.0 packaging
 # frontend (FXImporter mode; a matching cp310 torch-mlir wheel can be added too)
 uv pip install xdsl structlog ml_dtypes
-uv pip install -e /scratch/agustin/projects/model2MLIR --no-deps
+uv pip install -e /path/to/model2MLIR --no-deps
 ```
 
 ## Run
 ```bash
-cd /scratch/agustin/projects/RoboticsDiffusionTransformer
-M2M_RDT_DEPTH=2 uv run --no-sync python -c "
-import m2m, sys; sys.path.insert(0,'/scratch/agustin/projects/model2MLIR/workloads/rdt')
+cd /path/to/RoboticsDiffusionTransformer
+M2M_RDT_ROOT=/path/to/RoboticsDiffusionTransformer M2M_RDT_DEPTH=2 uv run --no-sync python -c "
+import m2m, sys; sys.path.insert(0,'/path/to/model2MLIR/workloads/rdt')
 from loader import get_model_and_inputs
 m,i=get_model_and_inputs(); r=m2m.convert(m,i)
-open('/scratch/agustin/projects/model2MLIR/workloads/rdt/rdt.mlir','w').write(r.mlir_text)
+open('/path/to/model2MLIR/workloads/rdt/rdt.mlir','w').write(r.mlir_text)
 print(r.path_taken, r.mlir_text.count('linalg.'))"
 ```
 Env: `M2M_RDT_DEPTH=N` (number of RDT blocks; default 2 smoke, real 1B = 28).

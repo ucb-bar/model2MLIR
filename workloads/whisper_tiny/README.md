@@ -19,7 +19,7 @@ The main `model2MLIR/.venv` (torch + transformers + torch-mlir).
 
 ## Run
 ```bash
-cd /scratch/agustin/projects/model2MLIR
+cd /path/to/model2MLIR
 python workloads/capture.py whisper_tiny --formats fp32,int8
 .venv/bin/python workloads/capture_consistent.py whisper_tiny int8 \
     <merlin>/out/artifacts/recaptures/whisper_tiny_int8_full

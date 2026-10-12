@@ -31,7 +31,7 @@ The main `model2MLIR/.venv`. No extra deps.
 
 ## Run
 ```bash
-cd /scratch/agustin/projects/model2MLIR
+cd /path/to/model2MLIR
 python workloads/capture.py lstmnetvit --formats fp32,int8
 .venv/bin/python workloads/capture_consistent.py lstmnetvit int8 \
     <merlin>/out/artifacts/recaptures/lstmnetvit_int8_full

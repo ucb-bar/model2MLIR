@@ -6,22 +6,22 @@ forward; `predict_action` wraps a generation loop that isn't export-friendly).
 
 ## Venv (dedicated)
 ```bash
-mkdir -p /scratch/agustin/projects/openvla_capture && cd /scratch/agustin/projects/openvla_capture
+mkdir -p /path/to/openvla_capture && cd /path/to/openvla_capture
 uv venv --python 3.12
 uv pip install 'transformers>=4.40' timm tokenizers accelerate pillow numpy
 uv pip install xdsl structlog ml_dtypes
-uv pip install -e /scratch/agustin/projects/model2MLIR --no-deps
+uv pip install -e /path/to/model2MLIR --no-deps
 # optional torch-mlir wheel (cp312/torch 2.x) for the accelerator path
 ```
 
 ## Run
 ```bash
-cd /scratch/agustin/projects/openvla_capture
+cd /path/to/openvla_capture
 uv run --no-sync python -c "
-import m2m, sys; sys.path.insert(0,'/scratch/agustin/projects/model2MLIR/workloads/openvla')
+import m2m, sys; sys.path.insert(0,'/path/to/model2MLIR/workloads/openvla')
 from loader import get_model_and_inputs
 m,i=get_model_and_inputs(); r=m2m.convert(m,i,backend='fx_importer')
-open('/scratch/agustin/projects/model2MLIR/workloads/openvla/openvla.mlir','w').write(r.mlir_text)
+open('/path/to/model2MLIR/workloads/openvla/openvla.mlir','w').write(r.mlir_text)
 print(r.ok, r.mlir_text.count('linalg.'))"
 ```
 

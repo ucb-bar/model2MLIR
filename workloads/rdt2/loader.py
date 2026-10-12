@@ -26,7 +26,7 @@ import sys
 import torch
 from torch import nn
 
-_RDT2_REPO = "/scratch/agustin/projects/RDT2"
+_RDT2_REPO = os.environ.get("M2M_RDT2_ROOT", "/path/to/RDT2")
 if _RDT2_REPO not in sys.path:
     sys.path.insert(0, _RDT2_REPO)
 

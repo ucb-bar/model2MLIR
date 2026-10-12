@@ -27,7 +27,7 @@ from torch import nn
 
 # RDT is imported by package-relative path `models.rdt.model`; the repo root must
 # be importable. Adjust if the clone lives elsewhere.
-_RDT_REPO = "/scratch/agustin/projects/RoboticsDiffusionTransformer"
+_RDT_REPO = os.environ.get("M2M_RDT_ROOT", "/path/to/RoboticsDiffusionTransformer")
 if _RDT_REPO not in sys.path:
     sys.path.insert(0, _RDT_REPO)
 

@@ -1,4 +1,4 @@
-venv = "/scratch/agustin/projects/openvla_capture/.venv"
+venv = ".venv"
 python = "3.12"
 deps = ["transformers>=4.40", "timm", "tokenizers", "accelerate", "pillow", "numpy"]
 [env]

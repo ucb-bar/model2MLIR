@@ -52,7 +52,7 @@ def _load_xr0_module() -> types.ModuleType:
     if "mibot.models.VLA.XR0" in sys.modules:
         return sys.modules["mibot.models.VLA.XR0"]
 
-    xr0_root = "/scratch/agustin/projects/Xiaomi-Robotics-0/xr0"
+    xr0_root = os.environ.get("M2M_XR0_ROOT", "/path/to/Xiaomi-Robotics-0/xr0")
     from mmengine import Registry
 
     # --- stub package tree so XR0.py's intra-package imports resolve ---
