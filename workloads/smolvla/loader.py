@@ -138,7 +138,8 @@ class SmolVLAMultiProgramCapture:
         self.paper_ready, self.full_checkpoint = bool(paper_ready), bool(full_checkpoint)
         self.provenance = dict(provenance)
 
-    def _external_runtime_session(self, *, quality_reference: np.ndarray | None = None):
+    def _external_runtime_session(self, *, quality_reference: np.ndarray | None = None,
+                                  quality_reference_inputs: dict[str, np.ndarray] | None = None):
         """Build the exact prefix/flow/action programs and functional tensor routing contract."""
         from m2m.capture.external_runtime import (
             ExternalRuntimeProgram, make_external_runtime_session,
@@ -170,6 +171,8 @@ class SmolVLAMultiProgramCapture:
         }
         if quality_reference is not None:
             flow_session["quality"]["reference_values"] = quality_reference
+        if quality_reference_inputs is not None:
+            flow_session["quality"]["reference_input_values"] = quality_reference_inputs
         horizon, action_dim = int(self.model.config.chunk_size), int(self.model.config.max_action_dim)
         action = SmolVLAActionDecodeStage(horizon, action_dim).eval()
         root = {
@@ -250,14 +253,17 @@ class SmolVLAMultiProgramCapture:
         reference = self.external_runtime_session()
         flow_program = reference.programs[1]
         from m2m.capture.bundle import capture_session_trajectory
-        quality_reference = capture_session_trajectory(
-            flow_program.module, flow_program.inputs, dict(flow_program.session or {}))
+        quality_reference, quality_reference_inputs = capture_session_trajectory(
+            flow_program.module, flow_program.inputs, dict(flow_program.session or {}),
+            return_state_inputs=True)
         del reference, flow_program
 
         if quant is not None:
             from m2m.capture.torchao_pipeline import apply_quantization
             self.model = apply_quantization(self.model, quant)
-        capture = self._external_runtime_session(quality_reference=quality_reference)
+        capture = self._external_runtime_session(
+            quality_reference=quality_reference,
+            quality_reference_inputs=quality_reference_inputs)
         from m2m.capture.bundle import write_multi_program_bundle
         return write_multi_program_bundle(
             capture.bundle_programs(), dict(capture.metadata), out, quant=quant,

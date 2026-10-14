@@ -212,12 +212,15 @@ def _tensor_outputs(value: Any) -> tuple[torch.Tensor, ...]:
     return tuple(values)
 
 
-def capture_session_trajectory(mdl, inputs, session: dict) -> np.ndarray:
+def capture_session_trajectory(mdl, inputs, session: dict, *,
+                               return_state_inputs: bool = False) -> (
+                                   np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]):
     """Execute a loader-authored session and return its selected output at every semantic step.
 
     This intentionally runs before quantization when called by :func:`write_bundle`. The resulting
     trajectory is the model-quality reference; a second execution after conversion/quantization is
-    recorded separately as the compiler-correctness reference.
+    recorded separately as the compiler-correctness reference. Optional state inputs record the
+    values presented to each step, allowing a later step to be replayed without earlier drift.
     """
     inputs = tuple(inputs)
     states = list(session.get("states", ()) or ())
@@ -246,12 +249,24 @@ def capture_session_trajectory(mdl, inputs, session: dict) -> np.ndarray:
     output_index = int(quality.get("output_index", 0))
     trajectory_inputs = list(inputs)
     outputs_seen: list[np.ndarray] = []
+    state_inputs_seen: dict[str, list[np.ndarray]] = {}
+    if return_state_inputs:
+        state_inputs_seen = {str(state.get("name", f"state{index}")): []
+                             for index, state in enumerate(states)}
+        if len(state_inputs_seen) != len(states):
+            raise ValueError("session state names must be unique for reference input capture")
     with torch.no_grad():
         for step in range(steps):
             for input_index, values in stream_values:
                 base = inputs[input_index]
                 trajectory_inputs[input_index] = values[step].to(
                     dtype=base.dtype, device=base.device)
+            if return_state_inputs:
+                for index, state in enumerate(states):
+                    name = str(state.get("name", f"state{index}"))
+                    state_inputs_seen[name].append(
+                        np.ascontiguousarray(_numpy_safe(
+                            trajectory_inputs[int(state["input_index"])]).copy()))
             outputs = _tensor_outputs(mdl(*trajectory_inputs))
             if output_index < 0 or output_index >= len(outputs):
                 raise ValueError(
@@ -268,7 +283,10 @@ def capture_session_trajectory(mdl, inputs, session: dict) -> np.ndarray:
                         f"state {state.get('name', input_index)!r} changes shape from "
                         f"{tuple(inputs[input_index].shape)} to {tuple(updated.shape)}")
                 trajectory_inputs[input_index] = updated
-    return np.ascontiguousarray(outputs_seen, dtype=np.float32)
+    trajectory = np.ascontiguousarray(outputs_seen, dtype=np.float32)
+    if return_state_inputs:
+        return trajectory, {name: np.stack(values) for name, values in state_inputs_seen.items()}
+    return trajectory
 
 
 def _runtime_args_by_input_index(manifest: dict, input_order: dict[str, int]) -> dict[int, int]:
@@ -297,7 +315,8 @@ def _runtime_args_by_input_index(manifest: dict, input_order: dict[str, int]) ->
 
 def write_session_artifacts(mdl, inputs, out: str | Path, *, manifest: dict,
                             input_order: dict[str, int], session: dict,
-                            quality_reference: np.ndarray | None = None) -> dict:
+                            quality_reference: np.ndarray | None = None,
+                            quality_reference_inputs: Mapping[str, np.ndarray] | None = None) -> dict:
     """Write a semantic trajectory contract, distinct observations, and eager trajectory goldens.
 
     ``session`` uses loader tuple indices because those are stable at authoring time:
@@ -308,7 +327,8 @@ def write_session_artifacts(mdl, inputs, out: str | Path, *, manifest: dict,
 
     This function resolves tuple indices to the exported numeric ABI, executes the quantized model over
     the whole trajectory while carrying state, and emits the files consumed by Merlin's generic runtime.
-    It never infers state from names or tuple positions.
+    It never infers state from names or tuple positions. Optional FP32 state inputs are stored beside
+    the quality outputs under ``input::<state name>`` keys; they are diagnostic, not runtime inputs.
     """
     import yaml
 
@@ -395,9 +415,21 @@ def write_session_artifacts(mdl, inputs, out: str | Path, *, manifest: dict,
         raise ValueError(
             f"FP32 quality trajectory shape {quality_reference.shape} differs from compiled-precision "
             f"correctness trajectory {correctness_values.shape}")
+    quality_arrays = {quality_key: quality_reference}
+    if quality_reference_inputs is not None:
+        expected_names = {state["name"] for state in contract_states}
+        if set(quality_reference_inputs) != expected_names:
+            raise ValueError("FP32 state input names differ from the session states")
+        for state in states:
+            name = str(state["name"])
+            initial = _numpy_safe(inputs[int(state["input_index"])])
+            values = np.ascontiguousarray(quality_reference_inputs[name])
+            if values.shape != (steps, *initial.shape) or values.dtype != initial.dtype:
+                raise ValueError(f"FP32 state input {name!r} shape or dtype differs from its session input")
+            quality_arrays[f"input::{name}"] = values
     np.savez(out / "session_inputs.npz", **arrays)
     np.savez(out / "session_goldens.npz", **{quality_key: correctness_values})
-    np.savez(out / "session_quality_fp32.npz", **{quality_key: quality_reference})
+    np.savez(out / "session_quality_fp32.npz", **quality_arrays)
     import hashlib
     correctness_sha256 = hashlib.sha256(correctness_values.tobytes()).hexdigest()
     quality_sha256 = hashlib.sha256(quality_reference.tobytes()).hexdigest()
@@ -518,8 +550,10 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
             prequant_origin = "observed_before_quantization"
 
     quality_reference = None
+    quality_reference_inputs = None
     if session is not None:
         quality = dict(session.get("quality", {}) or {})
+        quality_reference_inputs = quality.get("reference_input_values")
         supplied = quality.get("reference_values")
         if supplied is not None:
             if isinstance(supplied, torch.Tensor):
@@ -678,7 +712,8 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     if session is not None:
         session_summary = write_session_artifacts(
             runtime_mdl, inputs, out, manifest=man, input_order=order, session=session,
-            quality_reference=quality_reference)
+            quality_reference=quality_reference,
+            quality_reference_inputs=quality_reference_inputs)
 
     quantization_quality_pointer = None
     if capture_quantization_quality:

@@ -206,6 +206,11 @@ receipts, and any root or stage session inputs/goldens. The generic workload
 driver verifies the whole inventory and rejects missing, added, changed, or
 symlinked files before reporting success. This is captured-file integrity,
 not proof of frontend source closure, numerical correctness, or execution.
+For recurrent sessions that supply an FP32 state trajectory, each stage's
+`session_quality_fp32.npz` stores `input::<state name>` arrays beside the
+selected output. Each array starts with a step dimension and records the
+state presented to that step. These arrays support isolated numerical replay;
+the runtime session still uses its own carried state.
 
 If a caller has already converted the actual selected model into this same output
 directory, pass `conversion_result=r` to `write_bundle` to reuse it without

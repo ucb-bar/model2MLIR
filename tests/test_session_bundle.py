@@ -6,7 +6,8 @@ import torch
 import yaml
 from torch import nn
 
-from m2m.capture.bundle import write_multi_program_bundle, write_session_artifacts
+from m2m.capture.bundle import (capture_session_trajectory,
+                                write_multi_program_bundle, write_session_artifacts)
 
 
 class _StateStep(nn.Module):
@@ -86,17 +87,25 @@ def test_stream_free_session_uses_explicit_state_transition_steps(tmp_path):
         ],
         "streams": [], "quality": {"key": "actions", "output_index": 0},
     }
+    inputs = (torch.zeros(1), torch.ones(1))
+    reference, reference_inputs = capture_session_trajectory(
+        Flow(), inputs, session, return_state_inputs=True)
     summary = write_session_artifacts(
-        Flow(), (torch.zeros(1), torch.ones(1)), tmp_path,
+        Flow(), inputs, tmp_path,
         manifest={"0": {"kind": "input", "name": "state"},
                   "1": {"kind": "input", "name": "timestep"}},
-        input_order={"state": 0, "timestep": 1}, session=session)
+        input_order={"state": 0, "timestep": 1}, session=session,
+        quality_reference=reference, quality_reference_inputs=reference_inputs)
     contract = yaml.safe_load((tmp_path / "session_contract.yaml").read_text())
     assert contract["steps"] == 4
     assert contract["streams"] == []
     assert summary["session_steps"] == 4
     with np.load(tmp_path / "session_goldens.npz") as goldens:
         np.testing.assert_allclose(goldens["actions"].ravel(), [1.0, 1.75, 2.25, 2.5])
+    with np.load(tmp_path / "session_quality_fp32.npz") as quality:
+        np.testing.assert_allclose(quality["actions"].ravel(), [1.0, 1.75, 2.25, 2.5])
+        np.testing.assert_allclose(quality["input::flow_state"].ravel(), [0.0, 1.0, 1.75, 2.25])
+        np.testing.assert_allclose(quality["input::timestep"].ravel(), [1.0, 0.75, 0.5, 0.25])
 
 
 def test_multi_program_writer_resolves_cross_stage_tuple_input_to_abi(tmp_path, monkeypatch):
