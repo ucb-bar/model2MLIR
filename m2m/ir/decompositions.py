@@ -4324,11 +4324,22 @@ def decompose_cat(operands, meta, node_name):
             dim += len(out_shape)
         from xdsl.dialects.tensor import ConcatOp
 
+        # PyTorch treats a 1-D empty tensor as an identity in cat even when
+        # the other inputs have a higher rank. DynamicCache uses this while
+        # initializing its KV tensors; tensor.concat requires uniform ranks.
+        inputs = [o for o in operands
+                  if not (len(out_shape) > 1 and _shape_of(o) == [0])]
+        if not inputs:
+            return _opaque_decomp("aten_cat", operands, meta, "layout", pattern_hint="cat")
+        if (len(inputs) == 1 and _shape_of(inputs[0]) == out_shape
+                and inputs[0].type.element_type == elem):
+            return DecompResult(ops=[], result=inputs[0], pattern_hint="cat")
+
         # tensor.concat requires a uniform element type; torch.cat promotes mixed
         # dtypes (e.g. f32 + bf16 -> bf16). Cast each input to the result dtype first.
         ops: list = []
         casted: list = []
-        for o in operands:
+        for o in inputs:
             if o.type.element_type == elem:
                 casted.append(o)
                 continue
