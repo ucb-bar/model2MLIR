@@ -26,5 +26,12 @@ attributed token file through `M2M_LLAMA_TOKEN_IDS` and
 For a faster frontend smoke capture, pass `--env M2M_LLAMA_LAYERS=2`. This
 uses random weights and does not measure pretrained model quality.
 
+For a short compiler diagnostic with the **pretrained checkpoint**, pass
+`--env M2M_LLAMA_CHECKPOINT_LAYERS=2` instead. It loads the full checkpoint,
+keeps its first two decoder layers, and retains the same embeddings, final
+normalization, and output head. Its logits are for the truncated graph, so
+they are not a full TinyLlama inference result. The two layer options are
+mutually exclusive.
+
 The MX+VPU compilation steps for this session and the other supported models
 are in [mx-gemmini-mlir's end-to-end guide](https://github.com/ucb-bar/mx-gemmini-mlir/blob/handwritten-implementation/docs/compile_e2e_models.md).

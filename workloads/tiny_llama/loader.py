@@ -5,7 +5,9 @@
     m2m convert  examples/tiny_llama.py --quant int8_weight_only --out /tmp/tinyllama_int8.mlir
 
 Env:
-    M2M_LLAMA_LAYERS=N   truncate to N decoder layers (fast smoke; default: full)
+    M2M_LLAMA_LAYERS=N   random N-layer architecture (fast smoke; default: full)
+    M2M_LLAMA_CHECKPOINT_LAYERS=N
+                         keep the first N layers of the loaded checkpoint
     M2M_SEQ=N            sequence length for the example input (default 8)
     M2M_LLAMA_ATTENTION=eager
                          expose attention matmuls for MX graph quantization
@@ -47,8 +49,11 @@ def get_model_and_inputs() -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
     from transformers import AutoConfig, AutoModelForCausalLM
 
     n_layers = os.environ.get("M2M_LLAMA_LAYERS")
+    checkpoint_layers = os.environ.get("M2M_LLAMA_CHECKPOINT_LAYERS")
     seq = int(os.environ.get("M2M_SEQ", "8"))
     attention = os.environ.get("M2M_LLAMA_ATTENTION")
+    if n_layers and checkpoint_layers:
+        raise ValueError("choose random smoke layers or checkpoint layers, not both")
 
     if n_layers:
         # Fast smoke path: real Llama architecture, fewer layers, random init.
@@ -64,6 +69,14 @@ def get_model_and_inputs() -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
             _MODEL_ID, dtype=torch.float32, use_cache=False, tie_word_embeddings=False,
             **({"attn_implementation": attention} if attention else {}),
         )
+        if checkpoint_layers:
+            count = int(checkpoint_layers)
+            layers = model.model.layers
+            if not 1 <= count <= len(layers):
+                raise ValueError(f"checkpoint layer count must be within 1..{len(layers)}")
+            model.model.layers = nn.ModuleList(list(layers[:count]))
+            model.config.num_hidden_layers = count
+            model.model.config.num_hidden_layers = count
 
     # Break any residual weight tying so torchao quantize_ can swap weights.
     lm_head = getattr(model, "lm_head", None)
