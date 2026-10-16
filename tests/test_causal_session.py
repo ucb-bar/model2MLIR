@@ -1,6 +1,9 @@
 """Fixed-cache causal sessions expose state as an ordinary, functional tensor ABI."""
 from __future__ import annotations
 
+import functools
+import inspect
+
 import numpy as np
 import pytest
 import torch
@@ -32,8 +35,9 @@ def test_fixed_cache_prefill_owns_length_with_older_static_layer(monkeypatch):
 
     initialize = StaticLayer.lazy_initialization
 
-    def without_length(self, key_states, value_states):
-        initialize(self, key_states, value_states)
+    @functools.wraps(initialize)  # keep the installed Transformers signature
+    def without_length(self, *args):
+        initialize(self, *args)
         if hasattr(self, "cumulative_length"):
             del self.cumulative_length
 
@@ -46,6 +50,55 @@ def test_fixed_cache_prefill_owns_length_with_older_static_layer(monkeypatch):
     assert torch.equal(second_position, torch.full_like(second_position, 2))
     assert torch.count_nonzero(second_cache[..., 2:, :]) == 0
     assert not torch.equal(first_cache, second_cache)
+
+
+def test_functional_caches_accept_keys_only_static_layer_initialization(monkeypatch):
+    # Transformers 4.x initializes StaticLayer from keys only (5.x passes keys and values).
+    from transformers.cache_utils import StaticLayer
+
+    initialize = StaticLayer.lazy_initialization
+    takes_values = "value_states" in inspect.signature(initialize).parameters
+
+    def keys_only(self, key_states):
+        if takes_values:
+            initialize(self, key_states, key_states)
+        else:
+            initialize(self, key_states)
+
+    monkeypatch.setattr(StaticLayer, "lazy_initialization", keys_only)
+    lm = _tiny_llama()
+    prefill = FixedCachePrefillStage(lm, capacity=7).eval()
+    decode = FixedCacheDecodeStep(lm, capacity=7).eval()
+    _, cache, position = prefill(torch.tensor([[1, 2, 3, 4]]))
+    _, _, next_position = decode(torch.tensor([[5]]), cache, position)
+    assert torch.equal(position, torch.full_like(position, 4))
+    assert torch.equal(next_position, torch.full_like(next_position, 5))
+
+
+def test_fixed_cache_stages_run_eagerly_after_export():
+    # torch.export leaves traced tensors bound to the cache objects; the worker's float reference
+    # runs the same modules eagerly afterwards.
+    lm = _tiny_llama()
+    tokens = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    prefill = FixedCachePrefillStage(lm, capacity=7).eval()
+    with torch.no_grad():
+        before = prefill(tokens)
+    exported = torch.export.export(prefill, (tokens,))
+    with torch.no_grad():
+        after = prefill(tokens)
+    for expected, actual, traced in zip(before, after, exported.module()(tokens)):
+        assert torch.equal(expected, actual)
+        torch.testing.assert_close(traced, expected)
+
+    decode = FixedCacheDecodeStep(lm, capacity=7).eval()
+    inputs = (torch.tensor([[5]]), before[1], before[2])
+    with torch.no_grad():
+        before = decode(*inputs)
+    torch.export.export(decode, inputs)
+    with torch.no_grad():
+        after = decode(*inputs)
+    for expected, actual in zip(before, after):
+        assert torch.equal(expected, actual)
 
 
 def test_actual_causal_bundle_materializes_real_goldens_before_cache_export(tmp_path):
@@ -174,3 +227,42 @@ def test_deferred_causal_bundle_writer_reuses_protocol_and_preserves_fp32_refere
     assert reference.shape == (2, 1, 64)
     assert caught["root"]["quality_program"] == "decode"
     assert caught["kwargs"]["quantization_preapplied"] is False
+
+
+def test_exported_decode_tensor_position_matches_complete_causal_prefix():
+    lm = _tiny_llama()
+    lm.set_attn_implementation('sdpa')
+    prefix = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    cache, position = prefill_state(lm, prefix, capacity=8)
+    step = FixedCacheDecodeStep(lm, capacity=8).eval()
+    exported = torch.export.export(step, (torch.tensor([[4]]), cache, position), strict=False).module()
+    for token in (4, 5, 6):
+        input_ids = torch.tensor([[token]], dtype=torch.long)
+        observed, cache, position = exported(input_ids, cache, position)
+        prefix = torch.cat((prefix, input_ids), dim=1)
+        expected = lm(input_ids=prefix, use_cache=False).logits[:, -1, :]
+        torch.testing.assert_close(observed, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_prefill_eager_after_export_preserves_full_causal_logits():
+    lm = _tiny_llama()
+    lm.set_attn_implementation('sdpa')
+    tokens = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    stage = FixedCachePrefillStage(lm, capacity=8).eval()
+    exported = torch.export.export(stage, (tokens,), strict=False).module()
+    expected = lm(input_ids=tokens, use_cache=False).logits[:, -1, :]
+    torch.testing.assert_close(exported(tokens)[0], expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(stage(tokens)[0], expected, rtol=1e-5, atol=1e-6)
+
+
+def test_fixed_cache_export_does_not_retain_fake_tensor_constants():
+    from torch._subclasses.fake_tensor import FakeTensor
+    lm = _tiny_llama()
+    tokens = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    stage = FixedCachePrefillStage(lm, capacity=8).eval()
+    for _ in range(2):
+        exported = torch.export.export(stage, (tokens,))
+        assert not any(isinstance(value, FakeTensor) for value in exported.constants.values())
+        assert all(not isinstance(layer.keys, FakeTensor) for layer in stage._static_cache.layers)
+        expected = lm(input_ids=tokens, use_cache=False).logits[:, -1, :]
+        torch.testing.assert_close(stage(tokens)[0], expected, rtol=1e-5, atol=1e-6)

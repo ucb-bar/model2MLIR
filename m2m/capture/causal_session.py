@@ -17,6 +17,7 @@ is functional (updated state is returned explicitly), while eager execution has 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,26 @@ def _cache_geometry(lm: nn.Module) -> tuple[int, int, int]:
     kv_heads = int(getattr(config, "num_key_value_heads", config.num_attention_heads))
     head_dim = int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
     return layers, kv_heads, head_dim
+
+
+def _static_layer_initializer(static_layer: type):
+    """Call ``StaticLayer.lazy_initialization`` across its supported signatures.
+
+    Transformers 4.x initializes from keys only (``early_initialization`` passes one fake keys
+    tensor); 5.x takes keys and values. Subclasses accept both forms and forward what the installed
+    base class expects.
+    """
+    initialize = static_layer.lazy_initialization
+    takes_values = "value_states" in inspect.signature(initialize).parameters
+
+    def lazy_initialization(layer, key_states: torch.Tensor,
+                            value_states: torch.Tensor | None = None) -> None:
+        if takes_values:
+            initialize(layer, key_states, key_states if value_states is None else value_states)
+        else:
+            initialize(layer, key_states)
+
+    return lazy_initialization
 
 
 def _new_static_cache(lm: nn.Module, capacity: int):
@@ -57,7 +78,15 @@ def _new_decode_cache(lm: nn.Module, capacity: int):
     """
     from transformers.cache_utils import Cache, StaticLayer
 
+    initialize = _static_layer_initializer(StaticLayer)
+
     class _FunctionalDecodeLayer(StaticLayer):
+        def lazy_initialization(self, key_states: torch.Tensor,
+                                value_states: torch.Tensor | None = None) -> None:
+            initialize(self, key_states, value_states)
+            if not hasattr(self, "cumulative_length"):
+                self.cumulative_length = torch.zeros((1,), dtype=torch.long, device=key_states.device)
+
         def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs):
             if not self.is_initialized:
                 self.lazy_initialization(key_states, value_states)
@@ -80,9 +109,12 @@ def _new_prefill_cache(lm: nn.Module, capacity: int):
     """Functional cache whose one update fills a fixed-capacity prefix from position zero."""
     from transformers.cache_utils import Cache, StaticLayer
 
+    initialize = _static_layer_initializer(StaticLayer)
+
     class _FunctionalPrefillLayer(StaticLayer):
-        def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
-            super().lazy_initialization(key_states, value_states)
+        def lazy_initialization(self, key_states: torch.Tensor,
+                                value_states: torch.Tensor | None = None) -> None:
+            initialize(self, key_states, value_states)
             # Some supported StaticLayer versions initialize only keys/values. The functional
             # prefill stage owns its length tensor regardless of that upstream implementation.
             if not hasattr(self, "cumulative_length"):
@@ -121,11 +153,23 @@ class FixedCachePrefillStage(nn.Module):
         self._static_cache = _new_prefill_cache(self.lm, self.capacity)
 
     def forward(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        original_cache = [(layer.keys, layer.values, layer.cumulative_length)
+                          for layer in self._static_cache.layers]
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
         for layer in self._static_cache.layers:
-            layer.cumulative_length = torch.zeros_like(layer.cumulative_length)
+            # Fresh length avoids using a traced tensor in later eager calls.
+            layer.cumulative_length = torch.zeros(
+                tuple(layer.cumulative_length.shape), dtype=torch.long, device=input_ids.device)
+        slots = torch.arange(self.capacity, device=input_ids.device)
+        visible = slots.unsqueeze(0) <= positions.unsqueeze(1)
+        dtype = next(self.lm.parameters()).dtype
+        attention_mask = torch.where(
+            visible, torch.zeros((), dtype=dtype, device=input_ids.device),
+            torch.full((), torch.finfo(dtype).min, dtype=dtype, device=input_ids.device),
+        ).unsqueeze(0).unsqueeze(0)
         output = self.lm(
-            input_ids=input_ids, cache_position=positions, position_ids=positions.unsqueeze(0),
+            input_ids=input_ids, attention_mask=attention_mask,
+            cache_position=positions, position_ids=positions.unsqueeze(0),
             past_key_values=self._static_cache, use_cache=True)
         next_cache = torch.stack((
             torch.stack([layer.keys for layer in self._static_cache.layers]),
@@ -134,6 +178,10 @@ class FixedCachePrefillStage(nn.Module):
         next_position = torch.cat([
             layer.cumulative_length.reshape(1) for layer in self._static_cache.layers
         ])
+        # Export traces cache updates with fake tensors. Keep those tensors in returned
+        # graph values, never in persistent Python cache state used by the next export.
+        for layer, original in zip(self._static_cache.layers, original_cache):
+            layer.keys, layer.values, layer.cumulative_length = original
         return output.logits[:, -1, :], next_cache, next_position
 
 
@@ -153,6 +201,8 @@ class FixedCacheDecodeStep(nn.Module):
         # The private cache object is rebound to the public input tensors on every call. Its update
         # is functional, so callers' state is never mutated and the returned tensors are the only
         # next-state values.
+        original_cache = [(layer.keys, layer.values, layer.cumulative_length)
+                          for layer in self._static_cache.layers]
         for layer_index, layer in enumerate(self._static_cache.layers):
             layer.keys = kv_cache[0, layer_index]
             layer.values = kv_cache[1, layer_index]
@@ -160,8 +210,18 @@ class FixedCacheDecodeStep(nn.Module):
 
         cache_position = (torch.arange(input_ids.shape[1], device=input_ids.device)
                           + position[0:1])
+        # Fixed-capacity cache positions are tensor inputs. Supply the actual causal mask
+        # instead of asking SDPA's Python mask-elision heuristic to branch on their values.
+        slots = torch.arange(self.capacity, device=input_ids.device)
+        visible = slots.unsqueeze(0) <= cache_position.unsqueeze(1)
+        dtype = next(self.lm.parameters()).dtype
+        attention_mask = torch.where(
+            visible, torch.zeros((), dtype=dtype, device=input_ids.device),
+            torch.full((), torch.finfo(dtype).min, dtype=dtype, device=input_ids.device),
+        ).unsqueeze(0).unsqueeze(0)
         output = self.lm(
             input_ids=input_ids,
+            attention_mask=attention_mask,
             cache_position=cache_position,
             position_ids=cache_position.unsqueeze(0),
             past_key_values=self._static_cache,
@@ -174,6 +234,10 @@ class FixedCacheDecodeStep(nn.Module):
         next_position = torch.cat([
             layer.cumulative_length.reshape(1) for layer in self._static_cache.layers
         ])
+        # Export traces cache updates with fake tensors. Keep those tensors in returned
+        # graph values, never in persistent Python cache state used by the next export.
+        for layer, original in zip(self._static_cache.layers, original_cache):
+            layer.keys, layer.values, layer.cumulative_length = original
         return output.logits[:, -1, :], next_cache, next_position
 
 
@@ -193,7 +257,7 @@ def prefill_state(lm: nn.Module, input_ids: torch.Tensor, capacity: int) \
     keys = torch.stack([layer.keys.detach().clone() for layer in cache.layers])
     values = torch.stack([layer.values.detach().clone() for layer in cache.layers])
     lengths = torch.stack([
-        torch.as_tensor(layer.cumulative_length, device=input_ids.device).reshape(-1)[0]
+        torch.as_tensor(layer.get_seq_length(), device=input_ids.device).reshape(-1)[0]
         for layer in cache.layers
     ]).to(dtype=torch.long)
     expected = torch.full_like(lengths, int(input_ids.shape[1]))
@@ -432,6 +496,76 @@ def make_causal_program_capture(lm: nn.Module, *, env_prefix: str, checkpoint: s
         paper_ready=bool(full_checkpoint and corpus_ready), provenance=provenance,
         prefill_tokens=prefill_tokens, decode_tokens=decode_tokens)
     return capture, ()
+
+
+def load_calibration_tokens(path_value: str, *, vocab_size: int, min_tokens: int) \
+        -> tuple[torch.Tensor, dict[str, Any]]:
+    """Load a ``[segments, tokens]`` calibration corpus (``.npz`` ``input_ids`` or ``.npy``).
+
+    Every segment must hold at least ``min_tokens`` ids (the session's prefill plus decode span) so the
+    decode stage is calibrated over the same positions it runs at. The bytes' SHA-256 is returned for
+    the capture's provenance; nothing is downloaded or tokenized here.
+    """
+    path = Path(path_value).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"calibration token corpus is absent: {path}")
+    if path.suffix == ".npz":
+        with np.load(path) as data:
+            if "input_ids" not in data.files:
+                raise ValueError("calibration token npz needs an input_ids array")
+            array = np.asarray(data["input_ids"])
+    else:
+        array = np.asarray(np.load(path))
+    if array.ndim != 2 or array.shape[0] < 1:
+        raise ValueError(f"calibration tokens must be [segments, tokens], got {array.shape}")
+    if array.shape[1] < min_tokens:
+        raise ValueError(f"calibration segments hold {array.shape[1]} tokens, need {min_tokens}")
+    if np.any(array < 0) or np.any(array >= vocab_size):
+        raise ValueError(f"calibration tokens contain ids outside [0, {vocab_size})")
+    tokens = torch.from_numpy(np.ascontiguousarray(array[:, :min_tokens], dtype=np.int64))
+    provenance = {
+        "calibration_token_path": str(path),
+        "calibration_token_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "calibration_segments": int(array.shape[0]),
+    }
+    return tokens, provenance
+
+
+def causal_calibration_inputs(stage: nn.Module, tokens: torch.Tensor, *, prefill_tokens: int,
+                              decode_stride: int = 1):
+    """Calibration samples for one stage of the fixed-cache causal session, from real segments.
+
+    ``tokens`` is ``[segments, prefill_tokens + decode_tokens]``. The prefill stage sees every
+    segment's prefix. The decode stage sees the floating-point recurrence over each segment's own
+    continuation (teacher forced, as the session runs it): the prefill state, then every
+    ``decode_stride``-th step's ``(token, kv_cache, position)``. A decode stage calibrated on the
+    capture example's single step observes one position of one sequence; this observes the
+    positions and caches it executes at. Samples are yielded segment by segment, in order.
+    """
+    if decode_stride < 1:
+        raise ValueError("decode_stride must be positive")
+    if tokens.ndim != 2:
+        raise ValueError("calibration tokens must be [segments, tokens]")
+    if isinstance(stage, FixedCachePrefillStage):
+        for row in tokens:
+            yield (row[:prefill_tokens].reshape(1, -1).clone(),)
+        return
+    if not isinstance(stage, FixedCacheDecodeStep):
+        raise TypeError(f"no causal calibration stream for {type(stage).__name__}")
+    decode_tokens = stage.capacity - int(prefill_tokens)
+    if decode_tokens < 1 or tokens.shape[1] < stage.capacity:
+        raise ValueError("calibration segments do not cover the decode stage's positions")
+    prefill = FixedCachePrefillStage(stage.lm, stage.capacity).eval()
+    last = ((decode_tokens - 1) // decode_stride) * decode_stride
+    with torch.no_grad():
+        for row in tokens:
+            _logits, kv_cache, position = prefill(row[:prefill_tokens].reshape(1, -1))
+            for step in range(last + 1):
+                token = row[prefill_tokens + step].reshape(1, 1).clone()
+                if step % decode_stride == 0:
+                    yield (token, kv_cache, position)
+                if step < last:
+                    _logits, kv_cache, position = stage(token, kv_cache, position)
 
 
 def session_spec(model: nn.Module, _inputs: tuple[torch.Tensor, ...]) -> dict | None:

@@ -21,12 +21,31 @@ Env:
     M2M_LLAMA_TOKEN_SOURCE=...
     M2M_LLAMA_PAPER_READY=1
                          opt in only with the full checkpoint and an attributed external corpus
+    M2M_LLAMA_CALIBRATION_TOKEN_IDS=/path/to/calibration.npz
+                         ``input_ids`` [segments, prefill+decode] tokenized calibration segments; with
+                         ``e2e`` each recipe-quantized stage is calibrated on them (prefill: every
+                         segment's prefix; decode: the FP32 teacher-forced recurrence over its
+                         continuation). Unset: stages calibrate on their capture example, as before.
+    M2M_LLAMA_CALIBRATION_DECODE_STRIDE=N
+                         sample every N-th decode step of each calibration segment (default 1)
+    M2M_LLAMA_SPLIT_RATIO=r
+                         FP-equivalent outlier channel splitting (m2m.capture.outlier_split) of every
+                         gated MLP: a product channel whose calibrated absmax exceeds r x the median
+                         channel is split into ceil(absmax / (r x median)) parts
+    M2M_LLAMA_SPLIT_WIDTH_BUCKETS=n [M2M_LLAMA_SPLIT_WIDTH_ALIGN=a]
+                         after the split (and any smoothing), pad every gated MLP's intermediate width
+                         with zero channels up to one of n shared widths (multiples of a), chosen to
+                         minimise the padding: exact, and n distinct MLP shapes instead of one per layer
+    M2M_LLAMA_SMOOTH_ALPHA=a [M2M_LLAMA_SMOOTH_GROUPS=qkv,gate_up,down,o] [M2M_LLAMA_SMOOTH_SEGMENTS=32]
+                         FP-equivalent SmoothQuant rescaling (m2m.capture.smoothing) on statistics of
+                         the calibration prefixes, before quantization; needs the calibration corpus
 
 Weights are loaded from the local HF cache (TinyLlama/TinyLlama-1.1B-Chat-v1.0).
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -111,16 +130,27 @@ def get_model_and_inputs() -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
     if isinstance(lm_head, nn.Linear):
         lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
 
+    smoothing = _smooth(model.eval())
+
     if os.environ.get("M2M_LLAMA_SESSION") in {"decode", "e2e"}:
         from m2m.capture.causal_session import make_causal_program_capture, make_decode_session
 
         factory = (make_causal_program_capture
                    if os.environ.get("M2M_LLAMA_SESSION") == "e2e" else make_decode_session)
-        return factory(
+        result = factory(
             model.eval(), env_prefix="M2M_LLAMA",
             checkpoint=_MODEL_ID, full_checkpoint=not bool(n_layers),
             prefill_tokens=int(os.environ.get("M2M_PREFILL_TOKENS", "128")),
             decode_tokens=int(os.environ.get("M2M_DECODE_TOKENS", "32")))
+        calibration = _calibration_tokens(model)
+        if hasattr(result[0], "provenance"):
+            # Recorded in the session contract beside the capture's own token provenance.
+            if calibration is not None:
+                result[0].provenance.update(calibration[1])
+            if smoothing is not None:
+                # A JSON string, so it survives the capture's scalar-only provenance record.
+                result[0].provenance["range_transforms"] = json.dumps(smoothing, sort_keys=True)
+        return result
 
     token_path = os.environ.get("M2M_LLAMA_TOKEN_IDS")
     model = _LogitsOnly(model.eval(),
@@ -129,6 +159,77 @@ def get_model_and_inputs() -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
     input_ids = (_single_forward_ids(token_path, seq=seq, vocab=vocab)
                  if token_path else torch.randint(0, vocab, (1, seq), dtype=torch.long))
     return model, (input_ids,)
+
+
+def _smooth(lm: nn.Module) -> dict | None:
+    """FP-equivalent range transforms before any quantization.
+
+    ``M2M_LLAMA_SPLIT_RATIO``: split every gated-MLP product channel whose calibrated absmax exceeds
+    ratio x the median channel into equal parts (``m2m.capture.outlier_split``).
+    ``M2M_LLAMA_SMOOTH_ALPHA``: SmoothQuant rescaling of ``M2M_LLAMA_SMOOTH_GROUPS`` (default all:
+    qkv, gate_up, down, o). Both take their statistics from the first ``M2M_LLAMA_SMOOTH_SEGMENTS``
+    (default 32) calibration prefixes, so the calibration corpus is required. Unset: untouched.
+    """
+    ratio = os.environ.get("M2M_LLAMA_SPLIT_RATIO", "")
+    alpha = os.environ.get("M2M_LLAMA_SMOOTH_ALPHA", "")
+    if not ratio and not alpha:
+        return None
+    calibration = _calibration_tokens(lm)
+    if calibration is None:
+        raise ValueError("FP-equivalent range transforms need M2M_LLAMA_CALIBRATION_TOKEN_IDS")
+    from m2m.capture.outlier_split import split_outlier_channels
+    from m2m.capture.smoothing import GROUPS, smooth_decoder
+
+    segments = int(os.environ.get("M2M_LLAMA_SMOOTH_SEGMENTS", "32"))
+    prefill = int(os.environ.get("M2M_PREFILL_TOKENS", "128"))
+    statistics = calibration[0][:segments, :prefill]
+    record = {"statistics_segments": int(statistics.shape[0]), "statistics_tokens": int(statistics.shape[1])}
+    if ratio:
+        def observe():
+            for row in statistics:
+                lm(input_ids=row.reshape(1, -1), use_cache=False)
+
+        record["split"] = split_outlier_channels(lm, observe, ratio=float(ratio))
+    if alpha:
+        groups = tuple(g for g in os.environ.get("M2M_LLAMA_SMOOTH_GROUPS", ",".join(GROUPS)).split(",") if g)
+        record["smooth"] = smooth_decoder(lm, statistics, alpha=float(alpha), groups=groups)
+    buckets = os.environ.get("M2M_LLAMA_SPLIT_WIDTH_BUCKETS", "")
+    if buckets:
+        from m2m.capture.outlier_split import pad_gated_widths
+
+        align = int(os.environ.get("M2M_LLAMA_SPLIT_WIDTH_ALIGN", "1"))
+        record["pad"] = pad_gated_widths(lm, buckets=int(buckets), align=align)
+    return record
+
+
+def _calibration_tokens(lm: nn.Module):
+    """The declared calibration corpus and its provenance, or None when none is declared."""
+    path = os.environ.get("M2M_LLAMA_CALIBRATION_TOKEN_IDS", "")
+    if not path:
+        return None
+    from m2m.capture.causal_session import load_calibration_tokens
+
+    prefill = int(os.environ.get("M2M_PREFILL_TOKENS", "128"))
+    decode = int(os.environ.get("M2M_DECODE_TOKENS", "32"))
+    stride = int(os.environ.get("M2M_LLAMA_CALIBRATION_DECODE_STRIDE", "1"))
+    tokens, provenance = load_calibration_tokens(
+        path, vocab_size=int(lm.config.vocab_size), min_tokens=prefill + decode)
+    return tokens, {**provenance, "calibration_decode_stride": stride}
+
+
+def get_calibration_inputs(model: nn.Module, inputs: tuple[torch.Tensor, ...]):
+    """Calibration samples for one recipe-quantized session stage, or None (use its example).
+
+    The capture worker calls this once per quantized stage, with that stage's module.
+    """
+    if not os.environ.get("M2M_LLAMA_CALIBRATION_TOKEN_IDS", ""):
+        return None
+    from m2m.capture.causal_session import causal_calibration_inputs
+
+    tokens, _provenance = _calibration_tokens(model.lm)
+    return causal_calibration_inputs(
+        model, tokens, prefill_tokens=int(os.environ.get("M2M_PREFILL_TOKENS", "128")),
+        decode_stride=int(os.environ.get("M2M_LLAMA_CALIBRATION_DECODE_STRIDE", "1")))
 
 
 def get_session_spec(model: nn.Module, inputs: tuple[torch.Tensor, ...]) -> dict | None:

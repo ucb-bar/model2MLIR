@@ -8,6 +8,11 @@ on already-preprocessed tensors (host-side preprocessing stays out of the graph)
 ``M2M_SMOLVLA_SESSION=e2e`` emits compiled prefix, recurrent flow, and action-decode programs for
 the primary continuous session. Paper readiness additionally requires ``M2M_SMOLVLA_PRETRAINED=1``,
 an attributed ``M2M_SMOLVLA_INPUT_NPZ``, and explicit ``M2M_SMOLVLA_PAPER_READY=1`` opt-in.
+
+``M2M_SMOLVLA_CALIBRATION_NPZ`` names stacked model-ready calibration observations (the input
+npz's keys, each with a leading sample axis); a recipe-quantized stage then calibrates on them
+(``get_calibration_inputs``), the flow stage on each one's floating-point trajectory, sampled every
+``M2M_SMOLVLA_CALIBRATION_FLOW_STRIDE``-th step (default 1).
 """
 
 from __future__ import annotations
@@ -380,6 +385,15 @@ def get_model_and_inputs():
         model = VLAFlowMatching(cfg).eval()
 
     inputs, input_provenance, inputs_ready = _input_tensors(cfg)
+    calibration = os.environ.get("M2M_SMOLVLA_CALIBRATION_NPZ", "")
+    if calibration:
+        calibration_path = Path(calibration).expanduser().resolve()
+        input_provenance = {
+            **input_provenance,
+            "calibration_path": str(calibration_path),
+            "calibration_sha256": hashlib.sha256(calibration_path.read_bytes()).hexdigest(),
+            "calibration_flow_stride": int(os.environ.get("M2M_SMOLVLA_CALIBRATION_FLOW_STRIDE", "1")),
+        }
     session_mode = os.environ.get("M2M_SMOLVLA_SESSION")
     if session_mode not in {"denoise", "e2e"}:
         return SmolVLADenoiseStep(model).eval(), inputs
@@ -431,3 +445,68 @@ def get_model_and_inputs():
 
 def get_session_spec(model: nn.Module, _inputs: tuple[torch.Tensor, ...]) -> dict | None:
     return getattr(model, "session_spec", None)
+
+
+_OBSERVATION_KEYS = ("image", "image_mask", "language_tokens", "language_mask", "state", "noise")
+
+
+def _calibration_observations() -> tuple[tuple[torch.Tensor, ...], ...] | None:
+    """``M2M_SMOLVLA_CALIBRATION_NPZ``: model-ready observations stacked on a leading sample axis.
+
+    Each key holds ``[samples, *input_shape]`` (the capture input's own ABI per sample); the noise is
+    each sample's own flow start. Unset: None, and every stage calibrates on its capture example.
+    """
+    value = os.environ.get("M2M_SMOLVLA_CALIBRATION_NPZ", "")
+    if not value:
+        return None
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"SmolVLA calibration corpus is absent: {path}")
+    dtypes = (torch.float32, torch.bool, torch.long, torch.bool, torch.float32, torch.float32)
+    with np.load(path) as data:
+        missing = [key for key in _OBSERVATION_KEYS if key not in data.files]
+        if missing:
+            raise ValueError(f"SmolVLA calibration npz omits {missing}")
+        arrays = [torch.as_tensor(np.ascontiguousarray(data[key]), dtype=dtype)
+                  for key, dtype in zip(_OBSERVATION_KEYS, dtypes)]
+    count = int(arrays[0].shape[0])
+    if count < 1 or any(int(array.shape[0]) != count for array in arrays):
+        raise ValueError("SmolVLA calibration arrays disagree on their sample count")
+    return tuple(tuple(array[index] for array in arrays) for index in range(count))
+
+
+def get_calibration_inputs(model: nn.Module, inputs: tuple[torch.Tensor, ...]):
+    """Calibration samples for one recipe-quantized stage, or None (calibrate on its example).
+
+    The prefix stage sees each observation. The flow stage sees each observation's floating-point
+    trajectory -- its prefix cache, then the flow state and timestep at every
+    ``M2M_SMOLVLA_CALIBRATION_FLOW_STRIDE``-th (default every) Euler step -- because one step at
+    ``t = 1`` from the capture's noise is not the range the later steps run at.
+    """
+    observations = _calibration_observations()
+    if observations is None:
+        return None
+    if isinstance(model, SmolVLAPrefixStage):
+        return (sample[:5] for sample in observations)
+    if isinstance(model, SmolVLADenoiseStep):
+        return iter(observations)
+    if not isinstance(model, SmolVLAFlowSession):
+        raise TypeError(f"no SmolVLA calibration stream for {type(model).__name__}")
+    stride = int(os.environ.get("M2M_SMOLVLA_CALIBRATION_FLOW_STRIDE", "1"))
+    if stride < 1:
+        raise ValueError("M2M_SMOLVLA_CALIBRATION_FLOW_STRIDE must be positive")
+    return _flow_calibration(model, observations, stride)
+
+
+def _flow_calibration(flow: SmolVLAFlowSession, observations, stride: int):
+    prefix = SmolVLAPrefixStage(flow.model).eval()
+    steps = int(flow.model.config.num_steps)
+    with torch.no_grad():
+        for sample in observations:
+            masks, cache = prefix(*sample[:5])
+            state = sample[5]
+            timestep = torch.ones(sample[4].shape[0], dtype=torch.float32)
+            for step in range(steps):
+                if step % stride == 0:
+                    yield (masks, cache, state, timestep)
+                state, cache, timestep = flow(masks, cache, state, timestep)
