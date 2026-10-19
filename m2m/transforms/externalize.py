@@ -9,18 +9,36 @@ each tensor to the corresponding function argument.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+from pathlib import Path
 from typing import Any
 
 from xdsl.dialects.builtin import ModuleOp, StringAttr
 
 
-def externalize_weights(exported: Any, module: ModuleOp, path: str) -> dict:
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def externalize_weights(exported: Any, module: ModuleOp, path: str, *,
+                        reuse_source: str | Path | None = None) -> dict:
     """Write the exported program's parameters/buffers to ``path`` (safetensors) and a
     ``path + '.manifest.json'`` mapping func-arg index -> {weight, kind, dtype, shape}.
     Tags ``module`` with ``prov.weights_file``. Returns a summary dict. Best-effort: tensors
     that can't be serialized (e.g. exotic quant subclasses) are recorded in the manifest
-    with an ``error`` and skipped, never aborting capture."""
+    with an ``error`` and skipped, never aborting capture.
+
+    Explicit ``reuse_source`` validates every exported tensor's exact stored
+    dtype, shape and bytes before hard-linking an existing immutable container.
+    The destination must be fresh. Mismatches or source changes refuse reuse;
+    the source is never rewritten and there is no implicit copy fallback.
+    """
     import torch
     from safetensors.torch import save_file
 
@@ -72,11 +90,39 @@ def externalize_weights(exported: Any, module: ModuleOp, path: str) -> dict:
     # Parameter-free programs are valid bundle stages too. Persist a genuine
     # empty safetensors container so the declared weights path and receipt
     # contract are satisfied without inventing a tensor or weakening hashing.
-    save_file(tensors, path)
+    reused = None
+    if reuse_source is None:
+        save_file(tensors, path)
+    else:
+        from safetensors import safe_open
+
+        source, destination = Path(reuse_source), Path(path)
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("weight reuse requires a regular immutable source")
+        if destination.exists() or destination.is_symlink():
+            raise ValueError("weight reuse destination must be fresh")
+        before = _file_sha256(source)
+        with safe_open(source, framework="pt", device="cpu") as stored:
+            if set(stored.keys()) != set(tensors):
+                raise ValueError("reused weight tensor names differ from the exported program")
+            for name, tensor in tensors.items():
+                actual = stored.get_tensor(name)
+                if (actual.dtype != tensor.dtype or actual.shape != tensor.shape or
+                        not torch.equal(actual.reshape(-1).view(torch.uint8),
+                                        tensor.reshape(-1).view(torch.uint8))):
+                    raise ValueError("reused weight tensor bytes differ: " + name)
+        after = _file_sha256(source)
+        if before != after:
+            raise ValueError("reused weight source changed during validation")
+        os.link(source, destination)
+        if not os.path.samefile(source, destination) or _file_sha256(destination) != before:
+            raise ValueError("reused weight source changed during binding")
+        reused = {"source": str(source.resolve()), "sha256": before}
     with open(path + ".manifest.json", "w") as fh:
         json.dump(manifest, fh, indent=2)
     try:
         module.attributes["prov.weights_file"] = StringAttr(path)
     except Exception:  # noqa: BLE001
         pass
-    return {"weights": len(tensors), "args": len(placeholders), "path": path}
+    return {"weights": len(tensors), "args": len(placeholders), "path": path,
+            "reused": reused}
