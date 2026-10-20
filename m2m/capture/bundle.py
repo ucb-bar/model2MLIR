@@ -289,6 +289,8 @@ def write_session_artifacts(mdl, inputs, out: str | Path, *, manifest: dict,
     This function resolves tuple indices to the exported numeric ABI, executes the quantized model over
     the whole trajectory while carrying state, and emits the files consumed by Merlin's generic runtime.
     It never infers state from names or tuple positions.
+    Without a supplied quality reference, compatibility output retains the correctness bytes but marks
+    quality unavailable; neither paper readiness nor equal bytes establishes an independent reference.
     """
     import yaml
 
@@ -368,6 +370,7 @@ def write_session_artifacts(mdl, inputs, out: str | Path, *, manifest: dict,
                 trajectory_inputs[input_index] = updated
 
     correctness_values = np.ascontiguousarray(goldens, dtype=np.float32)
+    independent_quality = quality_reference is not None
     if quality_reference is None:
         quality_reference = correctness_values
     quality_reference = np.ascontiguousarray(quality_reference, dtype=np.float32)
@@ -396,8 +399,15 @@ def write_session_artifacts(mdl, inputs, out: str | Path, *, manifest: dict,
                         "reference_sha256": correctness_sha256},
         "quality": {"scope": "trajectory", "golden": "session_quality_fp32.npz",
                     "key": quality_key, "output_index": quality_output,
-                    "reference": str(quality.get("reference", "eager_fp32")),
-                    "reference_sha256": quality_sha256},
+                    "reference": (str(quality.get("reference", "eager_fp32"))
+                                  if independent_quality else "unavailable"),
+                    "reference_sha256": quality_sha256,
+                    "observation": {
+                        "schema": "m2m.session_quality_observation.v1",
+                        "status": "observed" if independent_quality else "unavailable",
+                        "origin": ("provided_quality_reference" if independent_quality
+                                   else "correctness_fallback"),
+                    }},
     }
     if session.get("provenance"):
         contract["provenance"] = session["provenance"]
