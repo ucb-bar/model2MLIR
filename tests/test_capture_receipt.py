@@ -177,6 +177,46 @@ def test_original_export_supplies_lifted_constants_without_second_export():
     assert extra["c_lifted_tensor_0"].tolist() == [True, False]
 
 
+def test_module_scoped_constant_preserves_the_exported_argument_name():
+    from torch.export.graph_signature import ConstantArgument, InputKind, InputSpec
+
+    name = "c_lm_model_lifted_tensor_28"
+    exported = SimpleNamespace(
+        constants={"lm.model.lifted_tensor_28": torch.tensor(2.5)},
+        state_dict={},
+        graph_signature=SimpleNamespace(input_specs=[
+            InputSpec(InputKind.CONSTANT_TENSOR, ConstantArgument(name, None),
+                      "lm.model.lifted_tensor_28"),
+        ]),
+    )
+    extra = {}
+    _lifted_constants(None, (), extra, exported_program=exported)
+    assert set(extra) == {name}
+    assert extra[name].shape == () and extra[name] == np.float32(2.5)
+
+
+def test_module_scoped_constant_cannot_be_replaced_by_an_ordinal_alias():
+    manifest = {"0": {"kind": "input", "name": "c_lm_model_lifted_tensor_0"}}
+    with pytest.raises(ValueError, match="unmaterialized"):
+        _bind_lifted_constants_to_manifest({"c_lifted_tensor_0": np.float32(2)}, manifest)
+
+
+def test_receipt_requires_module_scoped_lifted_constants(tmp_path):
+    root = tmp_path / "bundle"
+    write_bundle(_Tiny().eval(), (torch.randn(2, 4),), root, capture_regions=False)
+    path = root / "weights.safetensors.manifest.json"
+    manifest = json.loads(path.read_text())
+    name = "c_lm_model_lifted_tensor_0"
+    manifest[str(len(manifest))] = {"kind": "constant", "name": name}
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="incomplete"):
+        capture_receipt(root)
+    np.savez(root / "extra.npz", **{name: np.float32(2.5)})
+    receipt = capture_receipt(root)
+    assert receipt["materialized_abi"]["lifted_constants"] == [name]
+    assert receipt["lifted_constants"][name]["shape"] == []
+
+
 def test_converter_manifest_owns_lifted_constant_runtime_abi():
     extra = {"c_lifted_tensor_0": np.array(1), "c_lifted_tensor_1": np.array(2),
              "buf::other": np.array(3)}

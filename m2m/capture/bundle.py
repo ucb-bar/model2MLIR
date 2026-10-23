@@ -17,6 +17,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from m2m.capture.abi import is_lifted_tensor_argument
+
 
 def _opaque_call_count(module) -> int | None:
     """Count unresolved calls in the emitted xDSL module, or leave it unknown."""
@@ -95,7 +97,7 @@ def _flatten_subclass(obj: Any, prefix: str, out: dict) -> None:
 
 
 def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> None:
-    """Populate c_lifted_tensor_<i> from m2m's own export (graph order matches the importer)."""
+    """Materialize constants under the converted export's exact argument names."""
     try:
         from torch.export.graph_signature import InputKind
 
@@ -109,14 +111,12 @@ def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> Non
             ep = artifact.exported_program or artifact.original_exported_program
         consts = dict(getattr(ep, "constants", {}) or {})
         sd = dict(getattr(ep, "state_dict", {}) or {})
-        li = 0
         for spec in ep.graph_signature.input_specs:
             if spec.kind != InputKind.CONSTANT_TENSOR:
                 continue
             val = consts.get(str(spec.target), sd.get(str(spec.target)))
             if val is not None and hasattr(val, "detach"):
-                extra[f"c_lifted_tensor_{li}"] = _numpy_safe(val)
-            li += 1
+                extra[str(spec.arg.name)] = _numpy_safe(val)
     except Exception as exc:  # noqa: BLE001
         import traceback
         print(f"[warn] lifted-constant export failed: {exc}\n{traceback.format_exc()[-800:]}")
@@ -132,9 +132,10 @@ def _bind_lifted_constants_to_manifest(extra: dict, manifest: dict) -> None:
     """
     expected = {
         str(entry.get("name")) for entry in manifest.values()
-        if isinstance(entry, dict) and str(entry.get("name", "")).startswith("c_lifted_tensor_")
+        if isinstance(entry, dict) and is_lifted_tensor_argument(entry)
     }
-    observed = {name for name in extra if name.startswith("c_lifted_tensor_")}
+    observed = {name for name in extra
+                if name in expected or is_lifted_tensor_argument({"name": name})}
     missing = expected - observed
     if missing:
         raise ValueError(f"converted graph has unmaterialized lifted constants: {sorted(missing)}")
@@ -301,7 +302,7 @@ def _runtime_args_by_input_index(manifest: dict, input_order: dict[str, int]) ->
     for raw_index in sorted(manifest, key=lambda value: int(value)):
         meta = manifest[raw_index]
         name = str(meta.get("name", "") or "")
-        if meta.get("kind") in ("param", "buffer") or "lifted_tensor" in name:
+        if meta.get("kind") in ("param", "buffer") or is_lifted_tensor_argument(meta):
             continue
         input_index = input_order.get(name)
         if input_index is None:
@@ -702,7 +703,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     for i in range(len(man)):
         meta = man[str(i)]
         nm = meta.get("name", "") or ""
-        if meta["kind"] in ("param", "buffer") or "lifted_tensor" in nm:
+        if meta["kind"] in ("param", "buffer") or is_lifted_tensor_argument(meta):
             continue
         order[nm] = k
         k += 1

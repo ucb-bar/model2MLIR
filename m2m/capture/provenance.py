@@ -19,6 +19,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from m2m.capture.abi import is_lifted_tensor_argument
+
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -179,10 +181,15 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
         pointer = meta.get("frontend_trace") or {}
         if pointer.get("path") != "frontend-trace.json" or pointer.get("sha256") != artifacts["frontend-trace.json"]["sha256"]:
             raise ValueError("bundle metadata does not bind its exact frontend trace")
+    manifest = json.loads((out / "weights.safetensors.manifest.json").read_text())
+    expected_lifted = sorted({
+        str(entry.get("name")) for entry in manifest.values()
+        if isinstance(entry, dict) and is_lifted_tensor_argument(entry)
+    })
     lifted = {}
     with np.load(out / "extra.npz", allow_pickle=False) as extras:
         for name in sorted(extras.files):
-            if not name.startswith("c_lifted_tensor_"):
+            if name not in expected_lifted and not is_lifted_tensor_argument({"name": name}):
                 continue
             value = np.asarray(extras[name])
             lifted[name] = {
@@ -190,11 +197,6 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
                 "dtype": str(value.dtype),
                 "sha256": hashlib.sha256(value.tobytes()).hexdigest(),
             }
-    manifest = json.loads((out / "weights.safetensors.manifest.json").read_text())
-    expected_lifted = sorted({
-        str(entry.get("name")) for entry in manifest.values()
-        if isinstance(entry, dict) and str(entry.get("name", "")).startswith("c_lifted_tensor_")
-    })
     if expected_lifted != sorted(lifted):
         raise ValueError(
             "lifted-constant ABI is incomplete: "

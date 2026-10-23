@@ -193,6 +193,8 @@ inputs, actual selected-model goldens, `frontend-trace.json`, and merged
 `meta.json` (caller provenance is retained). `capture_receipt.json` binds the
 exact bytes, including the trace and its MLIR digest. Lifted constants come from
 the same prepared export used for lowering, not a hidden replacement capture.
+Their exported argument names are preserved, including module-scoped names.
+Both bundle materialization and the receipt reject missing lifted constants.
 An installed external quantization adapter can return a `torch.export.ExportedProgram`.
 `write_bundle(..., quant=ExternalQuantizationConfig(...))` executes that selected
 program for goldens and saves `quantization-manifest.json`. The receipt binds
