@@ -303,19 +303,543 @@ def capture_frontend_snapshot(model: Any, inputs: Any = (), *, stage: str = "ori
                 "counting_unit": "static_captured_call_sites"}
 
 
+def _dtype_literals(value: Any) -> list[Any]:
+    import torch
+
+    if isinstance(value, torch.dtype):
+        return [value]
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return [item for child in value for item in _dtype_literals(child)]
+    if isinstance(value, dict):
+        return [item for pair in value.items() for item in _dtype_literals(pair)]
+    if isinstance(value, slice):
+        return _dtype_literals((value.start, value.stop, value.step))
+    return []
+
+
+# Threat model: captured programs from the sealed recipes and standard torch
+# runtime context; this does not defend against arbitrary monkeypatching of
+# torch internals.
+def _refuse_module_hooks(module: Any) -> None:
+    """Copying or splicing a module cannot preserve arbitrary hook semantics."""
+    registries = (
+        "_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks",
+        "_state_dict_hooks", "_state_dict_pre_hooks",
+        "_load_state_dict_pre_hooks", "_load_state_dict_post_hooks",
+    )
+    for name, child in module.named_modules():
+        for registry in registries:
+            if getattr(child, registry, None):
+                raise ValueError(f"captured module hooks are unsupported: {name or '<root>'}.{registry}")
+
+
+def _refuse_global_execution_hooks() -> None:
+    """Torch 2.10 has no public accessor for these execution-hook registries."""
+    from collections import OrderedDict
+
+    from torch.nn.modules import module
+
+    registries = (
+        "_global_forward_pre_hooks", "_global_forward_hooks",
+        "_global_forward_hooks_always_called", "_global_forward_hooks_with_kwargs",
+        "_global_backward_pre_hooks", "_global_backward_hooks",
+    )
+    for registry in registries:
+        if not hasattr(module, registry) or not isinstance(getattr(module, registry), OrderedDict):
+            raise ValueError(f"captured global execution hooks cannot be inspected: {registry}")
+        if getattr(module, registry):
+            raise ValueError(f"captured global execution hooks are unsupported: {registry}")
+
+
+def _autocast_tensor_argument(argument_type: Any) -> bool:
+    """Recognize tensor, optional tensor, and lists of either structurally."""
+    if argument_type.kind() == "OptionalType":
+        argument_type = argument_type.getElementType()
+    if argument_type.kind() == "ListType":
+        argument_type = argument_type.getElementType()
+        if argument_type.kind() == "OptionalType":
+            argument_type = argument_type.getElementType()
+    return argument_type.kind() == "TensorType"
+
+
+def _autocast_static_tensor_devices(value: Any, body: Any) -> set[Any] | None:
+    """Prove device equality in the captured program; runtime inputs are guarded."""
+    import torch
+
+    if isinstance(value, (tuple, list)):
+        devices = set()
+        for item in value:
+            if item is None:
+                continue
+            known = _autocast_static_tensor_devices(item, body)
+            if known is None:
+                return None
+            devices.update(known)
+        return devices
+    if isinstance(value, torch.fx.Node) and value.op == "get_attr" and value.graph is body.graph:
+        _, value = _autocast_registered_tensor(body, value.target)
+    elif isinstance(value, torch.fx.Node) and value.graph is body.graph:
+        value = value.meta.get("val")
+    return {value.device} if isinstance(value, torch.Tensor) else None
+
+
+def _autocast_schema_arguments(node: Any, schema: Any) -> dict[str, Any] | None:
+    """Bind explicit values and defaults without executing an operator."""
+    if len(node.args) > len(schema.arguments):
+        return None
+    supplied = dict(node.kwargs)
+    for arg, value in zip(schema.arguments, node.args):
+        if arg.kwarg_only or arg.name in supplied:
+            return None
+        supplied[arg.name] = value
+    if supplied.keys() - {arg.name for arg in schema.arguments}:
+        return None
+    for arg in schema.arguments:
+        if arg.name not in supplied:
+            if not arg.has_default_value():
+                return None
+            supplied[arg.name] = arg.default_value
+    return supplied
+
+
+def _autocast_device_controls_match(arguments: Any, supplied: dict[str, Any], body: Any) -> bool:
+    import torch
+
+    tensor_args = [arg for arg in arguments if _autocast_tensor_argument(arg.type)]
+    if not tensor_args:
+        return False
+    for arg in arguments:
+        arg_type = arg.type
+        while arg_type.kind() in {"OptionalType", "ListType"}:
+            arg_type = arg_type.getElementType()
+        value = supplied[arg.name]
+        if value is None:
+            continue
+        if arg_type.kind() == "GeneratorType":
+            # A device match cannot prove independence from generator state.
+            return False
+        if arg_type.kind() == "DeviceObjType":
+            if not isinstance(value, (str, torch.device)):
+                return False
+            devices = [_autocast_static_tensor_devices(supplied[tensor.name], body)
+                       for tensor in tensor_args]
+            if any(known != {torch.device(value)} for known in devices):
+                return False
+    return True
+
+
+def _autocast_zero_return_check(op: Any) -> bool:
+    """Exact standard-Torch checks whose only native effect is raising.
+
+    Schemas/tags do not distinguish these from effectful no-result operators
+    such as backward. Keep this semantic exception small and overload-exact;
+    pt2_compliant_tag alone is not evidence of purity.
+    """
+    import torch
+
+    return op in (
+        torch.ops.aten._assert_tensor_metadata.default,
+        torch.ops.aten._assert_scalar.default,
+        torch.ops.aten.sym_constrain_range.default,
+        torch.ops.aten.sym_constrain_range_for_size.default,
+    )
+
+
+def _autocast_aten_is_pure(node: Any, body: Any) -> bool:
+    """Use schema effects and tags, plus exact standard-Torch check semantics."""
+    import torch
+
+    op = node.target
+    if not isinstance(op, torch._ops.OpOverload) or op.namespace != "aten":
+        return False
+    try:
+        schema = op._schema
+        packet = op.overloadpacket
+        if (not isinstance(packet, torch._ops.OpOverloadPacket)
+                or type(packet.__name__) is not str or not packet.__name__
+                or packet.__name__.endswith("_")):
+            return False
+        tags = op.tags
+        tag_members = torch.Tag.__members__
+        if not all(name in tag_members for name in
+                   ("nondeterministic_seeded", "nondeterministic_bitwise")):
+            return False
+        stateful_tags = {tag for name, tag in tag_members.items() if name.startswith("nondeterministic")}
+        if (not isinstance(tags, (list, tuple, set, frozenset))
+                or any(not isinstance(tag, torch.Tag) for tag in tags)
+                or stateful_tags.intersection(tags)
+                or not isinstance(schema, torch.FunctionSchema) or schema.is_mutable is not False
+                or (not schema.returns and not _autocast_zero_return_check(op))
+                or any(arg.type.kind() == "NoneType" for arg in schema.returns)
+                or any(arg.alias_info is not None and arg.alias_info.is_write
+                       for arg in (*schema.arguments, *schema.returns))):
+            return False
+        # Schemas can omit native effects. The in-place convention and absence
+        # of results expose some omissions, but other unannotated native effects
+        # cannot be excluded structurally. Upstream effect annotations remain
+        # trusted; this predicate is not a general proof of native-code purity.
+        supplied = _autocast_schema_arguments(node, schema)
+        if supplied is None:
+            return False
+        if not schema.returns and not any(_autocast_tensor_argument(arg.type) for arg in schema.arguments):
+            # The exact scalar/range checks have no tensor device controls.
+            return _autocast_zero_return_check(op)
+        return _autocast_device_controls_match(schema.arguments, supplied, body)
+    except (AttributeError, TypeError, RuntimeError, ValueError):
+        # Missing or changed schema/tag/device introspection grants no admission.
+        return False
+
+
+def _validate_autocast_codegen(module: Any, *, require_default: bool = False) -> None:
+    """Check callbacks and recorded code before copying can erase either."""
+    import copy
+
+    from torch.fx.graph import CodeGen, _PyTreeCodeGen
+
+    try:
+        codegen = module.graph._codegen
+        if require_default and type(codegen) is not CodeGen:
+            raise ValueError("captured autocast body requires default FX codegen")
+        if (type(codegen) not in (CodeGen, _PyTreeCodeGen)
+                or "_body_transformer" not in vars(codegen)):
+            raise ValueError("captured FX codegen transformer cannot be inspected")
+        if codegen._body_transformer is not None:
+            raise ValueError("captured FX codegen transformer is unsupported")
+        # A callback can be restored while its compiled arithmetic remains.
+        # A shallow graph view shares the nodes, but uses fresh known codegen;
+        # python_code restores node repr functions and never recompiles module.
+        graph = copy.copy(module.graph)
+        graph.set_codegen(CodeGen() if type(codegen) is CodeGen
+                          else _PyTreeCodeGen(codegen.pytree_info))
+        generated = graph.python_code("self").src
+        if type(module.code) is not str or type(generated) is not str or module.code != generated:
+            raise ValueError("captured executable code differs from FX nodes")
+    except (AttributeError, TypeError, RuntimeError) as exc:
+        raise ValueError("captured FX codegen cannot be inspected") from exc
+
+
+def _validate_autocast_body(body: Any) -> None:
+    """Admit only default FX codegen and structurally known body execution."""
+    import operator
+
+    import torch
+    from torch.fx.graph import CodeGen
+
+    if not isinstance(body, torch.fx.GraphModule):
+        raise ValueError("captured autocast body is not a GraphModule")
+    if type(getattr(body.graph, "_codegen", None)) is not CodeGen:
+        raise ValueError("captured autocast body requires default FX codegen")
+    for node in body.graph.nodes:
+        if node.op in {"placeholder", "output", "get_attr"}:
+            continue
+        if node.op == "call_function":
+            if _autocast_aten_is_pure(node, body):
+                continue
+            if node.target is operator.getitem and len(node.args) == 2 and not node.kwargs:
+                producer, index = node.args
+                # Multiple schema returns have a tuple ABI. Tensor/list indexing
+                # and untyped input tuples do not establish this proof.
+                if (isinstance(producer, torch.fx.Node) and producer.graph is body.graph
+                        and producer.op == "call_function"
+                        and isinstance(producer.target, torch._ops.OpOverload)
+                        and producer.target.namespace == "aten"
+                        and len(producer.target._schema.returns) > 1
+                        and type(index) is int
+                        and -len(producer.target._schema.returns) <= index
+                        < len(producer.target._schema.returns)):
+                    continue
+        raise ValueError(f"captured autocast body has unsupported execution: {node.op} {node.target}")
+    _validate_autocast_codegen(body, require_default=True)
+
+
+def _autocast_registered_tensor(body: Any, target: Any) -> tuple[Any, Any]:
+    """Prove every path component uses ordinary registered-module lookup."""
+    import torch
+
+    if type(target) is not str or not target or any(not part for part in target.split(".")):
+        raise ValueError("captured tensor state has an invalid attribute path")
+    owner = body
+    parts = target.split(".")
+    for index, name in enumerate(parts):
+        if (not isinstance(owner, torch.nn.Module)
+                or type(owner).__getattribute__ is not torch.nn.Module.__getattribute__
+                or type(owner).__getattr__ is not torch.nn.Module.__getattr__):
+            raise ValueError("captured tensor state requires ordinary attribute lookup")
+        storage = vars(owner)
+        if index < len(parts) - 1:
+            modules = storage.get("_modules")
+            if type(modules) is not dict or name not in modules:
+                raise ValueError("captured tensor state requires registered module paths")
+            child = getattr(owner, name)
+            if child is not modules[name]:
+                raise ValueError("captured tensor state requires registered module identity")
+            owner = child
+            continue
+        parameters, buffers = storage.get("_parameters"), storage.get("_buffers")
+        if (type(parameters) is not dict or type(buffers) is not dict
+                or (name in parameters) == (name in buffers)):
+            raise ValueError("captured autocast body attribute is not registered tensor state")
+        registered = parameters[name] if name in parameters else buffers[name]
+        value = getattr(owner, name)
+        if not isinstance(value, torch.Tensor) or value is not registered:
+            raise ValueError("captured tensor state requires registered tensor identity")
+        return owner, value
+    raise ValueError("captured tensor state has no attribute")
+
+
+def _validate_autocast_state_ownership(graph_module: Any, body: Any) -> None:
+    """Retain tensor state only when no live graph reference can rebind its owner."""
+    import torch
+
+    owners = {body}
+    state = [node for node in body.graph.nodes if node.op == "get_attr"]
+    if not state:
+        return
+    for node in state:
+        try:
+            owner, _ = _autocast_registered_tensor(body, node.target)
+        except (AttributeError, TypeError, RuntimeError) as exc:
+            raise ValueError("captured tensor state lookup cannot be inspected") from exc
+        owners.add(owner)
+    for _, scope in _graph_modules(graph_module):
+        if scope is body:
+            continue
+        for node in scope.graph.nodes:
+            if node.op not in {"get_attr", "call_module"}:
+                continue
+            value = scope
+            for part in str(node.target).split("."):
+                value = getattr(value, part)
+            if node.op == "get_attr" and value is body and node.users and all(
+                    user.op == "call_function"
+                    and user.target is torch.ops.higher_order.wrap_with_autocast
+                    and len(user.args) >= 5 and user.args[4] is node
+                    for user in node.users):
+                continue
+            if isinstance(value, torch.nn.Module) and any(child in owners for child in value.modules()):
+                raise ValueError("captured autocast body state has a live retained owner")
+
+
+def _disabled_autocast_arguments(node: Any) -> tuple[Any, ...]:
+    """Validate the captured ABI against Torch's disabled-autocast contract."""
+    import torch
+
+    args = tuple(node.args)
+    if len(args) < 5 or node.kwargs or not isinstance(args[4], torch.fx.Node) \
+            or args[4].op != "get_attr":
+        raise ValueError("captured autocast region has an unknown signature")
+    device_type, region_dtype, enabled, cache_enabled = args[:4]
+    if (not isinstance(device_type, str)
+            or not (region_dtype is None or isinstance(region_dtype, torch.dtype))
+            or type(enabled) is not bool
+            or not (cache_enabled is None or type(cache_enabled) is bool)):
+        raise ValueError("captured autocast region has an unknown signature")
+    if enabled is not False:
+        raise ValueError("captured enabled autocast region changes precision; "
+                         "FP32 staging refuses it")
+    try:
+        # Construction and entry both validate device legality; using the
+        # runtime contract also covers registered backends without a name list.
+        with torch.autocast(device_type, dtype=region_dtype, enabled=False,
+                            cache_enabled=cache_enabled):
+            pass
+    except (RuntimeError, ValueError, AssertionError) as exc:
+        raise ValueError("captured autocast region has an invalid runtime device contract") from exc
+    return args
+
+
+def _validate_captured_dtype_literals(graph_module: Any) -> None:
+    """Check ownership before normalization can discard any operand or output."""
+    import torch
+
+    for _, module in _graph_modules(graph_module):
+        for node in module.graph.nodes:
+            if node.op == "call_function" and node.target is torch.ops.higher_order.wrap_with_autocast:
+                args = _disabled_autocast_arguments(node)
+                # Only the wrapper's dtype control belongs to this ABI.
+                literals = _dtype_literals((args[:1], args[2:]))
+                owned = []
+            else:
+                literals = _dtype_literals((node.args, node.kwargs))
+                schema = getattr(node.target, "_schema", None) if node.op == "call_function" else None
+                owned = [] if schema is None else [
+                    node.kwargs.get(arg.name, node.args[index] if index < len(node.args) else None)
+                    for index, arg in enumerate(schema.arguments) if arg.name == "dtype"]
+                owned = [value for value in owned if isinstance(value, torch.dtype)]
+            if len(literals) != len(owned):
+                raise ValueError("captured dtype literal lacks a schema-owned dtype operand")
+
+
+def _autocast_attribute_target(module: Any, body: Any, wrapper: Any,
+                               inner: Any, attributes: dict[str, str]) -> str:
+    """Move the owning namespace once, retaining owner-relative attribute access."""
+    import torch
+
+    root, separator, suffix = str(inner.target).partition(".")
+    if root not in attributes:
+        base = f"_m2m_autocast_{wrapper.name}_{root}"
+        local = base
+        ordinal = 0
+        while hasattr(module, local):
+            ordinal += 1
+            local = f"{base}_{ordinal}"
+        value = getattr(body, root)
+        if isinstance(value, torch.nn.Module):
+            module.add_submodule(local, value)
+        elif root in body._parameters:
+            module.register_parameter(local, value)
+        elif root in body._buffers:
+            module.register_buffer(local, value,
+                persistent=root not in body._non_persistent_buffers_set)
+        else:
+            setattr(module, local, value)
+        attributes[root] = local
+    return attributes[root] + (separator + suffix if separator else "")
+
+
+def _autocast_body_is_referenced(graph_module: Any, owner: Any, target: str, body: Any) -> bool:
+    """A live module reference can invoke its descendants through Python forward."""
+    import torch
+
+    for _, scope in _graph_modules(graph_module):
+        for node in scope.graph.nodes:
+            if node.op not in {"get_attr", "call_module"}:
+                continue
+            reference = str(node.target)
+            if scope is owner and (reference == target or reference.startswith(target + ".")):
+                return True
+            value = scope
+            for part in reference.split("."):
+                value = getattr(value, part)
+            # Aliases and references in other graph scopes can keep an ancestor
+            # live without sharing the body's qualified path in this owner.
+            if isinstance(value, torch.nn.Module) and any(child is body for child in value.modules()):
+                return True
+    return False
+
+
+def _preflight_autocast_rewrite(graph_module: Any) -> None:
+    """Inspect source execution before any graph copying or splicing."""
+    import torch
+
+    scopes = list(_graph_modules(graph_module))
+    wrappers = [(module, node) for _, module in scopes for node in module.graph.nodes
+                if node.op == "call_function" and node.target is torch.ops.higher_order.wrap_with_autocast]
+    if not wrappers:
+        return
+    _refuse_global_execution_hooks()
+    for module, node in wrappers:
+        args = _disabled_autocast_arguments(node)
+        body = module.get_submodule(str(args[4].target))
+        _validate_autocast_body(body)
+        _validate_autocast_state_ownership(graph_module, body)
+    for _, module in scopes:
+        _validate_autocast_codegen(module)
+
+
+def _inline_disabled_autocast_regions(graph_module: Any) -> list[dict[str, Any]]:
+    """Splice disabled autocast under an explicit ambient-autocast precondition.
+
+    ``wrap_with_autocast(device_type, dtype, enabled, cache_enabled, body, *args)``
+    is schema-less; its dtype names the autocast target, not a tensor type.
+    A captured graph cannot prove the runtime caller's autocast state. Removing
+    the boundary requires ambient autocast disabled on every exposed device.
+    Materialization records that precondition and installs a runtime refusal on
+    the returned module. Consumers that re-export must enforce the receipt's
+    precondition too: export can specialize away Python guards. Enabled regions
+    are refused, as are global execution hooks and unproven body execution.
+    Exclusively owned registered tensor state is the only attribute exception.
+    Body nodes retain metadata; each removed wrapper is recorded.
+    This internal mutator requires exclusive ownership of nested GraphModules.
+    """
+    import operator
+
+    import torch
+
+    hop = torch.ops.higher_order.wrap_with_autocast
+    _validate_captured_dtype_literals(graph_module)
+    _preflight_autocast_rewrite(graph_module)
+    rows = []
+    changed = True
+    while changed:
+        changed = False
+        for _, module in list(_graph_modules(graph_module)):
+            for node in list(module.graph.nodes):
+                if node.op != "call_function" or node.target is not hop:
+                    continue
+                args = _disabled_autocast_arguments(node)
+                device_type, region_dtype, enabled, cache_enabled, body_attr = args[:5]
+                body = module
+                for part in str(body_attr.target).split("."):
+                    body = getattr(body, part)
+                if not isinstance(body, torch.fx.GraphModule):
+                    raise ValueError("captured autocast body is not a GraphModule")
+                _refuse_global_execution_hooks()
+                _refuse_module_hooks(body)
+                _validate_autocast_body(body)
+                _validate_autocast_state_ownership(graph_module, body)
+                placeholders = [n for n in body.graph.nodes if n.op == "placeholder"]
+                operands = args[5:]
+                if len(placeholders) != len(operands):
+                    raise ValueError("captured autocast region operands differ from its body")
+                output_nodes = [n for n in body.graph.nodes if n.op == "output"]
+                if (len(output_nodes) != 1 or len(output_nodes[0].args) != 1
+                        or type(output_nodes[0].args[0]) is not tuple):
+                    raise ValueError("captured autocast body requires the tuple-output ABI")
+                results = output_nodes[0].args[0]
+                for user in node.users:
+                    if (user.op != "call_function" or user.target is not operator.getitem
+                            or len(user.args) != 2 or user.kwargs
+                            or type(user.args[1]) is not int
+                            or not -len(results) <= user.args[1] < len(results)):
+                        raise ValueError("captured autocast result is not selected by index")
+                    if not isinstance(results[user.args[1]], torch.fx.Node):
+                        raise ValueError("captured autocast selected result is not an FX value")
+                env = dict(zip(placeholders, operands, strict=True))
+                attributes = {}
+                with module.graph.inserting_before(node):
+                    for inner in body.graph.nodes:
+                        if inner.op == "placeholder":
+                            continue
+                        if inner.op == "output":
+                            continue
+                        if inner.op in {"get_attr", "call_module"}:
+                            copied = module.graph.node_copy(inner, lambda n: env[n])
+                            copied.target = _autocast_attribute_target(
+                                module, body, node, inner, attributes)
+                        else:
+                            copied = module.graph.node_copy(inner, lambda n: env[n])
+                        env[inner] = copied
+                for user in list(node.users):
+                    replacement = results[user.args[1]]
+                    user.replace_all_uses_with(env[replacement])
+                    module.graph.erase_node(user)
+                rows.append({"source_node_id": (node.meta.get("custom") or {}).get("m2m_node_id"),
+                             "target": str(node.target), "device_type": device_type,
+                             "autocast_dtype": str(region_dtype), "enabled": False,
+                             "cache_enabled": cache_enabled,
+                             "action": "inlined_precision_neutral_region"})
+                module.graph.erase_node(node)
+                if not body_attr.users:
+                    module.graph.erase_node(body_attr)
+                    target = str(body_attr.target)
+                    if not _autocast_body_is_referenced(graph_module, module, target, body):
+                        module.delete_submodule(target)
+                module.graph.lint()
+                module.recompile()
+                changed = True
+                break
+            if changed:
+                break
+    return rows
+
+
+
+
 def _retarget_captured_float_dtypes(graph_module: Any, dtype: Any,
                                     original: dict[str, Any]) -> list[dict[str, Any]]:
     """Retarget only explicit floating ``dtype`` operands of schema-known FX calls."""
     import torch
-
-    def dtype_literals(value: Any) -> list[Any]:
-        if isinstance(value, torch.dtype):
-            return [value]
-        if isinstance(value, (tuple, list)):
-            return [item for child in value for item in dtype_literals(child)]
-        if isinstance(value, dict):
-            return [item for child in value.values() for item in dtype_literals(child)]
-        return []
 
     decisions = []
     seen_ids = set()
@@ -324,7 +848,7 @@ def _retarget_captured_float_dtypes(graph_module: Any, dtype: Any,
         module_changed = False
         for node in module.graph.nodes:
             if node.op != "call_function":
-                if dtype_literals(node.args) or dtype_literals(node.kwargs):
+                if _dtype_literals(node.args) or _dtype_literals(node.kwargs):
                     raise ValueError("captured dtype literal lacks a schema-owned call")
                 continue
             schema = getattr(node.target, "_schema", None)
@@ -374,7 +898,7 @@ def _retarget_captured_float_dtypes(graph_module: Any, dtype: Any,
                     node_changed = True
             # A floating dtype literal anywhere other than a schema's dtype
             # operand would otherwise evade both the rewrite and its audit.
-            all_literals = dtype_literals(node.args) + dtype_literals(node.kwargs)
+            all_literals = _dtype_literals(node.args) + _dtype_literals(node.kwargs)
             if len(all_literals) != node_decisions:
                 raise ValueError("captured dtype literal lacks a schema-owned dtype operand")
             if node_changed:
@@ -492,6 +1016,156 @@ def _audit_staged_float_precision(exported: Any, graph_module: Any, inputs: Any,
             "checked_floating_values": checked, "non_target_floating_values": 0}
 
 
+def _autocast_devices() -> tuple[str, ...]:
+    """Use Torch's complete autocast roster, including unavailable hardware."""
+    import torch
+
+    try:
+        devices = torch._C._autocast_supported_devices()
+        if (not isinstance(devices, (list, tuple)) or not devices
+                or any(type(device) is not str or not torch.amp.is_autocast_available(device)
+                       for device in devices)):
+            raise ValueError("invalid device roster")
+        for device in devices:
+            if type(torch.is_autocast_enabled(device)) is not bool:
+                raise ValueError("unknown autocast state")
+        if type(torch._C._is_any_autocast_enabled()) is not bool:
+            raise ValueError("unknown aggregate autocast state")
+        return tuple(sorted(set(devices)))
+    except (AttributeError, TypeError, RuntimeError, ValueError) as exc:
+        raise ValueError("autocast devices cannot be inspected") from exc
+
+
+def _tensor_input_devices(inputs: Any) -> tuple[tuple[int, str], ...]:
+    import torch
+    from torch.utils._pytree import tree_flatten
+
+    return tuple((index, str(value.device)) for index, value in enumerate(tree_flatten(inputs)[0])
+                 if isinstance(value, torch.Tensor))
+
+
+def _refuse_torch_modes() -> None:
+    """Python modes can observe context boundaries at every tensor operation."""
+    import torch
+    from torch.utils import _python_dispatch
+
+    for namespace, kind, type_name in (
+            (_python_dispatch, "dispatch", "TorchDispatchMode"),
+            (torch.overrides, "function", "TorchFunctionMode")):
+        try:
+            mode_type = getattr(namespace, type_name)
+            get_stack = getattr(namespace, f"_get_current_{kind}_mode_stack")
+            get_length = getattr(namespace, f"_len_torch_{kind}_stack")
+            if not isinstance(mode_type, type) or not callable(get_stack) or not callable(get_length):
+                raise ValueError("missing mode accessors")
+            length = get_length()
+            if type(length) is not int or length < 0:
+                raise ValueError("unknown mode stack length")
+            stack = get_stack()
+            if (type(stack) is not list or len(stack) != length
+                    or any(not isinstance(mode, mode_type) for mode in stack)):
+                raise ValueError("unknown mode stack")
+        except (AttributeError, TypeError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"torch {kind} modes cannot be inspected") from exc
+        if stack:
+            raise ValueError(f"precision materialization requires torch {kind} modes absent")
+
+
+def _check_ambient_autocast(inputs: Any, *, devices: tuple[str, ...],
+                            tensor_devices: tuple[tuple[int, str], ...]) -> None:
+    import torch
+
+    _refuse_torch_modes()
+    _refuse_global_execution_hooks()
+    if _tensor_input_devices(inputs) != tensor_devices:
+        raise ValueError("precision materialization requires captured tensor input devices")
+    if _autocast_devices() != devices:
+        raise ValueError("precision materialization autocast device roster changed")
+    for device in devices:
+        if torch.is_autocast_enabled(device):
+            raise ValueError(f"precision materialization requires ambient autocast disabled for {device}")
+    if torch._C._is_any_autocast_enabled():
+        raise ValueError("precision materialization requires all ambient autocast disabled")
+    # With every autocast dispatch key disabled, tensor kernels do not use the
+    # cast cache. Pure bodies cannot read it or mutate cached tensor inputs, so
+    # wrapper cache_enabled controls need no additional runtime equality guard.
+
+
+def _guard_precision_forward(gm: Any, *, devices: tuple[str, ...],
+                             tensor_devices: tuple[tuple[int, str], ...]) -> None:
+    """Guard both Module.__call__ and direct forward at the execution entry."""
+    import inspect
+    from functools import wraps
+
+    # FX gives each GraphModule its own generated class. Capture the unbound
+    # implementation so the wrapper neither owns nor closes over the module.
+    forward = type(gm).forward
+    signature = inspect.signature(forward)
+
+    @wraps(forward)
+    def guarded_forward(self, *args, **kwargs):
+        inputs = args
+        if kwargs:
+            bound = signature.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            inputs = tuple(bound.arguments.values())[1:]
+        _check_ambient_autocast(inputs, devices=devices, tensor_devices=tensor_devices)
+        return forward(self, *args, **kwargs)
+
+    type(gm).forward = guarded_forward
+
+
+def _memoize_nonleaf_capture_state(exported: Any, memo: dict[Any, Any]) -> None:
+    """Let Torch's storage-aware tensor deepcopy handle ordinary non-leaf state."""
+    import copy
+
+    import torch
+
+    tensors = [*exported.state_dict.values(), *exported.constants.values(),
+               *exported.graph_module.buffers()]
+    for value in tensors:
+        if not isinstance(value, torch.Tensor) or value.is_leaf or id(value) in memo:
+            continue
+        if type(value) is not torch.Tensor:
+            raise ValueError("non-leaf capture state requires ordinary tensors")
+        # A detached view keeps storage, offsets and strides. Torch's deepcopy
+        # uses the shared memo for storage as well as object identity, preserving
+        # aliases between distinct buffer views without retaining source autograd.
+        cloned = copy.deepcopy(value.detach(), memo)
+        cloned.requires_grad_(value.requires_grad)
+        memo[id(value)] = cloned
+
+
+def _owned_precision_capture(exported: Any, *, normalize_autocast: bool = False) -> Any:
+    """Own nested graphs and state without changing the export signature's names."""
+    import copy
+
+    import torch
+
+    # GraphModule.__deepcopy__ drops execution hooks in supported Torch versions.
+    # Inspect the source first; checking the owned copy would silently miss them.
+    _refuse_module_hooks(exported.graph_module)
+    # FX copying must not erase a custom callable ABI before admission checks.
+    if normalize_autocast:
+        _preflight_autocast_rewrite(exported.graph_module)
+    memo: dict[Any, Any] = {}
+    _memoize_nonleaf_capture_state(exported, memo)
+    owned = copy.deepcopy(exported, memo)
+    for _, module in _graph_modules(exported.graph_module):
+        for node in module.graph.nodes:
+            if node.op == "output":
+                continue
+            # FX graph_copy supplies the exact old->new Node map in the copy
+            # memo. It can rename builtins (e.g. input -> input_1), while the
+            # copied ExportGraphSignature still uses the original spelling.
+            cloned = memo.get(node)
+            if cloned is None:
+                raise ValueError("precision capture copy lacks an exact FX node binding")
+            cloned.name = node.name
+        memo[id(module)].recompile()
+    return owned
+
+
 def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
                                   original_frontend_snapshot: dict[str, Any] | None = None,
                                   retarget_float_dtype_arguments: bool = False):
@@ -505,6 +1179,14 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
     and owned floating lifted constants in that captured graph, then re-exports
     to audit the resulting real types. Integer/bool values remain unchanged;
     no numerical-equivalence claim follows from a successful type audit.
+    Removed disabled-autocast boundaries require ambient autocast to remain
+    disabled on all exposed devices. The receipt records this precondition and the
+    returned module's call and forward entries reject violations; downstream
+    exports inherit the contract.
+    Global execution-hook registries must also remain present, typed and empty.
+    Torch dispatch and function mode stacks must remain inspectable and empty.
+    Tensor input devices are bound to the captured examples so static device
+    proofs in disabled bodies remain valid for later calls.
     """
     import torch
     from torch.utils._pytree import tree_flatten, tree_map
@@ -513,6 +1195,9 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
         raise ValueError("precision materialization supports only native f16/bf16/f32/f64")
     exported = model if hasattr(model, "graph_signature") and hasattr(model, "graph_module") \
         else torch.export.export(model, tuple(inputs))
+    # module() can share nested GraphModules with the ExportedProgram. Own the
+    # complete capture before identity annotation, state conversion or splicing.
+    exported = _owned_precision_capture(exported, normalize_autocast=retarget_float_dtype_arguments)
     captured = snapshot_exported_program(exported, stage="original")
     original = original_frontend_snapshot if original_frontend_snapshot is not None else captured
     if not attach_original_identity(exported, original, captured):
@@ -546,6 +1231,7 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
             converted = memo.get(id(value))
             if converted is None:
                 converted = value.detach().to(dtype=dtype if value.is_floating_point() else value.dtype, copy=True)
+                converted.requires_grad_(value.requires_grad)
                 if parameter:
                     converted = torch.nn.Parameter(converted, requires_grad=value.requires_grad)
                 memo[id(value)] = converted
@@ -573,6 +1259,7 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
     staged_audit = None
     if retarget_float_dtype_arguments:
         constants = _owned_lifted_constant_conversions(exported, gm, dtype)
+        autocast_regions = _inline_disabled_autocast_regions(gm)
         decisions = _retarget_captured_float_dtypes(gm, dtype, original)
         prepare_lifted_constant_lineage(gm)
         defer_lifted_constant_user_lineage(gm, exported)
@@ -621,9 +1308,22 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
                "original_graph_sha256": original["sha256"], "target_dtype": str(dtype),
                "state_conversions": conversions, "input_conversions": input_conversions}
     if retarget_float_dtype_arguments:
+        if autocast_regions:
+            devices = _autocast_devices()
+            tensor_devices = _tensor_input_devices(cast_inputs)
+            _guard_precision_forward(gm, devices=devices, tensor_devices=tensor_devices)
+            receipt["runtime_preconditions"] = {
+                "autocast_disabled_for_devices": list(devices),
+                "global_execution_hooks_absent": True,
+                "torch_dispatch_modes_absent": True,
+                "torch_function_modes_absent": True,
+                "tensor_input_devices": [{"leaf_ordinal": index, "device": device}
+                                         for index, device in tensor_devices],
+            }
         receipt.update(staged_graph_sha256=staged_snapshot["sha256"],
                        dtype_decisions=decisions, constant_conversions=constants,
                        staged_precision_audit=staged_audit,
+                       inlined_autocast_regions=autocast_regions,
                        graph_dtype_retargeting="schema_float_dtype_operands")
     receipt["sha256"] = _digest(receipt)
     return gm, cast_inputs, original, receipt
