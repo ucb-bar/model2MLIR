@@ -17,6 +17,33 @@ from itertools import product
 from typing import Any
 
 
+def _geometry_fake_mode(model: Any, example_inputs: tuple[Any, ...]):
+    """Use the capture's symbol owner for fake-only, static-input propagation."""
+    import torch
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+    from torch.utils._pytree import tree_leaves
+
+    environments = {}
+    values = [node.meta.get("val") for module in model.modules()
+              if hasattr(module, "graph") for node in module.graph.nodes]
+    for value in tree_leaves([values, example_inputs]):
+        dimensions = [value]
+        if isinstance(value, torch.Tensor):
+            dimensions = [*value.shape, *value.stride(), value.storage_offset()]
+        for dimension in dimensions:
+            if isinstance(dimension, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+                environment = dimension.node.shape_env
+                environments[id(environment)] = environment
+    if len(environments) > 1:
+        raise ValueError("captured symbolic dimensions have incompatible ShapeEnv owners")
+    environment = next(iter(environments.values()), None)
+    # A fresh environment can reuse u0 and collide with rebind_unbacked's
+    # existing bindings. Keep the capture's owner, but use a fresh fake mode.
+    return FakeTensorMode(shape_env=environment if environment is not None else ShapeEnv(),
+                          static_shapes=True)
+
+
 def integerize_pt2e(
     model: Any,
     example_inputs: tuple[Any, ...],
@@ -82,8 +109,7 @@ def integerize_pt2e(
     # e.g. a finite binary64 alpha can overflow addmm's eager f32 scalar cast
     # while its integer/rational rewrite is entirely well-defined.
     if integer_readout:
-        from torch._subclasses.fake_tensor import FakeTensorMode
-        ShapeProp(model, fake_mode=FakeTensorMode()).propagate(*example_inputs)
+        ShapeProp(model, fake_mode=_geometry_fake_mode(model, example_inputs)).propagate(*example_inputs)
     else:
         ShapeProp(model).propagate(*example_inputs)
 
