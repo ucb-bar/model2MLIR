@@ -213,6 +213,9 @@ def convert(
             for _ in range(8):
                 if not inline_set_grad_hops(exported_program.graph_module):
                     break
+            from m2m.capture.region_lineage import certify_flattened_regions
+
+            certify_flattened_regions(trace_graphs["quantized"], exported_program)
             trace_graphs["prepared"] = snapshot_exported_program(exported_program, stage="prepared")
         except Exception as exc:  # Tracing remains diagnostic; no silent recapture.
             return ConversionResult(diagnostics=[f"traced frontend capture failed: {exc}"],

@@ -196,6 +196,9 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
     """Snapshot and stamp exactly this program, for the subsequent lowering."""
     from torch.fx import Node
     gm = exported.graph_module
+    from m2m.capture.region_lineage import restore
+
+    restore(gm)
     sig = getattr(exported, "graph_signature", None)
     input_specs = {getattr(s.arg, "name", None): s for s in getattr(sig, "input_specs", ())}
     records, edges = [], []
@@ -268,6 +271,7 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
                             "input_kind": str(getattr(spec, "kind", "")).removeprefix("InputKind.") or None,
                             "input_target": getattr(spec, "target", None),
                             "transformation": custom.get("m2m_transform"),
+                            "nested_lineage_required": custom.get("m2m_nested_lineage_required"),
                             "origin_node_ids": [v for v in prior if v != node_id]})
     body = {"schema": "m2m.frontend_graph.v1", "stage": stage, "status": "complete",
             "graph_id": f"g:{stage}:root", "nodes": records, "edges": edges,
@@ -281,6 +285,14 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
             "range_constraints": {str(k): str(v) for k, v in
                                   (getattr(exported, "range_constraints", {}) or {}).items()},
             "runtime_versions": {"torch": __import__("torch").__version__}}
+    from m2m.capture.region_lineage import snapshot_receipts
+
+    nested_receipts = snapshot_receipts(gm)
+    if nested_receipts:
+        body["nested_lineage"] = nested_receipts
+    flattened_receipt = getattr(exported, "_m2m_flattened_lineage", None)
+    if flattened_receipt is not None:
+        body["flattened_nested_lineage"] = flattened_receipt
     body["eliminations"] = list(getattr(exported, "_m2m_trace_eliminations", ()))
     body["sha256"] = _digest(body)
     return body
@@ -737,6 +749,54 @@ def _preflight_autocast_rewrite(graph_module: Any) -> None:
         _validate_autocast_codegen(module)
 
 
+def _autocast_lineage_receipt(wrapper, attribute, body, placeholders, operands, results):
+    """Record the exact splice after admission, before any node is erased."""
+    from torch.fx import Node
+
+    def identity(node):
+        return (node.meta.get("custom") or {}).get("m2m_node_id")
+
+    def value(node):
+        return {"node_id": identity(node),
+                "results": [{key: field for key, field in row.items() if key != "id"}
+                            for row in _types(node.meta.get("val"), "value")]}
+
+    bindings = [{"placeholder": value(placeholder), "operand": value(operand)}
+                for placeholder, operand in zip(placeholders, operands, strict=True)
+                if isinstance(operand, Node)]
+    selections = [{"selector": value(user), "result_index": user.args[1],
+                   "body_result": value(results[user.args[1]])} for user in wrapper.users]
+    removed = [wrapper, *wrapper.users]
+    if set(attribute.users) == {wrapper}:
+        removed.append(attribute)
+    typed = (len(bindings) == len(placeholders)
+             and all(row["placeholder"]["results"] == row["operand"]["results"]
+                     for row in bindings)
+             and all(row["selector"]["results"] == row["body_result"]["results"]
+                     for row in selections)
+             and all(isinstance(result, Node) for result in results))
+    if typed:
+        body_results = [item for result in results for item in value(result)["results"]]
+        typed = (body_results == value(wrapper)["results"]
+                 and all(item["kind"] == "tensor" for item in body_results))
+    return {"schema": "m2m.autocast_lineage.v1",
+            "status": "validated" if typed else "unproven_typed_bindings",
+            "operand_bindings": bindings,
+            "output_bindings": selections,
+            "body_source_ids": [identity(node) for node in body.graph.nodes],
+            "ownership_moves": [{"source_node_id": identity(node),
+                                 "from_body_node_id": identity(attribute),
+                                 "to_wrapper_scope_node_id": identity(wrapper)}
+                                for node in body.graph.nodes
+                                if node.op not in {"placeholder", "output"}],
+            "eliminations": [{"source_ids": [identity(node) for node in removed if identity(node)],
+                              "kind": "eliminated",
+                              "proof": {"disabled_autocast": True,
+                                        "validated_tuple_selections": True,
+                                        "operand_bindings": bindings,
+                                        "output_bindings": selections}}]}
+
+
 def _inline_disabled_autocast_regions(graph_module: Any) -> list[dict[str, Any]]:
     """Splice disabled autocast under an explicit ambient-autocast precondition.
 
@@ -749,7 +809,8 @@ def _inline_disabled_autocast_regions(graph_module: Any) -> list[dict[str, Any]]
     precondition too: export can specialize away Python guards. Enabled regions
     are refused, as are global execution hooks and unproven body execution.
     Exclusively owned registered tensor state is the only attribute exception.
-    Body nodes retain metadata; each removed wrapper is recorded.
+    Body nodes retain metadata; receipts bind operands, ordered results, moved
+    identities and every removed wrapper/selector to the admitted splice.
     This internal mutator requires exclusive ownership of nested GraphModules.
     """
     import operator
@@ -795,6 +856,7 @@ def _inline_disabled_autocast_regions(graph_module: Any) -> list[dict[str, Any]]
                         raise ValueError("captured autocast result is not selected by index")
                     if not isinstance(results[user.args[1]], torch.fx.Node):
                         raise ValueError("captured autocast selected result is not an FX value")
+                region_receipt = _autocast_lineage_receipt(node, body_attr, body, placeholders, operands, results)
                 env = dict(zip(placeholders, operands, strict=True))
                 attributes = {}
                 with module.graph.inserting_before(node):
@@ -814,7 +876,8 @@ def _inline_disabled_autocast_regions(graph_module: Any) -> list[dict[str, Any]]
                     replacement = results[user.args[1]]
                     user.replace_all_uses_with(env[replacement])
                     module.graph.erase_node(user)
-                rows.append({"source_node_id": (node.meta.get("custom") or {}).get("m2m_node_id"),
+                rows.append({**region_receipt,
+                             "source_node_id": (node.meta.get("custom") or {}).get("m2m_node_id"),
                              "target": str(node.target), "device_type": device_type,
                              "autocast_dtype": str(region_dtype), "enabled": False,
                              "cache_enabled": cache_enabled,
@@ -837,14 +900,14 @@ def _inline_disabled_autocast_regions(graph_module: Any) -> list[dict[str, Any]]
 
 
 def _retarget_captured_float_dtypes(graph_module: Any, dtype: Any,
-                                    original: dict[str, Any]) -> list[dict[str, Any]]:
+                                    original: dict[str, Any], *, graph_scopes=None) -> list[dict[str, Any]]:
     """Retarget only explicit floating ``dtype`` operands of schema-known FX calls."""
     import torch
 
     decisions = []
     seen_ids = set()
     original_nodes = {node["id"]: node for node in original["nodes"]}
-    for _, module in _graph_modules(graph_module):
+    for _, module in (_graph_modules(graph_module) if graph_scopes is None else graph_scopes):
         module_changed = False
         for node in module.graph.nodes:
             if node.op != "call_function":
@@ -1260,7 +1323,13 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
     if retarget_float_dtype_arguments:
         constants = _owned_lifted_constant_conversions(exported, gm, dtype)
         autocast_regions = _inline_disabled_autocast_regions(gm)
-        decisions = _retarget_captured_float_dtypes(gm, dtype, original)
+        from m2m.capture.region_lineage import precision_modules, publish
+
+        decisions = _retarget_captured_float_dtypes(
+            gm, dtype, original,
+            graph_scopes=precision_modules(gm) if autocast_regions else None)
+
+        publish(gm, original, autocast_regions)
         prepare_lifted_constant_lineage(gm)
         defer_lifted_constant_user_lineage(gm, exported)
         staged = torch.export.export(gm, cast_inputs)
@@ -1942,7 +2011,8 @@ def _tuple_selector_relations(source: dict[str, Any], dest: dict[str, Any],
         parent_id, index = args[0].get("node_id"), args[1]
         parent = source_nodes.get(parent_id)
         values = parent.get("results") or [] if parent else []
-        if (len(values) < 2 or not -len(values) <= index < len(values)
+        if (not values or not -len(values) <= index < len(values)
+                or (len(values) == 1 and (parent.get("result_metadata") or {}).get("container") != "tuple")
                 or selector.get("graph_id") != parent.get("graph_id")
                 or source_keys[(parent_id, index)] != 1
                 or args[0].get("value_id") != values[index].get("id")
@@ -1954,6 +2024,7 @@ def _tuple_selector_relations(source: dict[str, Any], dest: dict[str, Any],
             candidate_parent = dest_nodes.get(dest_id)
             dest_values = candidate_parent.get("results") or [] if candidate_parent else []
             if (candidate_parent is None or candidate_parent.get("target") != parent.get("target")
+                    or (len(values) == 1 and (candidate_parent.get("result_metadata") or {}).get("container") != "tuple")
                     or candidate_parent.get("graph_id", "").split(":", 2)[-1]
                     != parent.get("graph_id", "").split(":", 2)[-1]
                     or len(dest_values) != len(values)
@@ -2020,7 +2091,9 @@ def _dead_forward_value_relations(source: dict[str, Any], consumed: set[str]) ->
 
 def _inlined_parameter_relations(source: dict[str, Any], dest: dict[str, Any],
                                  relations: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], set[str]]:
-    """Bind a uniquely invoked grad-disabled body's inputs to its caller values."""
+    """Bind uniquely invoked disabled regions recursively to typed caller values."""
+    from m2m.capture.region_lineage import snapshot_caller
+
     src_nodes = {node["id"]: node for node in source["nodes"]}
     dst_nodes = {node["id"]: node for node in dest["nodes"]}
     mapped: dict[str, set[str]] = {}
@@ -2037,22 +2110,14 @@ def _inlined_parameter_relations(source: dict[str, Any], dest: dict[str, Any],
     scopes = {node["graph_id"].split(":", 2)[-1] for node in source["nodes"]
               if isinstance(node.get("graph_id"), str)
               and node["graph_id"] != f"g:{source['stage']}:root"}
-    for scope in sorted(scopes):
-        attrs = [node for node in source["nodes"] if node.get("op") == "get_attr"
-                 and node.get("graph_id") == f"g:{source['stage']}:root" and node.get("target") == scope]
-        if len(attrs) != 1:
+    for scope in sorted(scopes, key=lambda value: (value.count("."), value)):
+        call = snapshot_caller(source, scope)
+        if call is None:
             continue
-        wrappers = [node for node in source["nodes"] if node.get("target") == "wrap_with_set_grad_enabled"
-                    and node.get("graph_id") == f"g:{source['stage']}:root"
-                    and isinstance(node.get("args"), list) and len(node["args"]) >= 2
-                    and node["args"][0] is False
-                    and isinstance(node["args"][1], dict)
-                    and node["args"][1].get("node_id") == attrs[0]["id"]]
-        if len(wrappers) != 1:
-            continue
+        wrapper, offset = call
         placeholders = [node for node in source["nodes"] if node.get("op") == "placeholder"
                         and node.get("graph_id") == f"g:{source['stage']}:{scope}"]
-        arguments = wrappers[0]["args"][2:]
+        arguments = wrapper["args"][offset:]
         if len(placeholders) != len(arguments):
             continue
         bindings = []
@@ -2067,14 +2132,16 @@ def _inlined_parameter_relations(source: dict[str, Any], dest: dict[str, Any],
             candidates = [dst_nodes[identity] for identity in mapped.get(parent["id"], set())
                           if identity in dst_nodes and len(specs(dst_nodes[identity])) > selected
                           and specs(dst_nodes[identity])[selected] == specs(parent)[selected]]
-            if len(candidates) != 1:
+            if len(candidates) != 1 or mapped.get(parent["id"]) != {candidates[0]["id"]}:
                 break
             bindings.append({"source_ids": [placeholder["id"]], "destination_ids": [candidates[0]["id"]],
                              "kind": "inlined_parameter_binding",
-                             "proof": {"wrapper_node_id": wrappers[0]["id"],
+                             "proof": {"wrapper_node_id": wrapper["id"],
                                        "submodule": scope, "argument_result_index": selected}})
         if len(bindings) == len(placeholders):
             result.extend(bindings)
+            for binding in bindings:
+                mapped.setdefault(binding["source_ids"][0], set()).update(binding["destination_ids"])
             verified_scopes.add(scope)
     return result, verified_scopes
 
@@ -2361,6 +2428,9 @@ def _unchanged_nested_graph_relations(source: dict[str, Any], dest: dict[str, An
     the entire typed body, ordered arguments, and uniquely mapped caller values
     must agree. A changed or ambiguously invoked body remains unresolved.
     """
+    if source.get("runtime_versions") != dest.get("runtime_versions"):
+        return []
+
     def specs(node: dict[str, Any]) -> list[dict[str, Any]]:
         return [{key: value for key, value in result.items() if key != "id"}
                 for result in node.get("results") or []]
@@ -2415,23 +2485,10 @@ def _unchanged_nested_graph_relations(source: dict[str, Any], dest: dict[str, An
         return rows
 
     def caller(snapshot: dict[str, Any], scope: str) -> dict[str, Any] | None:
-        root = f"g:{snapshot['stage']}:root"
-        attrs = [node for node in snapshot["nodes"] if node.get("graph_id") == root
-                 and node.get("op") == "get_attr" and node.get("target") == scope]
-        if len(attrs) != 1:
-            return None
-        wrappers = [node for node in snapshot["nodes"] if node.get("graph_id") == root
-                    and node.get("target") == "wrap_with_set_grad_enabled"
-                    and isinstance(node.get("args"), list) and len(node["args"]) >= 2
-                    and node["args"][0] is False and isinstance(node["args"][1], dict)
-                    and node["args"][1].get("node_id") == attrs[0]["id"]]
-        if len(wrappers) != 1:
-            return None
-        attr_results = attrs[0].get("results") or []
-        if (len(attr_results) != 1
-                or wrappers[0]["args"][1].get("value_id") != attr_results[0].get("id")):
-            return None
-        return wrappers[0]
+        from m2m.capture.region_lineage import snapshot_caller
+
+        call = snapshot_caller(snapshot, scope)
+        return call[0] if call is not None else None
 
     mapped: dict[str, set[str]] = {}
     reverse: dict[str, set[str]] = {}
@@ -2445,7 +2502,12 @@ def _unchanged_nested_graph_relations(source: dict[str, Any], dest: dict[str, An
 
     def same_caller(source_wrapper: dict[str, Any], dest_wrapper: dict[str, Any],
                     src_body: list[dict[str, Any]], dst_body: list[dict[str, Any]]) -> bool:
-        source_args, dest_args = source_wrapper["args"][2:], dest_wrapper["args"][2:]
+        if source_wrapper["target"] != dest_wrapper["target"]:
+            return False
+        offset = 5 if source_wrapper["target"] == "wrap_with_autocast" else 2
+        if source_wrapper["args"][:offset - 1] != dest_wrapper["args"][:offset - 1]:
+            return False
+        source_args, dest_args = source_wrapper["args"][offset:], dest_wrapper["args"][offset:]
         source_inputs = [node for node in src_body if node.get("op") == "placeholder"]
         dest_inputs = [node for node in dst_body if node.get("op") == "placeholder"]
         if (len(source_args) != len(dest_args) or len(source_args) != len(source_inputs)
@@ -2512,10 +2574,31 @@ def _unchanged_nested_graph_relations(source: dict[str, Any], dest: dict[str, An
     return inferred
 
 
+def _region_diagnostic(source, dest, reason):
+    return {"from_stage": (source or {}).get("stage"), "to_stage": (dest or {}).get("stage"),
+            "status": "diagnostic", "relations": [], "reason": reason,
+            "unresolved_source_ids": [node["id"] for node in (source or {}).get("nodes", [])
+                                      if node["op"] in {"call_function", "call_module", "call_method"}],
+            "unresolved_destination_ids": [node["id"] for node in (dest or {}).get("nodes", [])
+                                           if node["op"] in {"call_function", "call_module", "call_method"}]}
+
+
 def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -> dict[str, Any]:
+    try:
+        return _graph_relation(source, dest)
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
+        return _region_diagnostic(source, dest, f"invalid provenance structure: {type(error).__name__}")
+
+
+def _graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -> dict[str, Any]:
     if not source or not dest or source.get("status") != "complete" or dest.get("status") != "complete":
         return {"from_stage": (source or {}).get("stage"), "to_stage": (dest or {}).get("stage"),
                 "status": "diagnostic", "relations": [], "reason": "graph unavailable"}
+    from m2m.capture.region_lineage import certificate_policy
+
+    protected_source, protected_dest, certificate_error = certificate_policy(source, dest)
+    if certificate_error:
+        return _region_diagnostic(source, dest, certificate_error)
     src_ids = {n["id"] for n in source["nodes"]}
     src_nodes = {n["id"]: n for n in source["nodes"]}
     def scope(node: dict[str, Any], stage: str) -> str:
@@ -2529,7 +2612,8 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
         # enclosing HOP's actual operands have been bound to its placeholders.
         # Otherwise a changed caller could inherit a stale inner-node tag.
         direct = [identity for identity in origins
-                  if scope(src_nodes[identity], source["stage"]) == scope(node, dest["stage"])]
+                  if scope(src_nodes[identity], source["stage"]) == scope(node, dest["stage"])
+                  and identity not in protected_source and node["id"] not in protected_dest]
         inlined = [identity for identity in origins if identity not in direct]
         if inlined:
             pending_inlined.append((node, inlined))
@@ -2551,7 +2635,10 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
             if proved is not None:
                 consumed.add(node["id"])
                 relations.append(proved)
-    nested = _unchanged_nested_graph_relations(source, dest, relations)
+    from m2m.capture.region_lineage import relations as region_relations
+
+    nested = region_relations(source, dest, relations)
+    nested += _unchanged_nested_graph_relations(source, dest, [*relations, *nested])
     relations.extend(nested)
     consumed.update(identity for relation in nested for identity in relation["source_ids"])
     unknown = [identity for identity in unknown if identity not in {
@@ -2560,7 +2647,8 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
     relations.extend(bindings)
     for node, identities in pending_inlined:
         accepted = [identity for identity in identities
-                    if scope(src_nodes[identity], source["stage"]) in verified_scopes]
+                    if scope(src_nodes[identity], source["stage"]) in verified_scopes
+                    and identity not in protected_source and node["id"] not in protected_dest]
         if accepted:
             consumed.update(accepted)
             relations.append({"source_ids": accepted, "destination_ids": [node["id"]],
