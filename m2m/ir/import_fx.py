@@ -9,7 +9,8 @@ Invariants:
     - Decomposed ops get ``compgen.region_id`` attributes for Recipe IR targeting.
     - Unsupported ops fall back to ``func.call`` (flagged as opaque).
     - Registered kernels (``kernel_registry.KERNEL_REGISTRY``) become a ``func.call`` tagged
-      ``prov.kernel`` (a black box, NOT opaque); their declarations follow ``@forward``.
+      ``prov.kernel`` (a black box, NOT opaque); their declarations are after ``@forward``,
+      ensuring it remains the first function.
     - The output module passes the xDSL verifier.
 """
 

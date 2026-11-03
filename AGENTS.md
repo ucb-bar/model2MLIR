@@ -125,13 +125,13 @@ func.func private @triton_exp__fused_mlp2(...) -> tensor<4x32xf32> attributes {p
 - To add a kernel: append `KernelSpec("ns::name", description=...)` to `_BUILTIN_KERNELS`.
   Unregistered Triton ops still lower as opaque (with a diagnostic pointing at the registry).
 - The consumer is merlin: `src/merlin/llvmlower/kernel_table.py` maps the same
-  `prov.kernel` names to CPU kernel bodies (LLVM IR / llvm-dialect MLIR under
-  `src/merlin/kernels/triton_llvmir/`) and links one into the model's LLVM IR. A kernel
-  registered here needs a matching merlin entry before its captures can run; merlin's
+  `prov.kernel` names to the Triton kernel exported as llvm-dialect MLIR (under
+  `src/merlin/kernels/triton_llvmir/`) and links it into the model's MLIR before lowering. A
+  kernel registered here needs a matching merlin entry before its captures can run; merlin's
   `test_table_keys_match_m2m_registry` fails until it has one.
 - Not yet supported: in-place kernels (`mutates_args`, which export wraps in
   `auto_functionalized_v2`). A registered one is an import **error**, never silently wrong IR.
-- Status, the end-to-end MLP example and the full limitations list:
+- How it is implemented, its limitations, and how to use it (the end-to-end MLP example):
   `docs/guides/triton_kernel_integration.md`.
 
 ## Layout

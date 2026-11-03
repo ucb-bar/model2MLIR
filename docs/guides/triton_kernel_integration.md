@@ -1,48 +1,101 @@
 # Triton kernel integration (model2MLIR side)
 
-> **Work in progress.** One registered kernel (`triton_exp::fused_mlp2`) on one toy model is captured,
-> consumed by merlin and run on spike rv64gcv, matching PyTorch. Kernels that write into their
-> arguments are not supported yet — see [Limitations](#limitations).
+A model can call a hand-written kernel, such as a `@torch.library.triton_op`, that model2MLIR should
+not decompose. model2MLIR captures each call to a **registered** kernel as a typed `func.call` to a
+body-less declaration tagged with the kernel's name. A downstream compiler later supplies the code.
 
-# THIS DOC IS TEMP AND ALSO SERVES A STATUS WILL BE UPDATED LATER
+This page covers the capture side. The other half, which links a body into the model, compiles it for
+rv64gcv and runs it on spike, is merlin's
+[Triton kernel integration guide](https://github.com/ucb-bar/merlin/blob/trition-op-integration/docs/guides/triton_kernel_integration.md)
+(`docs/guides/triton_kernel_integration.md` on merlin's `trition-op-integration` branch).
+
+- [Part 1: Summary](#part-1-summary): [what it does](#what-it-does), [how it is implemented](#how-it-is-implemented), [limitations](#limitations)
+- [Part 2: How to use it](#part-2-how-to-use-it): [setup](#1-setup), [capture](#2-capture-the-example), [read the IR](#3-read-the-emitted-ir), [register a kernel](#4-register-a-new-kernel), [run downstream](#5-run-it-downstream-in-merlin), [tests](#6-tests)
+
+---
+
+# Part 1: Summary
 
 ## What it does
 
-A model can call a hand-written kernel, e.g. a `@torch.library.triton_op`. `torch.export` keeps each
-such call as one custom-op node. model2MLIR now keeps a **global kernel table**, `KERNEL_REGISTRY` in
-`m2m/ir/kernel_registry.py` (the sibling of `DECOMPOSITION_TABLE`). A custom op listed there is
-emitted as a **black-box kernel call** — a typed `func.call` to a private declaration — instead of an
-opaque op:
+`KERNEL_REGISTRY` in `m2m/ir/kernel_registry.py` is a global table of custom ops that are kernels. It
+sits alongside `DECOMPOSITION_TABLE`. When `torch.export` produces a node whose op is in the table, the
+FX importer emits **one black-box call** for it instead of an opaque op:
 
-- tensor inputs become SSA operands, in the op schema's argument order;
-- every output becomes an SSA result;
-- non-tensor arguments (scales, block sizes, omitted defaults) are recorded as an attribute;
-- the call is tagged with a stable identity, `prov.kernel = "<ns>::<name>"`.
+- tensor inputs become SSA operands, in the op **schema's** argument order;
+- every output becomes an SSA result, in return order;
+- non-tensor arguments (scales, block sizes, omitted defaults) are recorded by name in an attribute;
+- the call and its private declaration are tagged `prov.kernel = "<ns>::<name>"`.
 
-model2MLIR never looks inside the kernel. The declaration is a placeholder that a downstream compiler
-binds to a real implementation; merlin does this by looking up `prov.kernel` in its own kernel table
-and linking a CPU body into the model's LLVM IR. Triton is only how the kernel is authored — capture
-needs no GPU, and the kernel is never executed during export.
+model2MLIR never looks inside the kernel. Capture needs no GPU, and the kernel never runs during
+export. Triton is only how the kernel is written; the consumer compiles it for its own target.
 
-## End-to-end: the MLP toy example
+A registered kernel call is **not** opaque: `opaque_report` skips it, `kernel_report` counts it, and
+`workloads/capture.py` prints `kernels=N`. Kernel-free models are unaffected. Their captures are
+byte-identical to a capture without the registry.
 
-Two workloads, the same 3-layer MLP (16 → 32 → 32 → 8) with the same seed, weights and input:
+### The IR contract
 
-| workload | what |
-|---|---|
-| `workloads/mlp_basic/` | plain PyTorch: `fc1 → relu → fc2 → relu → fc3` |
-| `workloads/mlp_basic_triton/` | fc1+relu+fc2+relu is one Triton op, `torch.ops.triton_exp.fused_mlp2` (`kernels.py`); fc3 is plain PyTorch |
+This is everything a consumer gets for a kernel:
 
-### 1. Setup
+| attribute | on | meaning |
+|---|---|---|
+| `prov.kernel` | call + declaration | identity, `"<ns>::<name>"`. The callee symbol is `<ns>__<name>`, with a `_<n>` suffix for each new shape, so match on this attribute, never on the symbol. |
+| `prov.kernel_operands` | call | schema argument name of each SSA operand, in order |
+| `prov.kernel_args` | call | non-tensor arguments by name (an absent optional is `unit`); **omitted** when there are none |
+
+Kernel calls also get the provenance tags every op gets: `prov.op` and `prov.family = "kernel"`,
+`prov.region_id`, `prov.aten` and `prov.orig_dtype`. Declarations are placed after `@forward`, so the
+entry function is always the first `func.func`.
+
+model2MLIR deliberately records nothing about where a kernel's code lives or what language it is in.
+That belongs to the consumer's table. An early draft also emitted `prov.kernel_backend`,
+`prov.triton_jit` and `prov.kernel_source`; merlin read none of them, so they were removed.
+
+## How it is implemented
+
+| piece | file | what it does |
+|---|---|---|
+| Registry | `m2m/ir/kernel_registry.py` | `KernelSpec(qualname, description)` entries in `_BUILTIN_KERNELS`. A qualname matches every overload of `torch.ops.<ns>.<name>`. `emit_kernel_call` builds the call from the op schema, and `kernel_decl` builds the private declaration. |
+| Importer | `m2m/ir/import_fx.py` | `lookup_kernel` runs **before** the decomposition table and the result-type check, because a kernel may return a tuple. `_lower_kernel` takes result types from `meta["val"]`, gives one symbol to each (kernel, operand types, result types) combination, and resolves `getitem(node, i)` to result `i`. Declarations are collected separately and appended after `@forward`. A kernel inside a `while_loop` body keeps its `prov.kernel*` attributes. |
+| Coverage | `m2m/coverage.py` | `opaque_report` excludes kernel calls. `kernel_report(text)` counts them by `prov.kernel`. `kernel` is in `CANONICAL_FAMILIES`. Both reports parse the module rather than matching text. |
+| Backend choice | `m2m/api.py`, `m2m/capture/torch_export.py`, `m2m/capture/torch_mlir_bridge.py` | torch-mlir cannot legalize custom ops, so `backend="auto"` goes straight to the FX importer when the graph contains a registered kernel. The unsupported-op scan treats registered kernels as supported. |
+| Transforms | `m2m/transforms/` | `split_by_section` now takes the first function **with a body** as the entry point and re-declares each section's callees. Before, it picked a declaration and returned no sections. `fuse_int2_unpack` no longer matches kernel calls by callee substring. |
+| Workloads | `workloads/mlp_basic/`, `workloads/mlp_basic_triton/` | The same 3-layer MLP (16 → 32 → 32 → 8, same seed, weights and input), first in plain PyTorch, then with fc1+relu+fc2+relu as one Triton op, `torch.ops.triton_exp.fused_mlp2` (`kernels.py`). |
+
+Errors are explicit. A registered kernel that cannot be represented faithfully, such as one that
+mutates an argument or has an unresolved tensor operand, raises `KernelLoweringError`, and the importer
+reports an error diagnostic instead of emitting wrong IR. An **unregistered** Triton op still lowers
+through the generic opaque path, with a diagnostic that points at the registry.
+
+## Limitations
+
+| gap | today | what it needs |
+|---|---|---|
+| Kernels that write into their arguments (`mutates_args`, such as an `out=` buffer) | `torch.export` wraps them in `auto_functionalized_v2`. A registered one is an **import error**. An unregistered one takes the generic opaque path, which loses its operands without flagging it. | Rebuild the schema arguments, taking the mutated buffer from `_all_bases[...]`. Emit destination-passing style: the buffer's initial value becomes an operand, and the results are the op's returns plus one new value per mutated argument, tagged `prov.kernel_mutated` / `prov.kernel_tied`. Remap `getitem`. Refuse view arguments (`_<arg>_size` / `_stride`). Probe the `meta["val"]` slot layout for ops that both return and mutate first. |
+| Unregistered custom ops | Generic opaque path: non-tensor arguments are dropped and only the first output is kept | Register them, or extend the same binding to the opaque path |
+| One symbol per shape only | Two calls with the same shapes but different `prov.kernel_args` share a symbol | Key symbols by arguments too, once a consumer reads `kernel_args` |
+| Registration | One global built-in table, with no per-workload registration | By design for now |
+| Dynamic shapes | Dimensions become `-1` like any op's, but no consumer handles a dynamic kernel yet | A consumer that does |
+
+The consumer has its own limits on what it can link: no `kernel_args`, a body per shape, and only
+llvm-dialect bodies. They are listed in
+[merlin's guide](https://github.com/ucb-bar/merlin/blob/trition-op-integration/docs/guides/triton_kernel_integration.md#limitations).
+
+---
+
+# Part 2: How to use it
+
+## 1. Setup
 
 ```bash
 uv venv && uv pip install -e .
-uv pip install triton        # only to define/register the @triton_op; no GPU needed
+uv pip install triton        # only to define and register the @triton_op; no GPU needed
 ```
 
-Both workloads use the repo's own venv (`capture.toml`: `venv = "../../.venv"`).
+Both MLP workloads use the repo's own venv (`capture.toml`: `venv = "../../.venv"`).
 
-### 2. Capture
+## 2. Capture the example
 
 ```bash
 python workloads/capture.py mlp_basic_triton --formats fp32
@@ -54,10 +107,10 @@ OK mlp_basic_triton fp32  opaque=0    kernels=1   linalg=5     families=4   -> w
 OK mlp_basic      fp32  opaque=0    kernels=0   linalg=19    families=4   -> workloads/mlp_basic/mlp_basic.mlir
 ```
 
-Each run writes `workloads/<name>/<name>.mlir` plus `<name>.safetensors` and its `.manifest.json` (the
-weights, keyed by func-argument index). These are gitignored build outputs.
+Each run writes `workloads/<name>/<name>.mlir`, plus `<name>.safetensors` and its `.manifest.json`,
+which hold the weights keyed by function-argument index. These are gitignored build outputs.
 
-The same from Python:
+The same capture from Python:
 
 ```python
 import sys; sys.path.insert(0, "workloads/mlp_basic_triton")
@@ -67,12 +120,12 @@ from m2m.coverage import kernel_report, opaque_report
 
 model, inputs = get_model_and_inputs()
 r = m2m.convert(model, inputs)        # backend="auto"
-r.path_taken                          # "fx_importer" -- torch-mlir is skipped when a kernel is present
+r.path_taken                          # "fx_importer": torch-mlir is skipped when a kernel is present
 opaque_report(r.mlir_text)            # {}
 kernel_report(r.mlir_text)            # {"triton_exp::fused_mlp2": 1}
 ```
 
-### 3. The emitted IR
+## 3. Read the emitted IR
 
 `workloads/mlp_basic_triton/mlp_basic_triton.mlir`:
 
@@ -92,89 +145,47 @@ builtin.module attributes {prov.weights_file = ".../mlp_basic_triton.safetensors
 }
 ```
 
-Compared with `mlp_basic.mlir`: the same `@forward` signature (7 arguments in the same order), the
-same weights manifest, and fc3 op-for-op identical — only fc1..relu2 is replaced by the one call.
+Compared with `mlp_basic.mlir`, the `@forward` signature is the same (7 arguments in the same order),
+the weights manifest is the same, and fc3 is identical op for op. Only fc1..relu2 is replaced, by the
+one call.
 
-**The contract a consumer reads** (nothing else is emitted for a kernel):
+## 4. Register a new kernel
 
-| attribute | on | meaning |
+1. Define the op as usual, for example `@triton_op("my_ns::my_kernel", mutates_args={})`. It must
+   return its outputs rather than write into an argument (see [Limitations](#limitations)).
+2. Append a `KernelSpec` to `_BUILTIN_KERNELS` in `m2m/ir/kernel_registry.py`:
+
+   ```python
+   KernelSpec("my_ns::my_kernel", description="what it computes, which workload uses it"),
+   ```
+
+3. Capture a model that calls it and check `kernel_report(r.mlir_text)` and `opaque_report`.
+4. Add the matching entry and body on the consumer side. In merlin, that is
+   `src/merlin/llvmlower/kernel_table.py`, plus a body under `src/merlin/kernels/triton_llvmir/`.
+   merlin's `test_table_keys_match_m2m_registry` fails until the two tables agree.
+
+## 5. Run it downstream in merlin
+
+merlin consumes this IR as is. Its kernel table maps `triton_exp::fused_mlp2` to the Triton kernel's
+llvm-dialect MLIR, links that into the model **before** MLIR lowering, and runs the result on spike
+rv64gcv. Measured against PyTorch:
+
+| capture | spike retired instructions | max abs error |
 |---|---|---|
-| `prov.kernel` | call + declaration | identity, `"<ns>::<name>"`. The callee symbol is `<ns>__<name>`, with a `_<n>` suffix per new shape, so match on this attribute, never the symbol. |
-| `prov.kernel_operands` | call | schema argument name of each SSA operand, in order |
-| `prov.kernel_args` | call | non-tensor arguments by name (an absent optional is `unit`); **omitted** when there are none |
+| `mlp_basic_triton` (kernel linked) | 15,121 | 3.0e-8 |
+| `mlp_basic` (no kernel) | 16,156 | 4.5e-8 |
 
-Plus the usual provenance tags every op gets (`prov.op` / `prov.family = "kernel"`, `prov.region_id`,
-`prov.aten`, `prov.orig_dtype`). Declarations are placed after `@forward`, so the entry function is
-always the first `func.func`.
+merlin tracks copies of both captures under `merlin/tests/data/mlp_bundles/`, and
+`merlin/tests/infra/test_mlp_bundles_fresh.py` re-captures them from this checkout. To regenerate
+merlin's copies and run them there, follow
+[merlin's guide](https://github.com/ucb-bar/merlin/blob/trition-op-integration/docs/guides/triton_kernel_integration.md#part-2-how-to-use-it).
 
-### 4. Downstream (merlin)
-
-merlin consumes this IR as-is: its kernel table maps `triton_exp::fused_mlp2` to CPU bodies, links one
-into the model's LLVM IR and runs it on spike rv64gcv. Measured there against PyTorch: max abs error
-3.0e-8 with the kernel (`llvm_mlir` body, 15,558 retired instructions) and 4.5e-8 for `mlp_basic`
-(16,156). In merlin, `build_tools/scripts/run_mlp_kernel_spike.py --form llvm_mlir` runs it; see
-merlin's `docs/guides/triton_kernel_integration.md`.
-
-### 5. Tests
+## 6. Tests
 
 ```bash
 python -m pytest tests/test_kernels.py
 ```
 
-13 tests. Most register plain CPU `torch.library.custom_op`s with fake implementations as kernels, so
-they need neither Triton nor a GPU; `test_mlp_basic_triton_mvp` captures the real workload and needs
-the `triton` package.
-
-### Adding a kernel
-
-Append a `KernelSpec` to `_BUILTIN_KERNELS` in `m2m/ir/kernel_registry.py`:
-
-```python
-KernelSpec("my_ns::my_kernel", description="what it computes, which workload uses it"),
-```
-
-The qualname matches every overload of `torch.ops.my_ns.my_kernel`. A consumer needs a matching
-entry (merlin: `src/merlin/llvmlower/kernel_table.py`; its `test_table_keys_match_m2m_registry` fails
-until it has one). An unregistered Triton op still lowers as an opaque call, with a diagnostic that
-points at the registry.
-
-## Changes made
-
-Branch `feat/triton-integration` on `main`, pushed to ucb-bar/model2MLIR. The code changes are these 4 commits (plus this page):
-
-| commit | change |
-|---|---|
-| `feat(ir): lower registered custom kernels to black-box func.calls` | `m2m/ir/kernel_registry.py` (new); FXImporter branch in `m2m/ir/import_fx.py` (before the decomposition table; declarations after `@forward`; `kernel` family; kernel identity kept inside `while_loop` bodies; diagnostic for unregistered Triton ops; import error for a registered kernel that mutates its arguments); `m2m/coverage.py` (`opaque_report` excludes kernel calls, new `kernel_report`, `kernel` in `CANONICAL_FAMILIES`); `m2m/capture/torch_export.py` (registered kernels count as supported in the unsupported-op loop); `m2m/api.py` (`backend="auto"` skips torch-mlir when a kernel is present); `m2m/capture/torch_mlir_bridge.py` (kernel-call count in diagnostics); `m2m/ir/__init__.py` exports |
-| `fix(transforms): keep kernel calls intact through sections and int2 fusion` | `split_by_section` took a body-less declaration as the entry point whenever a module had opaque or kernel calls, and returned no sections — it now picks the first function with a body and re-declares each section's callees; `fuse_int2_unpack` no longer matches kernel calls by callee substring |
-| `feat(workloads): add mlp_basic and mlp_basic_triton kernel workloads` | the two workloads; `workloads/capture.py` prints `kernels=N` |
-| `docs: document the kernel registry and its IR contract` | `AGENTS.md` (custom-kernels section), `docs/OP_TAXONOMY.md` (attributes, `kernel` family), `workloads/README.md` |
-
-How the IR contract was chosen: an earlier draft also emitted `prov.kernel_backend`,
-`prov.triton_jit` and `prov.kernel_source`, and an empty `prov.kernel_args = {}`. merlin read none of
-them — where a kernel's implementation lives belongs to the consumer's table — so they were removed.
-The contract is now exactly what merlin reads.
-
-## Limitations
-
-| gap | today | plan |
-|---|---|---|
-| Kernels that write into their arguments (`mutates_args`, e.g. an `out=` buffer) | `torch.export` wraps them in `auto_functionalized_v2(op, **kwargs, _<arg>_base_index, _all_bases=[...])`; a registered one is an **import error**; an unregistered one goes through the generic opaque path, which loses its operands (pre-existing behavior, not yet flagged) | rebuild the schema arguments (mutated buffer from `_all_bases[...]`); emit destination-passing style — the buffer's initial value as an operand, results = the op's returns + one new value per mutated argument, tagged `prov.kernel_mutated` / `prov.kernel_tied`; remap `getitem`; refuse view arguments (`_<arg>_size` / `_stride`). Probe the `meta["val"]` slot layout for ops that both return and mutate first |
-| Unregistered custom ops | still the generic opaque path: non-tensor args dropped, only the first output kept | register them, or extend the same binding to the opaque path |
-| Symbols per shape only | two calls with the same shapes but different `prov.kernel_args` share a symbol | key symbols by args too, once a consumer passes `kernel_args` |
-| Registration | one global built-in table; no per-workload registration | by design for now |
-| Dynamic shapes | dims become `-1` like any op; no consumer handles a dynamic kernel yet | — |
-
-## Current state
-
-- **Branch.** `feat/triton-integration` on ucb-bar/model2MLIR (also on the `gram117anderson-117` fork),
-  based on `main` `905d2c9`. No PR is open.
-- **Tests.** `tests/test_kernels.py` 13 passed; full suite 731 passed, 304 skipped. Each of the 4
-  commits passes the kernel tests on its own.
-- **No regression for kernel-free models.** Captures of `mlp_basic`, `tiny_llama` and `whisper_tiny` are
-  byte-identical to `main`.
-- **Cross-repo checks.** merlin's `kernel_link.find_kernel_uses` and `_check_use` accept the emitted IR
-  for both of its body forms; merlin's `test_mlp_bundles_fresh.py` re-captures both workloads from this
-  checkout and requires its tracked copies to match byte for byte.
-- **Unrelated local work** (a conv `padding="valid"` test, a local pi05 setup, `efficient_wam` /
-  `small_llama` configs) is kept apart on the local branch `wip/pi05-local-workloads`.
-- **Next.** In-place kernels (the plan above), then per-call `prov.kernel_args` once merlin can pass them.
+There are 13 tests. Most register plain CPU `torch.library.custom_op`s with fake implementations as
+kernels, so they need neither Triton nor a GPU. `test_mlp_basic_triton_mvp` captures the real
+workload and needs the `triton` package.
