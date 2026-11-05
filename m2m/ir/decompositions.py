@@ -2336,6 +2336,49 @@ def _im2col_max_elems() -> int:
     return _IM2COL_MAX_ELEMS_DEFAULT
 
 
+def _identity_signed_i8_storage(value):
+    """Recover storage only from an exact elementwise signed i8 -> i32 extension.
+
+    No range assumption about an arbitrary i32 tensor licenses narrowing it. The
+    original all-parallel identity body must consist solely of extsi and yield.
+    """
+    from xdsl.dialects.arith import ExtSIOp
+    from xdsl.dialects.builtin import IntegerType
+    from xdsl.dialects.linalg import GenericOp, IteratorType, YieldOp
+    from xdsl.ir.affine import AffineMap
+
+    owner = value.owner
+    if not isinstance(owner, GenericOp) or len(owner.inputs) != 1 or len(owner.outputs) != 1:
+        return None
+    source = owner.inputs[0]
+    if not isinstance(source.type, TensorType) or not isinstance(value.type, TensorType):
+        return None
+    if source.type.get_shape() != value.type.get_shape():
+        return None
+    narrow, wide = source.type.element_type, value.type.element_type
+    if not (isinstance(narrow, IntegerType) and narrow.width.data == 8
+            and isinstance(wide, IntegerType) and wide.width.data == 32):
+        return None
+    rank = len(source.type.get_shape())
+    identity = AffineMap.identity(rank)
+    if len(owner.indexing_maps) != 2 or any(attr.data != identity for attr in owner.indexing_maps):
+        return None
+    if len(owner.iterator_types) != rank or any(it.data != IteratorType.PARALLEL for it in owner.iterator_types):
+        return None
+    if len(owner.body.blocks) != 1 or len(owner.results) != 1 or owner.results[0] is not value:
+        return None
+    block = owner.body.block
+    body = tuple(block.ops)
+    if len(block.args) != 2 or len(body) != 2:
+        return None
+    extend, end = body
+    if (not isinstance(extend, ExtSIOp) or extend.input is not block.args[0]
+            or extend.result.type != wide or not isinstance(end, YieldOp)
+            or tuple(end.arguments) != (extend.result,)):
+        return None
+    return source
+
+
 def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, padding,
                         dilation, groups, elem):
     """N-D-spatial conv as im2col + ``linalg.matmul`` (or ``linalg.batch_matmul`` per group).
@@ -2356,11 +2399,14 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
 
     Returns ``(ops, result_ssa)`` or ``None`` (caller falls back).
     """
-    from xdsl.dialects.arith import AddfOp, MulfOp
-    from xdsl.dialects.builtin import AffineMapAttr, DenseArrayBase
+    from xdsl.dialects.arith import AddfOp, AddiOp, ExtSIOp, MulfOp, MuliOp
+    from xdsl.dialects.builtin import AffineMapAttr, DenseArrayBase, IntegerType
     from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, TransposeOp, YieldOp
     from xdsl.ir import Block, Region
     from xdsl.ir.affine import AffineExpr, AffineMap
+
+    multiply = MuliOp if isinstance(elem, IntegerType) else MulfOp
+    add = AddiOp if isinstance(elem, IntegerType) else AddfOp
 
     n_in, c_in, h_in, w_in = in_shape
     f_out, c_per_g, kh, kw = w_shape
@@ -2389,10 +2435,19 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
     if k_g * m_dim * g > _im2col_max_elems():
         return None
 
+    # Keep accumulator/output arithmetic unchanged while gathering the exact i8
+    # storage underlying a pair of identity signed extensions. This is a source
+    # portability normalization, not a value-dependent narrowing of i32 inputs.
+    storage_elem = elem
+    input_storage, weight_storage = _identity_signed_i8_storage(inp), _identity_signed_i8_storage(w)
+    if input_storage is not None and weight_storage is not None:
+        inp, w = input_storage, weight_storage
+        storage_elem = inp.type.element_type
+
     ops: list[Operation] = []
     cur = inp
     if ph or pw:
-        padded = _zero_pad_ops(inp, elem, list(in_shape), [(0, 0), (0, 0), (ph, ph), (pw, pw)])
+        padded = _zero_pad_ops(inp, storage_elem, list(in_shape), [(0, 0), (0, 0), (ph, ph), (pw, pw)])
         if padded is None:
             return None
         ops += padded[0]
@@ -2403,9 +2458,9 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
 
     def _gather(col_shape, in_map_exprs, n_dims):
         """One all-parallel linalg.generic copying padded input into the column tensor."""
-        col_type = TensorType(elem, col_shape)
+        col_type = TensorType(storage_elem, col_shape)
         empty = _make_empty(col_type)
-        blk = Block(arg_types=[elem, elem])
+        blk = Block(arg_types=[storage_elem, storage_elem])
         blk.add_op(YieldOp(blk.args[0]))
         gen = GenericOp(
             inputs=[cur],
@@ -2423,14 +2478,35 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
         gops, col = _gather([c_in, kh, kw, n_out, h_out, w_out],
                             [D(3), D(0), D(4) * sh + D(1) * dh, D(5) * sw + D(2) * dw], 6)
         ops += gops
-        rs = _emit_reshape(col, [k_g, m_dim], elem)
-        wf = _emit_reshape(w, [f_out, k_g], elem)
+        rs = _emit_reshape(col, [k_g, m_dim], storage_elem)
+        wf = _emit_reshape(w, [f_out, k_g], storage_elem)
         if rs is None or wf is None:
             return None
         ops += rs[0] + wf[0]
         mm_type = TensorType(elem, [f_out, m_dim])
         z_ops, z_acc = _zero_acc(mm_type, elem)
-        mm = MatmulOp(inputs=[wf[1], rs[1]], outputs=[z_acc], res=[mm_type])
+        if isinstance(elem, IntegerType):
+            # linalg.matmul's implicit scalar body is floating point in this
+            # xDSL version. Preserve the integral source with an explicit body.
+            blk = Block(arg_types=[storage_elem, storage_elem, elem])
+            lhs, rhs = blk.args[0], blk.args[1]
+            if storage_elem != elem:
+                left, right = ExtSIOp(lhs, elem), ExtSIOp(rhs, elem)
+                blk.add_ops([left, right])
+                lhs, rhs = left.result, right.result
+            prod = multiply(lhs, rhs)
+            acc = add(blk.args[2], prod.results[0])
+            blk.add_ops([prod, acc, YieldOp(acc.results[0])])
+            mm = GenericOp(
+                inputs=[wf[1], rs[1]], outputs=[z_acc], body=Region(blk),
+                indexing_maps=[AffineMapAttr(AffineMap(3, 0, (D(0), D(2)))),
+                               AffineMapAttr(AffineMap(3, 0, (D(2), D(1)))),
+                               AffineMapAttr(AffineMap(3, 0, (D(0), D(1))))],
+                iterator_types=[par, par, IteratorTypeAttr(IteratorType.REDUCTION)],
+                result_types=[mm_type],
+            )
+        else:
+            mm = MatmulOp(inputs=[wf[1], rs[1]], outputs=[z_acc], res=[mm_type])
         ops += [*z_ops, mm]
         prod = mm.results[0]
         prod_shape = [f_out, m_dim]
@@ -2439,8 +2515,8 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
         gops, col = _gather([g, cg, kh, kw, n_out, h_out, w_out],
                             [D(4), D(0) * cg + D(1), D(5) * sh + D(2) * dh, D(6) * sw + D(3) * dw], 7)
         ops += gops
-        rs = _emit_reshape(col, [g, k_g, m_dim], elem)
-        wf = _emit_reshape(w, [g, fg, k_g], elem)
+        rs = _emit_reshape(col, [g, k_g, m_dim], storage_elem)
+        wf = _emit_reshape(w, [g, fg, k_g], storage_elem)
         if rs is None or wf is None:
             return None
         ops += rs[0] + wf[0]
@@ -2453,9 +2529,14 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
         mm_type = TensorType(elem, [g, fg, m_dim])
         z_ops, z_acc = _zero_acc(mm_type, elem)
         Db = AffineExpr.dimension  # dims: g=0, fg=1, m=2, k=3
-        bblk = Block(arg_types=[elem, elem, elem])
-        bprod = MulfOp(bblk.args[0], bblk.args[1])
-        bacc = AddfOp(bblk.args[2], bprod.results[0])
+        bblk = Block(arg_types=[storage_elem, storage_elem, elem])
+        lhs, rhs = bblk.args[0], bblk.args[1]
+        if storage_elem != elem:
+            left, right = ExtSIOp(lhs, elem), ExtSIOp(rhs, elem)
+            bblk.add_ops([left, right])
+            lhs, rhs = left.result, right.result
+        bprod = multiply(lhs, rhs)
+        bacc = add(bblk.args[2], bprod.results[0])
         bblk.add_op(bprod)
         bblk.add_op(bacc)
         bblk.add_op(YieldOp(bacc.results[0]))
@@ -2501,10 +2582,8 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
         res = tr.results[0]
 
     if bias is not None and isinstance(bias.type, TensorType):
-        from xdsl.dialects.arith import AddfOp
-
         bias_map = AffineMap(4, 0, (AffineExpr.dimension(1),))
-        em = _elementwise([res, bias], out_type, _bin_build(AddfOp),
+        em = _elementwise([res, bias], out_type, _bin_build(add),
                           input_maps=[_broadcast_map([n_out, f_out, h_out, w_out],
                                                      [n_out, f_out, h_out, w_out]), bias_map],
                           promote=True)
@@ -2563,8 +2642,8 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
     if _t_elem(operands[1]) != elem:
         return None
 
-    from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp
-    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr
+    from xdsl.dialects.arith import AddfOp, AddiOp, ConstantOp, MulfOp, MuliOp
+    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr, IntegerAttr, IntegerType
     from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
     from xdsl.dialects.tensor import SplatOp
     from xdsl.ir import Block, Region
@@ -2582,11 +2661,14 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
             return None
         pad_ops, inp, _padded_shape = padded
     result_type = TensorType(elem, out_shape)
-    zero = ConstantOp(FloatAttr(0.0, elem), elem)
+    integral = isinstance(elem, IntegerType)
+    multiply = MuliOp if integral else MulfOp
+    add = AddiOp if integral else AddfOp
+    zero = ConstantOp(IntegerAttr(0, elem) if integral else FloatAttr(0.0, elem), elem)
     D = AffineExpr.dimension
     blk = Block(arg_types=[elem, elem, elem])
-    prod = MulfOp(blk.args[0], blk.args[1])
-    acc = AddfOp(blk.args[2], prod.results[0])
+    prod = multiply(blk.args[0], blk.args[1])
+    acc = add(blk.args[2], prod.results[0])
     blk.add_op(prod)
     blk.add_op(acc)
     blk.add_op(YieldOp(acc.results[0]))
@@ -2643,7 +2725,7 @@ def _try_direct_conv2d(operands, meta, in_shape, w_shape):
         bias = operands[2]
         bias_map = _AM(4, 0, (_AE.dimension(1),))
         em = _elementwise(
-            [res, bias], result_type, _bin_build(AddfOp),
+            [res, bias], result_type, _bin_build(add),
             input_maps=[_broadcast_map(out_shape, out_shape), bias_map], promote=True,
         )
         if em is not None:
@@ -7022,7 +7104,22 @@ def _make_minmax(op_cls_name: str, hint: str):
 
     def f(operands, meta, node_name):
         int_name = {"MaximumfOp": "MaxSIOp", "MinimumfOp": "MinSIOp"}.get(op_cls_name, op_cls_name)
-        build = _arith_build2(op_cls_name, int_name)
+        arithmetic = _arith_build2(op_cls_name, int_name)
+
+        def build(args, out_elem):
+            from xdsl.dialects.arith import CmpiOp, SelectOp
+            from xdsl.dialects.builtin import IntegerType
+
+            if isinstance(out_elem, IntegerType) and int_name in {"MaxSIOp", "MinSIOp"}:
+                # Keep signed integral extrema in the portable compare/select
+                # vocabulary. This is exact even at the integer endpoints and
+                # does not depend on subtraction or floating conversion.
+                predicate = "slt" if int_name == "MaxSIOp" else "sgt"
+                compare = CmpiOp(args[0], args[1], predicate)
+                selected = SelectOp(compare.result, args[1], args[0])
+                return [compare, selected], selected.result
+            return arithmetic(args, out_elem)
+
         real = _pointwise(operands[:2], meta, build, family="minmax", promote=True)
         if real is not None:
             return real
