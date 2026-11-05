@@ -166,10 +166,17 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
     for node in list(graph.nodes):
         if node.op != "call_function" or node.target not in ({linear, conv2d} | matmuls | unsupported_contractions):
             continue
-        quantized = any(
+        dequantized = [
             isinstance(arg, Node) and arg.op == "call_function" and arg.target in dequants
             for arg in node.args
-        )
+        ]
+        # A contraction is a quantized PT2E site only when both operands are dequantize
+        # operations, the rule the independent integer reference counts by. A float
+        # contraction that reads one shared dequantize (an attention product left in
+        # floating point beside a quantized sibling) is a floating-point island.
+        quantized = len(dequantized) >= 2 and all(dequantized[:2])
+        if node.target in unsupported_contractions:
+            quantized = any(dequantized)  # never let an unverified rewrite pass as float
         if quantized:
             counts["quantized_contractions_seen"] += 1
         if node.target in unsupported_contractions:

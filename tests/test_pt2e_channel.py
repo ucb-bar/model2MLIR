@@ -282,3 +282,29 @@ def test_mixed_qdq_precision_records_integer_and_float_lanes():
     assert lowered.mlir_text.count('prov.aten = "aten._int_mm.default"') >= 1
     assert "quant_ext.dequantize_per_tensor" in lowered.mlir_text
     assert "tensor<1x4xbf16>" in lowered.mlir_text
+
+
+def test_a_float_product_reading_one_shared_dequantize_stays_a_float_island():
+    """Only a contraction with two dequantized operands is a quantized site, as the reference counts."""
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+
+    class SharedDequantize(nn.Module):
+        def forward(self, x, y):
+            qx = torch.ops.quantized_decomposed.quantize_per_tensor.default(x, 0.125, 0, -128, 127, torch.int8)
+            dx = torch.ops.quantized_decomposed.dequantize_per_tensor.default(qx, 0.125, 0, -128, 127, torch.int8)
+            qy = torch.ops.quantized_decomposed.quantize_per_tensor.default(y, 0.25, 0, -128, 127, torch.int8)
+            dy = torch.ops.quantized_decomposed.dequantize_per_tensor.default(qy, 0.25, 0, -128, 127, torch.int8)
+            quantized = torch.ops.aten.matmul.default(dx, dy)  # both operands dequantized: an int8 site
+            floating = torch.ops.aten.matmul.default(dx, y * 2)  # one shared dequantize: float
+            return quantized, floating
+
+    inputs = (torch.linspace(-2, 2, 12).reshape(3, 4), torch.linspace(-1, 3, 20).reshape(4, 5))
+    model = torch.export.export(SharedDequantize().eval(), inputs).module()
+    expected = model(*inputs)
+    reference = run_pt2e_integer_reference(model, inputs, expected_contractions=1)
+    rewritten, receipt = integerize_pt2e(model, inputs)
+    assert receipt["matmul_seen"] == 2 and receipt["matmul_integerized"] == 1
+    assert receipt["quantized_contractions_seen"] == receipt["quantized_contractions_integerized"] == 1
+    assert not receipt["refusals"] and reference.matmul_count == 1
+    torch.testing.assert_close(rewritten(*inputs)[1], expected[1])
+    torch.testing.assert_close(reference.output[0], rewritten(*inputs)[0], atol=0, rtol=0)
