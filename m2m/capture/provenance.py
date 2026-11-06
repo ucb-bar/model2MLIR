@@ -182,7 +182,7 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
     lifted = {}
     with np.load(out / "extra.npz", allow_pickle=False) as extras:
         for name in sorted(extras.files):
-            if not name.startswith("c_lifted_tensor_"):
+            if not (name.startswith("c_") and "lifted_tensor_" in name):
                 continue
             value = np.asarray(extras[name])
             lifted[name] = {
@@ -193,7 +193,9 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
     manifest = json.loads((out / "weights.safetensors.manifest.json").read_text())
     expected_lifted = sorted({
         str(entry.get("name")) for entry in manifest.values()
-        if isinstance(entry, dict) and str(entry.get("name", "")).startswith("c_lifted_tensor_")
+        if isinstance(entry, dict)
+        and str(entry.get("name", "")).startswith("c_")
+        and "lifted_tensor_" in str(entry.get("name", ""))
     })
     if expected_lifted != sorted(lifted):
         raise ValueError(

@@ -95,7 +95,7 @@ def _flatten_subclass(obj: Any, prefix: str, out: dict) -> None:
 
 
 def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> None:
-    """Populate c_lifted_tensor_<i> from m2m's own export (graph order matches the importer)."""
+    """Materialize constants under their exact exported argument names."""
     try:
         from torch.export.graph_signature import InputKind
 
@@ -109,14 +109,12 @@ def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> Non
             ep = artifact.exported_program or artifact.original_exported_program
         consts = dict(getattr(ep, "constants", {}) or {})
         sd = dict(getattr(ep, "state_dict", {}) or {})
-        li = 0
         for spec in ep.graph_signature.input_specs:
             if spec.kind != InputKind.CONSTANT_TENSOR:
                 continue
             val = consts.get(str(spec.target), sd.get(str(spec.target)))
             if val is not None and hasattr(val, "detach"):
-                extra[f"c_lifted_tensor_{li}"] = _numpy_safe(val)
-            li += 1
+                extra[str(spec.arg.name)] = _numpy_safe(val)
     except Exception as exc:  # noqa: BLE001
         import traceback
         print(f"[warn] lifted-constant export failed: {exc}\n{traceback.format_exc()[-800:]}")
@@ -687,7 +685,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     return {
         "out": str(out), "n_inputs": len(inputs),
         "n_buffers": sum(1 for kk in extra if kk.startswith("buf::")),
-        "n_lifted": sum(1 for kk in extra if kk.startswith("c_lifted")),
+        "n_lifted": sum(1 for kk in extra if kk.startswith("c_") and "lifted_tensor_" in kk),
         "n_qinner": sum(1 for kk in extra if kk.startswith("qinner::")),
         "golden_shape": list(golden.shape), "linalg": r.mlir_text.count("linalg."),
         "input_order": order, "n_regions": n_regions, **session_summary,

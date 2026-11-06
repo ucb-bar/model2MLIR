@@ -163,16 +163,36 @@ def test_original_export_supplies_lifted_constants_without_second_export():
     from torch.export.graph_signature import ConstantArgument, InputKind, InputSpec
 
     exported = SimpleNamespace(
-        constants={"lifted_tensor_0": torch.tensor([True, False])},
+        constants={"lm.model.lifted_tensor_0": torch.tensor([True, False])},
         state_dict={},
         graph_signature=SimpleNamespace(input_specs=[
-            InputSpec(InputKind.CONSTANT_TENSOR, ConstantArgument("c_lifted_tensor_0", None),
-                      "lifted_tensor_0"),
+            InputSpec(InputKind.CONSTANT_TENSOR,
+                      ConstantArgument("c_lm_model_lifted_tensor_0", None),
+                      "lm.model.lifted_tensor_0"),
         ]),
     )
     extra = {}
     _lifted_constants(None, (), extra, exported_program=exported)
-    assert extra["c_lifted_tensor_0"].tolist() == [True, False]
+    assert extra["c_lm_model_lifted_tensor_0"].tolist() == [True, False]
+
+
+def test_receipt_requires_prefixed_lifted_constant_by_exact_manifest_name(tmp_path):
+    import pytest
+
+    bundle = tmp_path / "bundle"
+    write_bundle(_Tiny().eval(), (torch.randn(2, 4),), bundle, capture_regions=False)
+    manifest_path = bundle / "weights.safetensors.manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest[str(len(manifest))] = {"kind": "input", "name": "c_lm_model_lifted_tensor_0"}
+    manifest_path.write_text(json.dumps(manifest))
+    np.savez(bundle / "extra.npz", c_lm_model_lifted_tensor_0=np.array([True, False]))
+    receipt = capture_receipt(bundle)
+    assert receipt["materialized_abi"]["lifted_constants"] == ["c_lm_model_lifted_tensor_0"]
+    assert receipt["lifted_constants"]["c_lm_model_lifted_tensor_0"]["shape"] == [2]
+
+    np.savez(bundle / "extra.npz", c_lifted_tensor_0=np.array([True, False]))
+    with pytest.raises(ValueError, match="lifted-constant ABI is incomplete"):
+        capture_receipt(bundle)
 
 
 def test_traced_bundle_and_reused_conversion_bind_exact_bytes_without_recapture(tmp_path, monkeypatch):
