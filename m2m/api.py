@@ -257,9 +257,9 @@ def convert(
     # Torch-MLIR's own text remains authoritative on that separate path.
     if result.path_taken == "fx_importer" and result.module is not None:
         from xdsl.dialects.builtin import StringAttr
-        from m2m.capture.source_cpu import observed_torch_cpu
+        from m2m.capture.source_cpu import cpu_inputs_and_state, observed_torch_cpu
 
-        observed_cpu = observed_torch_cpu()
+        observed_cpu = observed_torch_cpu() if cpu_inputs_and_state(model, example_inputs) else None
         if observed_cpu is not None:
             for key, value in (
                 ("prov.torch_source_version", observed_cpu["torch_version"]),

@@ -625,6 +625,15 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     selected_quality_outputs = (tuple(value.detach().cpu().clone() for value in _tensor_outputs(g))
                                 if capture_quantization_quality else None)
     golden = g[0] if isinstance(g, (tuple, list)) else g
+    from m2m.capture.source_cpu import cpu_inputs_and_state, cpu_outputs, observed_torch_cpu
+
+    cpu_selected = cpu_inputs_and_state(runtime_mdl, inputs) and cpu_outputs(g)
+    cpu_attrs_present = (r.module is not None and
+                         any(name in r.module.attributes for name in (
+                             "prov.torch_source_version", "prov.torch_source_commit",
+                             "prov.torch_cpu_capability")))
+    if cpu_attrs_present and not cpu_selected:
+        raise ValueError("captured Torch CPU facts require CPU inputs, model state, and golden outputs")
     np.save(out / "golden.npy", _numpy_safe(golden))
 
     np.savez(out / "inputs.npz",
@@ -679,11 +688,10 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
 
     from m2m.capture.provenance import write_capture_receipt
-    from m2m.capture.source_cpu import observed_torch_cpu
 
     write_capture_receipt(
         out, source_path=source_path,
-        require_source_cpu=r.path_taken == "fx_importer" and observed_torch_cpu() is not None,
+        require_source_cpu=r.path_taken == "fx_importer" and cpu_selected and observed_torch_cpu() is not None,
     )
 
     return {

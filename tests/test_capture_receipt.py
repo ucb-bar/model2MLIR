@@ -16,7 +16,7 @@ from m2m.capture.bundle import (
     write_bundle,
 )
 from m2m.capture.provenance import _package_python_sources, _source_cpu_from_mlir, capture_receipt
-from m2m.capture.source_cpu import observed_torch_cpu
+from m2m.capture.source_cpu import cpu_inputs_and_state, cpu_outputs, observed_torch_cpu
 from m2m.capture.torch_export import _serialize_range_constraints
 
 
@@ -158,6 +158,18 @@ def test_old_mlir_does_not_acquire_current_torch_cpu_source_facts(tmp_path):
 def test_missing_torch_commit_does_not_become_source_metadata(monkeypatch):
     monkeypatch.setattr(torch.version, "git_version", None)
     assert observed_torch_cpu() is None
+
+
+def test_cpu_source_selection_refuses_non_cpu_inputs_state_and_golden():
+    model = _Tiny().eval()
+    cpu_input = torch.zeros((2, 4))
+    meta_input = torch.zeros((2, 4), device="meta")
+    assert cpu_inputs_and_state(model, (cpu_input,))
+    assert cpu_outputs(torch.zeros((2, 3)))
+    assert not cpu_inputs_and_state(model, (meta_input,))
+    assert not cpu_inputs_and_state(model.to("meta"), (cpu_input,))
+    assert not cpu_outputs(torch.zeros((2, 3), device="meta"))
+    assert not cpu_outputs((torch.zeros((1,)), torch.zeros((1,), device="meta")))
 
 
 def test_python_source_inventory_finds_new_nested_modules_and_flags_links(tmp_path):

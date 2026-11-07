@@ -79,7 +79,9 @@ source-closure or execution proof; the driver reports
 `source_closure_verified: false`.
 New FXImporter bundles also record the producing Torch wheel's git commit and
 selected CPU capability in `model.mlir` and the byte-bound capture receipt when
-the running Torch exposes both facts. The receipt writer refuses partial or
+the running Torch exposes both facts and the tensor inputs, module state, and
+golden outputs are observed on CPU. This records the selected CPU dispatch
+capability, not proof of every internal kernel's dispatch. The receipt writer refuses partial or
 conflicting MLIR facts. An older bundle with no such attributes remains
 unobserved; rerunning the receipt helper cannot assign it the current host's
 Torch commit or CPU dispatch. These observations do not establish source
