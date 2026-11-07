@@ -12,20 +12,27 @@ Capture unit: ONE forward of the whole classifier on a 224×224 image.
 
 ## Weights
 
-Real trained weights: a 300-epoch SpectFormer-Ti checkpoint at **73.14% top-1 / 91.56% top-5**
-on ImageNet, loaded with `missing=0, unexpected=0`. Override with `SPECTFORMER_CKPT`. If the
-checkpoint is unreadable the loader falls back to random init and **says so on stderr** — the
-golden then checks lowering exactness rather than accuracy.
+Real trained weights require a separate 300-epoch SpectFormer-Ti checkpoint;
+the source repository does not supply it. Set `SPECTFORMER_CKPT` to your
+checkpoint and check that the loader reports `missing=0, unexpected=0`.
+If the checkpoint is unreadable, the loader falls back to random init and
+**says so on stderr** — the golden then checks lowering, not accuracy.
 
-## Venv
-The main `model2MLIR/.venv` (torch + timm + torch-mlir).
+## Environment
+
+Merlin's chip `run.sh setup` fetches the pinned model2MLIR revision and
+builds a compatible capture environment. Set `SPECTFORMER_DIR` to a checkout
+of the upstream source and `SPECTFORMER_CKPT` to the trained file before a
+trained-model capture. The captured model and checkpoint revision should be
+recorded with the resulting bundle.
 
 ## Run
 ```bash
-cd /scratch/agustin/projects/model2MLIR
-python workloads/capture.py spectformer --formats fp32,int8
-.venv/bin/python workloads/capture_consistent.py spectformer int8 \
-    <merlin>/out/artifacts/recaptures/spectformer_int8_full
+cd /path/to/merlin
+export SPECTFORMER_DIR=/path/to/SpectFormers
+export SPECTFORMER_CKPT=/path/to/checkpoint_best.pth
+examples/kodiak/run.sh capture spectformer
+# Iris: examples/iris/run.sh capture spectformer
 ```
 Env: `SPECTFORMER_CKPT`, `M2M_SPECTFORMER_DEPTH` (truncate blocks), `M2M_SPECTFORMER_DIM`.
 
