@@ -42,8 +42,8 @@ Rules that make capture stable and scalable:
 - **Small config, no big/gated downloads.** Build the real architecture from a *reduced*
   config (fewer layers/hidden/vocab) and random init — capture is about the op set, not weights.
 - **Capture ONE unit.** A single `forward` / denoise step — not generation loops or sampling.
-- **`sys.path` the upstream repo** (cloned at `/scratch/agustin/projects/<Repo>`, a sibling of
-  `model2MLIR`). Stub out heavy side-effect imports if the package `__init__` pulls the world.
+- **`sys.path` the upstream repo** (a separate checkout beside `model2MLIR`).
+  Stub out heavy side-effect imports if the package `__init__` pulls the world.
 - **Eager attention**, `use_cache=False` — keep the traced graph export-friendly.
 
 ### `capture.toml` — environment (optional)
@@ -52,7 +52,7 @@ venv   = ".venv"          # default: workloads/<model>/.venv (the STANDARD locat
                           # may be an absolute path to reuse an existing dedicated venv.
 python = "3.11"           # python version for a fresh venv
 deps   = ["torch==2.7.1", "transformers==4.53.3", ...]   # pip specs for a fresh venv
-upstream = "/scratch/agustin/projects/<Repo>"            # documentation
+upstream = "/path/to/<Repo>"                            # replace with your checkout
 [env]                     # env vars set for the capture (e.g. small-config knobs)
 M2M_<MODEL>_LAYERS = "4"
 ```
@@ -93,7 +93,7 @@ lowers it back). Quantization is QDQ-preserved by default (`quant_ext.dequantize
 weight); fp8 renders the native `f8E4M3FN` spelling.
 
 ## Adding a new model (the whole recipe)
-1. `git clone <upstream>` → `/scratch/agustin/projects/<Repo>`.
+1. Obtain an upstream checkout at `/path/to/<Repo>`.
 2. `mkdir workloads/<model>` ; write `loader.py` (the contract above).
 3. Write `capture.toml` (deps + any small-config env vars).
 4. `python workloads/capture.py <model>` → three `.mlir` files at 0 opaque.
