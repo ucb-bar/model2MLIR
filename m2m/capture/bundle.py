@@ -679,8 +679,12 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
 
     from m2m.capture.provenance import write_capture_receipt
+    from m2m.capture.source_cpu import observed_torch_cpu
 
-    write_capture_receipt(out, source_path=source_path)
+    write_capture_receipt(
+        out, source_path=source_path,
+        require_source_cpu=r.path_taken == "fx_importer" and observed_torch_cpu() is not None,
+    )
 
     return {
         "out": str(out), "n_inputs": len(inputs),

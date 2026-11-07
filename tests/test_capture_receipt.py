@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import sympy
 import torch
 from m2m.capture.bundle import (
@@ -14,7 +15,8 @@ from m2m.capture.bundle import (
     _tensor_abi,
     write_bundle,
 )
-from m2m.capture.provenance import _package_python_sources, capture_receipt
+from m2m.capture.provenance import _package_python_sources, _source_cpu_from_mlir, capture_receipt
+from m2m.capture.source_cpu import observed_torch_cpu
 from m2m.capture.torch_export import _serialize_range_constraints
 
 
@@ -88,6 +90,20 @@ def test_bundle_receipt_binds_source_tool_framework_and_materialized_abi(tmp_pat
     assert "m2m/capture/stagewise_pt2e.py" in receipt["tool"]["source_sha256"]
     assert "m2m/capture/external_runtime.py" in receipt["tool"]["source_sha256"]
     assert receipt["framework"]["torch"] == torch.__version__
+    observed_cpu = observed_torch_cpu()
+    mlir = (bundle / "model.mlir").read_text(encoding="utf-8")
+    if observed_cpu is not None:
+        assert receipt["framework"]["torch_git_commit"] == observed_cpu["torch_git_commit"]
+        assert receipt["framework"]["cpu_capability"] == observed_cpu["cpu_capability"]
+        for key, value in (
+            ("prov.torch_source_version", observed_cpu["torch_version"]),
+            ("prov.torch_source_commit", observed_cpu["torch_git_commit"]),
+            ("prov.torch_cpu_capability", observed_cpu["cpu_capability"]),
+        ):
+            assert f'{key} = "{value}"' in mlir
+    else:
+        assert "torch_git_commit" not in receipt["framework"]
+        assert "cpu_capability" not in receipt["framework"]
     assert receipt["lifted_constants"] == {}
     assert receipt["materialized_abi"] == {"complete": True, "inputs": 1, "lifted_constants": []}
     for name in ("model.mlir", "weights.safetensors", "inputs.npz", "golden.npy",
@@ -104,6 +120,44 @@ def test_bundle_receipt_binds_source_tool_framework_and_materialized_abi(tmp_pat
     manifest_path.write_text(json.dumps(manifest))
     np.savez(bundle / "extra.npz", c_lifted_tensor_0=np.array(1.0, dtype=np.float32))
     assert capture_receipt(bundle)["lifted_constants"]["c_lifted_tensor_0"]["shape"] == []
+
+
+def test_torch_cpu_receipt_refuses_partial_and_conflicting_mlir(tmp_path):
+    observed_cpu = observed_torch_cpu()
+    if observed_cpu is None:
+        pytest.skip("selected Torch wheel does not expose its CPU source facts")
+    bundle = tmp_path / "bundle"
+    write_bundle(_Tiny().eval(), (torch.randn(2, 4),), bundle, capture_regions=False)
+    path = bundle / "model.mlir"
+    original = path.read_text(encoding="utf-8")
+    assert _source_cpu_from_mlir(path) == observed_cpu
+
+    path.write_text(original.replace(observed_cpu["torch_git_commit"], "wrong", 1), encoding="utf-8")
+    with pytest.raises(ValueError, match="disagree with receipt runtime"):
+        capture_receipt(bundle)
+
+    path.write_text(original.replace("prov.torch_cpu_capability", "removed_cpu_capability", 1), encoding="utf-8")
+    with pytest.raises(ValueError, match="incomplete Torch CPU source facts"):
+        capture_receipt(bundle)
+
+    without_facts = original
+    for name in ("prov.torch_source_version", "prov.torch_source_commit", "prov.torch_cpu_capability"):
+        without_facts = without_facts.replace(name, f"removed_{name}", 1)
+    path.write_text(without_facts, encoding="utf-8")
+    assert "torch_git_commit" not in capture_receipt(bundle)["framework"]
+    with pytest.raises(ValueError, match="omitted observed Torch CPU source facts"):
+        capture_receipt(bundle, require_source_cpu=True)
+
+
+def test_old_mlir_does_not_acquire_current_torch_cpu_source_facts(tmp_path):
+    path = tmp_path / "old.mlir"
+    path.write_text("module {\n  func.func @forward()\n}\n", encoding="utf-8")
+    assert _source_cpu_from_mlir(path) is None
+
+
+def test_missing_torch_commit_does_not_become_source_metadata(monkeypatch):
+    monkeypatch.setattr(torch.version, "git_version", None)
+    assert observed_torch_cpu() is None
 
 
 def test_python_source_inventory_finds_new_nested_modules_and_flags_links(tmp_path):

@@ -253,6 +253,24 @@ def convert(
         except Exception:  # noqa: BLE001
             pass
 
+    # FXImporter serializes this module as the authoritative captured MLIR.
+    # Torch-MLIR's own text remains authoritative on that separate path.
+    if result.path_taken == "fx_importer" and result.module is not None:
+        from xdsl.dialects.builtin import StringAttr
+        from m2m.capture.source_cpu import observed_torch_cpu
+
+        observed_cpu = observed_torch_cpu()
+        if observed_cpu is not None:
+            for key, value in (
+                ("prov.torch_source_version", observed_cpu["torch_version"]),
+                ("prov.torch_source_commit", observed_cpu["torch_git_commit"]),
+                ("prov.torch_cpu_capability", observed_cpu["cpu_capability"]),
+            ):
+                existing = result.module.attributes.get(key)
+                if existing is not None and getattr(existing, "data", None) != value:
+                    raise ValueError(f"captured Torch CPU fact disagrees with selected runtime: {key}")
+                result.module.attributes[key] = StringAttr(value)
+
     external_manifest = None
     if isinstance(quantization, ExternalQuantizationConfig):
         # This is a selected input boundary. A missing or altered manifest is an

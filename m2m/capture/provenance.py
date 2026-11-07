@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import re
 import stat
 import subprocess
 import sys
@@ -18,6 +19,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+from m2m.capture.source_cpu import observed_torch_cpu
 
 
 def _sha256_file(path: Path) -> str:
@@ -30,6 +33,31 @@ def _sha256_file(path: Path) -> str:
 
 def _file_record(path: Path) -> dict:
     return {"bytes": path.stat().st_size, "sha256": _sha256_file(path)}
+
+
+def _source_cpu_from_mlir(path: Path) -> dict[str, str] | None:
+    """Read complete module CPU facts; old MLIR cannot acquire them retroactively."""
+    header = path.read_text(encoding="utf-8").split("func.func", 1)[0]
+    names = {
+        "torch_version": "prov.torch_source_version",
+        "torch_git_commit": "prov.torch_source_commit",
+        "cpu_capability": "prov.torch_cpu_capability",
+    }
+    found: dict[str, str] = {}
+    for label, name in names.items():
+        values = re.findall(rf'\b{re.escape(name)}\s*=\s*"([^"]*)"', header)
+        if name in header and (len(values) != 1 or not values[0]):
+            raise ValueError(f"captured MLIR has malformed or duplicate {name}")
+        if values:
+            found[label] = values[0]
+    if not found:
+        return None
+    if set(found) != set(names):
+        raise ValueError("captured MLIR has incomplete Torch CPU source facts")
+    observed = observed_torch_cpu()
+    if observed is None or found != observed:
+        raise ValueError("captured MLIR Torch CPU source facts disagree with receipt runtime")
+    return found
 
 
 def _package_python_sources(root: Path) -> tuple[dict[str, str], list[str]]:
@@ -91,7 +119,8 @@ def _tool_identity() -> dict:
     }
 
 
-def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -> dict:
+def capture_receipt(out: str | Path, *, source_path: str | Path | None = None,
+                    require_source_cpu: bool = False) -> dict:
     """Describe the bytes a bundle writer actually published.
 
     ``source_path`` is an observed input artifact, such as a torch.export .pt2
@@ -220,10 +249,17 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
         torchao_version = importlib.metadata.version("torchao")
     except importlib.metadata.PackageNotFoundError:
         torchao_version = None
+    framework = {"torch": torch.__version__, "torchao": torchao_version}
+    source_cpu = _source_cpu_from_mlir(out / "model.mlir")
+    if require_source_cpu and source_cpu is None:
+        raise ValueError("captured FXImporter MLIR omitted observed Torch CPU source facts")
+    if source_cpu is not None:
+        framework.update(torch_git_commit=source_cpu["torch_git_commit"],
+                         cpu_capability=source_cpu["cpu_capability"])
     return {
         "schema": "m2m.capture-receipt.v1",
         "tool": _tool_identity(),
-        "framework": {"torch": torch.__version__, "torchao": torchao_version},
+        "framework": framework,
         "source": source,
         "source_closure_verified": False,
         "artifacts": artifacts,
@@ -233,9 +269,11 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
     }
 
 
-def write_capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -> dict:
+def write_capture_receipt(out: str | Path, *, source_path: str | Path | None = None,
+                          require_source_cpu: bool = False) -> dict:
     """Write the receipt last, only after all required bundle outputs exist."""
-    receipt = capture_receipt(out, source_path=source_path)
+    receipt = capture_receipt(out, source_path=source_path,
+                              require_source_cpu=require_source_cpu)
     (Path(out) / "capture_receipt.json").write_text(
         json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8",
     )
