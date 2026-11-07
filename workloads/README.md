@@ -77,6 +77,13 @@ count before reporting success. Session captures only support
 rather than silently captured as FP32. These are capture artifacts, not
 source-closure or execution proof; the driver reports
 `source_closure_verified: false`.
+New FXImporter bundles also record the producing Torch wheel's git commit and
+selected CPU capability in `model.mlir` and the byte-bound capture receipt when
+the running Torch exposes both facts. The receipt writer refuses partial or
+conflicting MLIR facts. An older bundle with no such attributes remains
+unobserved; rerunning the receipt helper cannot assign it the current host's
+Torch commit or CPU dispatch. These observations do not establish source
+closure or prove a different machine's numerical dispatch.
 
 The two output levels (see `docs/OP_TAXONOMY.md`): `linalg-on-tensors` (default, portable
 standard dialects) and `high-level` (opt-in `linalg_ext.*` named ops; `m2m.expand_to_linalg`
