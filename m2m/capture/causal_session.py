@@ -462,6 +462,25 @@ class CausalMultiProgramCapture:
         """Public model-agnostic capability consumed by external runtime exporters."""
         return self._external_runtime_session()
 
+    def external_runtime_shared_model(self):
+        """Bind one quantization transform to both stages and the source quality trajectory."""
+        import copy
+
+        from m2m.capture.bundle import capture_session_trajectory
+        from m2m.capture.external_runtime import ExternalRuntimeSharedModel
+
+        source = self._external_runtime_session()
+        decode = source.programs[1]
+        quality_reference = capture_session_trajectory(
+            decode.module, decode.inputs, dict(decode.session or {}))
+
+        def make_session(selected):
+            selected_capture = copy.copy(self)
+            selected_capture.lm = selected
+            return selected_capture._external_runtime_session(quality_reference=quality_reference)
+
+        return ExternalRuntimeSharedModel(self.lm, make_session, ("prefill", "decode"))
+
     def write_bundle(self, out: str | Path, *, quant=None) -> dict[str, Any]:
         # Generate the quality trajectory from the untouched checkpoint before torchAO changes the
         # shared module. This reference is never reused as the compiler-correctness golden.

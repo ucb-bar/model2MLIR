@@ -11,11 +11,46 @@ real stages and tuple-index bindings.
 """
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping
+from typing import Any, Literal
 
 import torch
 from torch import nn
+
+
+@dataclass(frozen=True)
+class ExternalRuntimeSharedModel:
+    """One source model and a factory rebuilding all weight-sharing stages.
+
+    The capture caller selects a numerical transform and applies it once to
+    ``model``. The factory must reference that exact returned module in every
+    named program; the quantized bundle writer verifies identity and stable
+    tensor bytes. This capability never authorizes independent stage rewrites.
+    """
+
+    model: nn.Module
+    make_session: Callable[[nn.Module], ExternalRuntimeSession]
+    shared_programs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.model, nn.Module) or not callable(self.make_session):
+            raise TypeError("shared runtime capture needs a source nn.Module and a session factory")
+        if (not isinstance(self.shared_programs, tuple) or not self.shared_programs
+                or any(not isinstance(name, str) or not name for name in self.shared_programs)
+                or len(set(self.shared_programs)) != len(self.shared_programs)):
+            raise ValueError("shared runtime programs must be distinct nonempty names")
+
+
+def external_runtime_shared_model(model) -> ExternalRuntimeSharedModel:
+    """Resolve an explicit capability; never infer sharing from stage names."""
+    factory = getattr(model, "external_runtime_shared_model", None)
+    if not callable(factory):
+        raise TypeError("dynamic multi-program capture requires external_runtime_shared_model()")
+    result = factory()
+    if not isinstance(result, ExternalRuntimeSharedModel):
+        raise TypeError("external_runtime_shared_model() returned the wrong protocol type")
+    return result
 
 
 @dataclass(frozen=True)

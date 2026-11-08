@@ -3,6 +3,7 @@
 import hashlib
 import json
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -151,6 +152,47 @@ def test_quantized_session_binds_one_shared_model_and_stage_receipts(tmp_path):
         assert json.loads(receipt)["materialized_abi"]["complete"] is True
 
 
+def test_actual_dynamic_int8_tensor_storage_and_policy_are_bound(tmp_path):
+    from torchao.quantization import Int8DynamicActivationInt8WeightConfig, quantize_
+
+    from m2m.capture.bundle import _shared_tensor_inventory
+
+    calls = []
+
+    def transform(model):
+        calls.append(model)
+        quantize_(model, Int8DynamicActivationInt8WeightConfig())
+        return model
+
+    out = tmp_path / "dynamic"
+    shared = Shared().eval()
+    write_quantized_multi_program_bundle(
+        shared, transform, _session, out, shared_programs=("prefix", "step"),
+        quantization={"scheme": "int8_dyn_act_int8_weight", "shared_transform_count": 1},
+        quant=QuantizationConfig(scheme="int8_dyn_act_int8_weight"), capture_trace=True)
+    assert calls == [shared]
+    verify_bundle_integrity(out)
+    binding = json.loads((out / "quantized-session-binding.json").read_text())
+    names = {row["name"] for row in binding["shared_tensors"]}
+    assert {"linear.weight.qdata", "linear.weight.scale", "linear.weight.zero_point"} <= names
+    metadata = next(row for row in binding["shared_tensors"] if row["name"] == "linear.weight")["metadata"]
+    assert metadata["act_quant_kwargs"]["fields"]["mapping_type"]["name"] == "SYMMETRIC"
+    assert metadata["reduce_range"] is False
+    before = _shared_tensor_inventory(shared)
+    with torch.no_grad():
+        shared.linear.weight.scale.add_(0.125)
+    assert _shared_tensor_inventory(shared) != before
+    for stage in ("prefix", "step"):
+        text = (out / "stages" / stage / "model.mlir").read_text()
+        assert 'prov.quantization = "int8_dyn_act_int8_weight"' in text
+        assert "prov.int_mm_lhs_dtype" in text
+    complete = np.load(out / "stages/step/goldens.npz")
+    assert json.loads((out / "stages/step/output_order.json").read_text()) == ["Y0", "Y1"]
+    assert np.array_equal(complete["Y0"], complete["Y1"])
+    receipt = json.loads((out / "stages/step/capture_receipt.json").read_text())
+    assert {"goldens.npz", "output_order.json"} <= set(receipt["artifacts"])
+
+
 def test_quantized_session_refuses_post_transform_route_mismatch(tmp_path):
     with pytest.raises(ValueError, match="post-quantization dtype/shape mismatch"):
         write_quantized_multi_program_bundle(
@@ -160,6 +202,18 @@ def test_quantized_session_refuses_post_transform_route_mismatch(tmp_path):
             quant=QuantizationConfig(scheme="int8_weight_only"),
         )
     assert not (tmp_path / "refused").exists()
+
+
+def test_unknown_tensor_subclass_policy_metadata_refuses():
+    from torchao.quantization import Int8DynamicActivationInt8WeightConfig, quantize_
+
+    from m2m.capture.bundle import _shared_tensor_inventory
+
+    shared = Shared().eval()
+    quantize_(shared, Int8DynamicActivationInt8WeightConfig())
+    shared.linear.weight.act_quant_kwargs = object()
+    with pytest.raises(ValueError, match="metadata cannot be byte-bound"):
+        _shared_tensor_inventory(shared)
 
 
 def test_global_preapplied_policy_without_config_still_fails_closed(tmp_path):

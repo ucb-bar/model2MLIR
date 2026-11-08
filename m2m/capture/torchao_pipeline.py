@@ -386,7 +386,8 @@ def apply_quantization(
     except ImportError:
         pass
     # int8 W + int8 A for systolic / RVV int8 datapaths (Gemmini, Saturn/OPU).
-    # Per-channel weights, per-tensor dynamic activations.
+    # The config owns granularity: current v2 defaults are per-output-channel
+    # weights and per-token activation rows, not per-tensor activations.
     try:
         from torchao.quantization import Int8DynamicActivationInt8WeightConfig
 

@@ -103,9 +103,12 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
         "inputs.npz", "golden.npy", "extra.npz", "input_order.json",
     )
     artifacts = {name: _file_record(out / name) for name in required}
-    for name in ("frontend-trace.json", "meta.json", "quantization-manifest.json", "quantization-quality.json"):
+    for name in ("frontend-trace.json", "meta.json", "quantization-manifest.json", "quantization-quality.json",
+                 "goldens.npz", "output_order.json"):
         if (out / name).is_file():
             artifacts[name] = _file_record(out / name)
+    if ("goldens.npz" in artifacts) != ("output_order.json" in artifacts):
+        raise ValueError("complete output goldens require both archive and output order")
     if "quantization-manifest.json" not in artifacts and (
         b"prov.quantization_manifest_sha256" in (out / "model.mlir").read_bytes()
         or ("meta.json" in artifacts and "quantization_manifest" in json.loads(

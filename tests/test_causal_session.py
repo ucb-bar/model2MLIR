@@ -207,6 +207,29 @@ def test_deferred_causal_capture_exposes_actual_prefill_decode_runtime_protocol(
     assert exported.final_output.program == "decode"
 
 
+def test_shared_causal_factory_keeps_original_quality_and_selected_module_identity():
+    import copy
+
+    from m2m.capture.external_runtime import external_runtime_shared_model
+
+    lm = _tiny_llama()
+    capture = CausalMultiProgramCapture(
+        lm, torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long),
+        checkpoint="unit/tiny", full_checkpoint=False, paper_ready=False,
+        provenance={}, prefill_tokens=4, decode_tokens=2)
+    capability = external_runtime_shared_model(capture)
+    selected = copy.deepcopy(lm)
+    with torch.no_grad():
+        selected.lm_head.weight.zero_()
+    session = capability.make_session(selected)
+    assert capability.model is lm and capture.lm is lm
+    assert capability.shared_programs == ("prefill", "decode")
+    assert all(any(child is selected for child in program.module.modules()) for program in session.programs)
+    assert np.any(session.programs[1].session["quality"]["reference_values"] != 0)
+    with torch.no_grad():
+        assert torch.count_nonzero(session.programs[0].module(*session.programs[0].inputs)[0]) == 0
+
+
 def test_deferred_causal_bundle_writer_reuses_protocol_and_preserves_fp32_reference(
         tmp_path, monkeypatch):
     lm = _tiny_llama()

@@ -626,6 +626,12 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
                                 if capture_quantization_quality else None)
     golden = g[0] if isinstance(g, (tuple, list)) else g
     np.save(out / "golden.npy", _numpy_safe(golden))
+    complete_outputs = _tensor_outputs(g)
+    if len(complete_outputs) > 1:
+        names = [f"Y{index}" for index in range(len(complete_outputs))]
+        np.savez(out / "goldens.npz", **{
+            name: _numpy_safe(value) for name, value in zip(names, complete_outputs, strict=True)})
+        (out / "output_order.json").write_text(json.dumps(names) + "\n", encoding="utf-8")
 
     np.savez(out / "inputs.npz",
              **{f"in{i}": _numpy_safe(x) for i, x in enumerate(inputs)})
@@ -796,10 +802,46 @@ def write_multi_program_bundle(programs: list[dict], root_session: dict, out: st
 
 def _shared_tensor_inventory(model: nn.Module) -> list[dict]:
     """Hash the actual shared tensor bytes without serializing another model copy."""
+    import math
+    from dataclasses import fields, is_dataclass
+    from enum import Enum
+
+    def metadata(value):
+        if value is None or type(value) in (str, bool, int):
+            return value
+        if type(value) is float and math.isfinite(value):
+            return value
+        if isinstance(value, torch.dtype):
+            return {"torch_dtype": str(value)}
+        if isinstance(value, Enum):
+            return {"enum": type(value).__module__ + "." + type(value).__qualname__, "name": value.name}
+        if is_dataclass(value) and not isinstance(value, type):
+            return {"dataclass": type(value).__module__ + "." + type(value).__qualname__,
+                    "fields": {field.name: metadata(getattr(value, field.name)) for field in fields(value)}}
+        if isinstance(value, tuple):
+            return {"tuple": [metadata(item) for item in value]}
+        if isinstance(value, list):
+            return [metadata(item) for item in value]
+        if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+            return {key: metadata(item) for key, item in sorted(value.items())}
+        raise ValueError(f"shared tensor subclass metadata cannot be byte-bound: {type(value).__name__}")
+
     inventory = []
-    for name, value in sorted(model.state_dict().items()):
+
+    def visit(name, value):
         if not isinstance(value, torch.Tensor) or value.layout != torch.strided:
             raise ValueError(f"shared tensor {name!r} cannot be byte-bound")
+        flatten = getattr(value, "__tensor_flatten__", None)
+        if callable(flatten):
+            children, context = flatten()
+            if (not children or len(set(children)) != len(children)
+                    or any(not isinstance(child, str) or not child for child in children)):
+                raise ValueError(f"shared tensor {name!r} has an invalid subclass storage roster")
+            inventory.append({"name": name, "tensor_subclass": type(value).__module__ + "." + type(value).__qualname__,
+                              "metadata": metadata(context), "children": list(children)})
+            for child in children:
+                visit(name + "." + child, getattr(value, child))
+            return
         try:
             tensor = value.detach().cpu().contiguous()
             raw = memoryview(tensor.reshape(-1).view(torch.uint8).numpy()).cast("B")
@@ -808,6 +850,8 @@ def _shared_tensor_inventory(model: nn.Module) -> list[dict]:
             raise ValueError(f"shared tensor {name!r} cannot be byte-bound") from exc
         inventory.append({"name": name, "shape": list(value.shape),
                           "dtype": str(value.dtype), "sha256": digest})
+    for name, value in sorted(model.state_dict().items()):
+        visit(name, value)
     if not inventory:
         raise ValueError("quantized multi-program capture has no shared model tensors")
     return inventory
@@ -836,6 +880,7 @@ def write_quantized_multi_program_bundle(
     capture_trace: bool = True,
     source_path: str | Path | None = None,
     metadata: dict | None = None,
+    original_frontend_by_program: Mapping[str, dict] | None = None,
 ) -> dict:
     """Capture a quantized v2 session derived from one transformed shared model.
 
@@ -869,6 +914,10 @@ def write_quantized_multi_program_bundle(
     for name in shared_names:
         if not any(module is selected for module in by_name[name].module.modules()):
             raise ValueError(f"program {name!r} does not reference the transformed shared model")
+    if original_frontend_by_program is not None and (
+            set(original_frontend_by_program) != set(shared_names)
+            or any(snapshot.get("status") != "complete" for snapshot in original_frontend_by_program.values())):
+        raise ValueError("shared original snapshots must cover every transformed program completely")
 
     outputs = {program.name: _program_output_tensors(program) for program in session.programs}
     program_abis = {
@@ -895,8 +944,13 @@ def write_quantized_multi_program_bundle(
                            "dtype": str(value.dtype), "shape": list(value.shape)})
     tensors = _shared_tensor_inventory(selected)
     out = Path(out)
+    programs = session.bundle_programs()
+    if original_frontend_by_program is not None:
+        for program in programs:
+            if program["name"] in original_frontend_by_program:
+                program["original_frontend_snapshot"] = original_frontend_by_program[program["name"]]
     summary = write_multi_program_bundle(
-        session.bundle_programs(), dict(session.metadata), out,
+        programs, dict(session.metadata), out,
         quantization_by_program={name: quant for name in shared_names},
         quantization_preapplied=True, capture_trace=capture_trace,
         source_path=source_path, metadata=metadata)
