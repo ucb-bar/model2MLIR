@@ -1517,11 +1517,12 @@ def decompose_bmm(operands, meta, node_name):
 
 
 def decompose_int_mm(operands, meta, node_name):
-    """aten._int_mm(a:i8[M,K], b:i8[K,N]) -> i32[M,N] — the TRUE quantized matmul.
+    """Preserve each FX integer operand's signedness in an exact i32 dot.
 
-    This is the non-QDQ integer GEMM: sign-extend i8 operands to i32 and accumulate
-    in i32 (linalg.generic contraction, family ``matmul``). No dequantize roundtrip --
-    the low-precision op is preserved for a target that supports int8 matmul natively."""
+    MLIR's signless i8 storage cannot distinguish Torch int8 from uint8. CPU
+    TorchAO uses a uint8 activation shifted by 128 and compensates after the
+    dot; sign-extending that activation changes the captured program.
+    """
     if len(operands) < 2:
         return _opaque_decomp("aten__int_mm", operands, meta, "matmul", pattern_hint="int_matmul")
     a, b = operands[0], operands[1]
@@ -1533,16 +1534,25 @@ def decompose_int_mm(operands, meta, node_name):
             or any(d < 0 for d in [*sa, *sb, *out_shape]):
         return _opaque_decomp("aten__int_mm", operands, meta, "matmul", pattern_hint="int_matmul")
 
-    from xdsl.dialects.arith import AddiOp, ConstantOp, ExtSIOp, MuliOp
+    from xdsl.dialects.arith import AddiOp, ConstantOp, ExtSIOp, ExtUIOp, MuliOp
     from xdsl.dialects.builtin import AffineMapAttr, IntegerAttr, IntegerType
     from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
     from xdsl.dialects.tensor import SplatOp
     from xdsl.ir import Block, Region
     from xdsl.ir.affine import AffineExpr, AffineMap
 
-    if not isinstance(out_elem, IntegerType):
-        out_elem = IntegerType(32)
     a_elem, b_elem = a.type.element_type, b.type.element_type
+    operand_dtypes = []
+    for index, elem in enumerate((a_elem, b_elem)):
+        argument = _fx_arg(meta, index)
+        value = getattr(argument, "meta", {}).get("val") if hasattr(argument, "meta") else argument
+        dtype = _torch_dtype_tag(value)
+        if (not isinstance(elem, IntegerType) or elem.width.data != 8
+                or dtype not in ("int8", "uint8")):
+            return _opaque_decomp("aten__int_mm", operands, meta, "matmul", pattern_hint="int_matmul")
+        operand_dtypes.append(dtype)
+    if not isinstance(out_elem, IntegerType) or out_elem.width.data != 32:
+        return _opaque_decomp("aten__int_mm", operands, meta, "matmul", pattern_hint="int_matmul")
     result_type = TensorType(out_elem, out_shape)
     zero = ConstantOp(IntegerAttr(0, out_elem), out_elem)
     init = SplatOp(zero.result, [], result_type)
@@ -1551,8 +1561,8 @@ def decompose_int_mm(operands, meta, node_name):
     b_map = AffineMap(3, 0, (D(2), D(1)))
     o_map = AffineMap(3, 0, (D(0), D(1)))
     blk = Block(arg_types=[a_elem, b_elem, out_elem])
-    ea = ExtSIOp(blk.args[0], out_elem) if a_elem != out_elem else None
-    eb = ExtSIOp(blk.args[1], out_elem) if b_elem != out_elem else None
+    ea = (ExtUIOp if operand_dtypes[0] == "uint8" else ExtSIOp)(blk.args[0], out_elem)
+    eb = (ExtUIOp if operand_dtypes[1] == "uint8" else ExtSIOp)(blk.args[1], out_elem)
     av = ea.results[0] if ea else blk.args[0]
     bv = eb.results[0] if eb else blk.args[1]
     prod = MuliOp(av, bv)
@@ -1574,6 +1584,8 @@ def decompose_int_mm(operands, meta, node_name):
     for op in (zero, init, gen):
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("matmul")
+    gen.attributes["prov.int_mm_lhs_dtype"] = StringAttr(operand_dtypes[0])
+    gen.attributes["prov.int_mm_rhs_dtype"] = StringAttr(operand_dtypes[1])
     return DecompResult(ops=[zero, init, gen], result=gen.results[0], region_ids=[rid], pattern_hint="int_matmul")
 
 
