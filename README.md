@@ -53,6 +53,13 @@ Data-dependent size guards are not silently discarded: supported
 and `cf.assert` in the MLIR, with exact prepared-call provenance. A later compiler
 must preserve or explicitly discharge `cf.assert`; a complete frontend trace
 alone does not prove its runtime implementation.
+
+The FX importer also retains CPU rank-zero boolean `aten._assert_async` checks,
+including both the message and default overload, as ordered `tensor.extract`
+and `cf.assert`. Zero-result checks execute before later source arithmetic;
+unsupported operand types, shapes, schema controls or claimed results refuse.
+This preserves the success/failure condition and order, not the original
+framework's exception class, asynchronous GPU behavior or default error text.
 Exported tensor-metadata assertions introduced by a quantizer can inherit a
 producer's source lineage only when every asserted size, stride, dtype, device,
 or layout field matches that producer's captured type. A mismatch leaves the

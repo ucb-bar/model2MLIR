@@ -206,6 +206,17 @@ def _prepare_exported_program(
         run_default_decompositions=run_default_decompositions,
         export_decomposition_table=export_decomposition_table,
     )
+    default_assert = torch.ops.aten._assert_async.default
+    if any(node.op == "call_function" and node.target is default_assert
+           for module in exported_program.graph_module.modules()
+           if isinstance(module, torch.fx.GraphModule)
+           for node in module.graph.nodes):
+        from m2m.ir.finite_checks import preserve_default_assert
+
+        if default_assert in (export_decomposition_table or {}):
+            raise ValueError("source assertion decomposition cannot be overridden")
+        table[default_assert] = preserve_default_assert
+        targets = tuple(sorted(str(key) for key in table))
     if not table:
         return exported_program, targets
     eliminations: list[dict[str, Any]] = list(

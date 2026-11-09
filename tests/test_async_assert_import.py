@@ -15,14 +15,25 @@ class Guarded(torch.nn.Module):
         return x + 1
 
 
-def test_actual_export_preserves_guard_as_ordered_standard_ir():
+class GuardedWithoutMessage(torch.nn.Module):
+    def forward(self, x):
+        torch.ops.aten._assert_async.default(torch.isfinite(x).all())
+        return x + 1
+
+
+@pytest.mark.parametrize("model_type", [Guarded, GuardedWithoutMessage])
+def test_actual_export_preserves_guard_as_ordered_standard_ir(model_type):
     result = m2m.convert(
-        Guarded(), (torch.ones(4),), backend="fx_importer", capture_trace=True
+        model_type(), (torch.ones(4),), backend="fx_importer", capture_trace=True
     )
     assert result.ok, result.diagnostics
+    message = (
+        "finite source input required" if model_type is Guarded
+        else "source tensor assertion failed"
+    )
     assert (
         "cf.assert" in result.mlir_text
-        and "finite source input required" in result.mlir_text
+        and message in result.mlir_text
     )
     assert result.capture_trace["status"] == "complete", result.capture_trace[
         "blockers"
@@ -90,13 +101,75 @@ def test_assert_source_controls_and_result_contract_refuse(bad):
         assert_async(operands, meta, "guard")
 
 
-def test_guarded_export_throws_for_nonfinite_without_changing_finite_math():
-    model = Guarded()
+@pytest.mark.parametrize("model_type", [Guarded, GuardedWithoutMessage])
+def test_guarded_export_throws_for_nonfinite_without_changing_finite_math(model_type):
+    model = model_type()
     x = torch.tensor([-0.0, torch.finfo(torch.float32).max, -1.0, 3.0])
     ep = torch.export.export(model, (x,), strict=True)
     assert torch.equal(ep.module()(x).view(torch.uint8), model(x).view(torch.uint8))
     for nonfinite in (float("inf"), float("-inf"), float("nan")):
         bad = x.clone()
         bad[0] = nonfinite
-        with pytest.raises(RuntimeError, match="finite source input"):
+        with pytest.raises(RuntimeError):
             ep.module()(bad)
+
+
+def test_default_overload_cannot_accept_a_message_argument():
+    from xdsl.dialects.builtin import TensorType, i1
+    from xdsl.ir import Block
+
+    ep = torch.export.export(GuardedWithoutMessage(), (torch.ones(4),), strict=True)
+    node = next(n for n in ep.graph.nodes
+                if n.target is torch.ops.aten._assert_async.default)
+    value = Block(arg_types=[TensorType(i1, [])]).args[0]
+    meta = dict(node.meta)
+    meta.update(_fx_args=(node.args[0], "unproved message"), _fx_kwargs={},
+                _fx_ssa_args={0: value}, _aten_target="aten._assert_async.default")
+    with pytest.raises(ValueError, match="message arity"):
+        assert_async([value], meta, "guard")
+
+
+@pytest.mark.parametrize("defaults", [True, False])
+def test_default_guard_preparation_preserves_original_and_global_effects(defaults):
+    from torch._library.utils import is_impure
+
+    from m2m.capture.torch_export import _prepare_exported_program
+
+    x = torch.ones(4)
+    ep = torch.export.export(GuardedWithoutMessage(), (x,), strict=True)
+    original = str(ep.graph)
+    effects = tuple(is_impure(op) for op in (
+        torch.ops.aten._assert_async.default, torch.ops.aten._assert_async.msg))
+    prepared, _ = _prepare_exported_program(
+        ep, run_default_decompositions=defaults, export_decomposition_table=None
+    )
+    assert str(ep.graph) == original
+    assert tuple(is_impure(op) for op in (
+        torch.ops.aten._assert_async.default, torch.ops.aten._assert_async.msg)) == effects
+    assert sum(n.target is torch.ops.aten._assert_async.msg
+               for n in prepared.graph.nodes if n.op == "call_function") == 1
+    assert torch.equal(prepared.module()(x), ep.module()(x))
+    for number in (float("nan"), float("inf"), float("-inf")):
+        bad = x.clone()
+        bad[0] = number
+        with pytest.raises(RuntimeError):
+            prepared.module()(bad)
+
+
+def test_source_guard_decomposition_override_refuses():
+    from m2m.capture.torch_export import _prepare_exported_program
+
+    ep = torch.export.export(GuardedWithoutMessage(), (torch.ones(4),), strict=True)
+    with pytest.raises(ValueError, match="cannot be overridden"):
+        _prepare_exported_program(
+            ep, run_default_decompositions=True,
+            export_decomposition_table={torch.ops.aten._assert_async.default: lambda _: None}
+        )
+
+
+@pytest.mark.parametrize("bad", [torch.tensor(1.), torch.ones(1, dtype=torch.bool)])
+def test_default_preparation_refuses_nonboolean_or_nonscalar(bad):
+    from m2m.ir.finite_checks import preserve_default_assert
+
+    with pytest.raises(ValueError, match="CPU scalar bool"):
+        preserve_default_assert(bad)

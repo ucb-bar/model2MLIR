@@ -768,7 +768,8 @@ class FXImporter:
                     block.add_op(assertion)
                     self.decomposed_count += 1
                     continue
-            if node.target is torch.ops.aten._assert_async.msg:
+            if (node.target is torch.ops.aten._assert_async.msg
+                    or node.target is torch.ops.aten._assert_async.default):
                 # Zero-result source effects cannot use the ordinary tensor
                 # result-type path below. Preserve the exact scalar-bool guard
                 # before all following arithmetic; malformed guards refuse.
