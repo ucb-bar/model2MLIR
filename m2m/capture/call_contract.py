@@ -7,11 +7,11 @@ import struct
 
 
 def _value(value):
-    if type(value) in (type(None), bool, int, str):
+    if any(type(value) is kind for kind in (type(None), bool, int, str)):
         return (type(value), value)
     if type(value) is float:
         return (float, struct.pack("!d", value))
-    if type(value) in (tuple, list):
+    if type(value) is tuple or type(value) is list:
         return (type(value), tuple(_value(item) for item in value))
     if type(value) is dict:
         return (dict, tuple((_value(k), _value(v)) for k, v in value.items()))
@@ -21,7 +21,7 @@ def _value(value):
 def _tree(spec):
     from torch.utils._pytree import LeafSpec, TreeSpec
 
-    if type(spec) not in (TreeSpec, LeafSpec):
+    if type(spec) is not TreeSpec and type(spec) is not LeafSpec:
         raise ValueError("unsupported call-contract TreeSpec")
     if hasattr(spec, "__dict__") and set(vars(spec)) != {
         "type",
@@ -32,24 +32,34 @@ def _tree(spec):
         "num_children",
     }:
         raise ValueError("unsupported extra call-contract tree fields")
-    children = list(spec.children_specs)
+    children = spec.children_specs
+    if type(children) is not list:
+        raise ValueError("unsupported call-contract tree child container")
+    if any(
+        type(child) is not TreeSpec and type(child) is not LeafSpec
+        for child in children
+    ):
+        raise ValueError("unsupported call-contract tree child kind")
     counts = (spec.num_nodes, spec.num_leaves, spec.num_children)
     if any(type(count) is not int for count in counts):
         raise ValueError("unsupported call-contract tree counts")
     if spec.type is None:
         if spec.context is not None or children or counts != (1, 1, 0):
             raise ValueError("inconsistent call-contract leaf fields")
-        return ("leaf", type(spec))
-    if spec.type not in (tuple, list, dict):
+        return ("leaf", type(spec), counts)
+    if not any(spec.type is kind for kind in (tuple, list, dict)):
         raise ValueError("unsupported call-contract tree container")
+    # Recurse through only exact known child records before reading any child
+    # counts. A mutated counter is not an integer and cannot reach sum/add.
+    child_records = tuple(_tree(child) for child in children)
     expected = (
-        1 + sum(child.num_nodes for child in children),
-        sum(child.num_leaves for child in children),
+        1 + sum(child[-1][0] for child in child_records),
+        sum(child[-1][1] for child in child_records),
         len(children),
     )
     if counts != expected:
         raise ValueError("inconsistent call-contract tree counts")
-    if (spec.type in (tuple, list) and spec.context is not None) or (
+    if ((spec.type is tuple or spec.type is list) and spec.context is not None) or (
         spec.type is dict
         and (type(spec.context) is not list or len(spec.context) != len(children))
     ):
@@ -59,7 +69,7 @@ def _tree(spec):
         type(spec),
         spec.type,
         _value(spec.context),
-        tuple(_tree(child) for child in children),
+        child_records,
         counts,
     )
 
@@ -86,7 +96,7 @@ def _argument(value):
         )
         if (cls := getattr(graph_signature, name, None)) is not None
     )
-    if type(value) not in known:
+    if not any(type(value) is kind for kind in known):
         raise ValueError("unsupported call-contract argument kind")
     return (
         type(value),
