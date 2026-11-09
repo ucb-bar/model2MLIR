@@ -178,7 +178,8 @@ def convert(
             if decompose:
                 exported_program, _ = _prepare_exported_program(
                     raw, run_default_decompositions=True,
-                    export_decomposition_table=torch_mlir_gap_decompositions(), capture_trace=True)
+                    export_decomposition_table=torch_mlir_gap_decompositions(), capture_trace=True,
+                    quantized_frontend_snapshot=trace_graphs["quantized"])
             else:
                 exported_program = raw
             for _ in range(8):

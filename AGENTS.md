@@ -85,6 +85,10 @@ liftings. Exact multi-return tensor slots are separate storage owners; repeated
 selection of one slot retains its intervening writes. This closes a specific
 quantized-to-prepared proof and does not certify original-to-TorchAO attribution,
 quantization quality, arbitrary tensor subclasses or target execution.
+The field observer is bound to the archived raw quantized snapshot. If a prior
+rewrite (including grad-HOP inlining) changes public node ordinals, it declines
+before any snapshot can overwrite their IDs. Such higher-order field lifting
+remains unproved; no post-rewrite graph is relabelled as the raw source stage.
 
 Frontend snapshots preserve historical `results` slots and add versioned
 `result_metadata` describing actual FX `val` presence, container and every

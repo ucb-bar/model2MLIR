@@ -199,6 +199,7 @@ def _prepare_exported_program(
     run_default_decompositions: bool,
     export_decomposition_table: dict[Any, Any] | None,
     capture_trace: bool = False,
+    quantized_frontend_snapshot: dict | None = None,
 ) -> tuple[Any, tuple[str, ...]]:
     table, targets = _build_decomposition_table(
         run_default_decompositions=run_default_decompositions,
@@ -213,7 +214,7 @@ def _prepare_exported_program(
     if capture_trace:
         from m2m.capture.subclass_trace import observe
 
-        subclass_fields = observe(exported_program)
+        subclass_fields = observe(exported_program, quantized_frontend_snapshot=quantized_frontend_snapshot)
         from m2m.capture.trace import tuple_selection_trace_program
 
         exported_program = tuple_selection_trace_program(exported_program)

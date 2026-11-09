@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from m2m.capture.trace import snapshot_exported_program
+from m2m.capture.trace import _digest, snapshot_exported_program
 from m2m.capture.view_trace import SourceStorageAliases
 
 
@@ -70,7 +70,16 @@ def _states(exported):
     return {**exported.state_dict, **exported.constants}
 
 
-def observe(exported) -> Observation | None:
+def _canonical_quantized_ids(exported):
+    """A public trace stage must not be silently renumbered after a rewrite."""
+    return all(
+        (node.meta.get("custom") or {}).get("m2m_node_id")
+        == f"g:quantized:root:n{index}"
+        for index, node in enumerate(exported.graph.nodes)
+    )
+
+
+def observe(exported, *, quantized_frontend_snapshot=None) -> Observation | None:
     """Collect only immutable, actual state-field accesses with complete effects."""
     packet = getattr(torch.ops.export, "access_subclass_inner_tensor", None)
     accessor = getattr(packet, "default", None)
@@ -84,7 +93,26 @@ def observe(exported) -> Observation | None:
         or exported.graph_signature.user_inputs_to_mutate
     ):
         return None
+    # api.convert may already have inlined higher-order regions. Old public
+    # qIDs still describe the archived raw graph, not new root ordinals. Refuse
+    # this proof before any snapshot can overwrite them.
+    if not _canonical_quantized_ids(exported):
+        return None
+    if quantized_frontend_snapshot is not None:
+        supplied = dict(quantized_frontend_snapshot)
+        claimed = supplied.pop("sha256", None)
+        if (
+            supplied.get("stage") != "quantized"
+            or supplied.get("status") != "complete"
+            or claimed != _digest(supplied)
+        ):
+            return None
     snapshot = snapshot_exported_program(exported, stage="quantized")
+    if (
+        quantized_frontend_snapshot is not None
+        and snapshot != quantized_frontend_snapshot
+    ):
+        return None
     aliases = SourceStorageAliases(snapshot)
     states = _states(exported)
     rows = snapshot["nodes"]
@@ -178,7 +206,7 @@ def observe(exported) -> Observation | None:
 
 def bind(observation: Observation | None, prepared) -> list[dict]:
     """Stamp only uniquely observed, unchanged state-field parameters."""
-    if observation is None:
+    if observation is None or not _canonical_quantized_ids(observation.source):
         return []
     fresh = snapshot_exported_program(observation.source, stage="quantized")
     if fresh["sha256"] != observation.source_graph_sha256:
