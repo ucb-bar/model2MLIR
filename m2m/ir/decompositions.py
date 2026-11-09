@@ -4336,11 +4336,25 @@ def decompose_cat(operands, meta, node_name):
             dim += len(out_shape)
         from xdsl.dialects.tensor import ConcatOp
 
+        # torch.cat permits a one-dimensional (0,) sentinel beside tensors of
+        # another rank (not arbitrary empty shapes). Keep the result dtype from
+        # Torch metadata: even the omitted empty operand participates in type
+        # promotion, so retained tensors still require the ordinary casts below.
+        inputs = [o for o in operands
+                  if len(out_shape) == 1 or tuple(o.type.get_shape()) != (0,)]
+        if (not inputs or not 0 <= dim < len(out_shape)
+                or any(len(o.type.get_shape()) != len(out_shape) for o in inputs)
+                or any(any(d < 0 for d in o.type.get_shape()) for o in inputs)
+                or any(any(size != out_shape[axis] for axis, size in enumerate(o.type.get_shape())
+                           if axis != dim) for o in inputs)
+                or sum(o.type.get_shape()[dim] for o in inputs) != out_shape[dim]):
+            return _opaque_decomp("aten_cat", operands, meta, "layout", pattern_hint="cat")
+
         # tensor.concat requires a uniform element type; torch.cat promotes mixed
-        # dtypes (e.g. f32 + bf16 -> bf16). Cast each input to the result dtype first.
+        # dtypes (e.g. f32 + bf16 -> f32). Cast each input to the result dtype first.
         ops: list = []
         casted: list = []
-        for o in operands:
+        for o in inputs:
             if o.type.element_type == elem:
                 casted.append(o)
                 continue
