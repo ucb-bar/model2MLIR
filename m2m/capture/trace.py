@@ -2067,17 +2067,14 @@ def finalize_trace(graphs: dict[str, Any], mlir_text: str, *, path: str,
     blockers, operations = [], []
     module = _parse_mlir_text_to_xdsl(mlir_text) if mlir_text else None
     prepared = graphs.get("prepared") or {}
-    projections = []
-    if path == "fx_importer":
-        for node in prepared.get("nodes", ()):
-            for value in node.get("results", ()):
-                dtype = value.get("storage_dtype") or ""
-                if dtype.startswith("float8_"):
-                    projections.append({"node_id": node["id"], "value_id": value["id"],
-                                        "frontend_dtype": dtype, "mlir_storage_dtype": "f32",
-                                        "reason": "FXImporter/xDSL has no native FP8 arithmetic type support"})
-        if projections:
-            blockers.append("FP8 storage is projected to f32; exact storage precision is not qualified")
+    from m2m.capture.fp8_storage_trace import observe_storage
+    precision = observe_storage(prepared, module, dispositions)
+    if precision["projections"]:
+        blockers.append("FP8 storage is projected to f32; exact storage precision is not qualified")
+    if precision["unknown_values"]:
+        blockers.append("exact FP8 storage format correspondence is unproved")
+    if precision["opaque_fp8_calls"]:
+        blockers.append("FP8 arithmetic remains an unresolved external call; typed storage is not arithmetic qualification")
     calls = {n["id"] for n in prepared.get("nodes", ())
              if n["op"] in {"call_function", "call_method", "call_module"}}
     mapped: dict[str, list[int]] = {}
@@ -2124,9 +2121,7 @@ def finalize_trace(graphs: dict[str, Any], mlir_text: str, *, path: str,
     return {"schema": "m2m.frontend_trace.v1", "status": "diagnostic" if blockers else "complete",
             "counting_unit": "static_captured_call_sites", "graphs": graphs,
             "transformations": transforms,
-            "precision": {"scope": "FXImporter FP8 storage projection audit",
-                          "status": "projected" if projections else "no_known_projection",
-                          "projections": projections},
+            "precision": precision,
             "mlir": {"sha256": hashlib.sha256(mlir_text.encode()).hexdigest(),
                      "bytes": len(mlir_text.encode()),
                      "serialization": "generic" if path == "fx_importer" else "backend",

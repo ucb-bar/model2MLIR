@@ -96,10 +96,20 @@ usable implementation. Unavailable provenance or an unqualified backend remains
 diagnostic. Existing callers without `capture_trace=True` keep normal serialization.
 
 Precision is not inferred from a scheme name. BF16/FP16 tensors retain native
-`bf16`/`f16` MLIR types. The current FXImporter/xDSL path projects Torch FP8
-storage to FP32; the trace records each affected value in `precision.projections`
-and remains diagnostic. This representation is not native FP8 lowering or an
-execution qualification.
+`bf16`/`f16` MLIR types. Exact Torch E4M3FN and E5M2 tensors retain standard
+`f8E4M3FN`/`f8E5M2` signatures and one-byte external storage. Pure layout
+operations and explicit widening/narrowing casts preserve those types; unknown
+FP8 formats refuse instead of becoming FP32. No local encoder or replacement
+quantization recipe is introduced. The trace checks actual source-ID-mapped
+MLIR storage, including positional arguments and existing checked aliases;
+unproved mappings remain unknown. `precision.projections` records an actual
+FP32 projection rather than assuming one from the framework dtype.
+
+Typed storage is not arithmetic qualification. `aten._scaled_mm` remains an
+explicit unresolved external call with typed FP8 operands, and its trace remains
+diagnostic. Accumulation order, scale/bias evaluation, floating effects and
+numeric permission require separate proofs before any target implementation or
+mixed-precision policy can be selected.
 
 To change the precision of the captured static program while preserving its
 original operation identities:

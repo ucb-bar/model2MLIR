@@ -28,6 +28,27 @@ from xdsl.dialects.tensor import EmptyOp
 from xdsl.ir import Operation, SSAValue
 
 
+def _storage_transpose(input, init, permutation, result=None):
+    """Construct the same pure transpose body for supported FP8 storage.
+
+    xDSL's convenience constructor hardcodes its closed AnyFloat union. The
+    operation itself admits typed tensors; its identity-yield body performs no
+    arithmetic and needs no value encoding or precision policy.
+    """
+    from m2m.ir.types import Float8E4M3FNType, Float8E5M2Type
+    from xdsl.dialects.linalg import YieldOp
+    from xdsl.ir import Block, Region
+
+    if isinstance(input.type, TensorType) and isinstance(input.type.element_type, (Float8E4M3FNType, Float8E5M2Type)):
+        if not isinstance(init.type, TensorType) or input.type.element_type != init.type.element_type:
+            raise ValueError("transpose must preserve the exact FP8 format")
+        block = Block(arg_types=[input.type.element_type, init.type.element_type])
+        block.add_op(YieldOp(block.args[0]))
+        return TransposeOp.build(operands=[[input], [init]], result_types=[[result or init.type]],
+                                 properties={"permutation": permutation}, regions=[Region(block)])
+    return TransposeOp(input=input, init=init, permutation=permutation, result=result)
+
+
 def _static_shape(shape_like: Any) -> list[int]:
     """Coerce a sequence of possibly-symbolic dims to xDSL-friendly ints.
 
@@ -227,10 +248,14 @@ def _cast_scalar_arg(x, dst, *, source_unsigned=False):
     )
     from xdsl.dialects.builtin import AnyFloat, FloatAttr, IntegerType
 
+    from m2m.ir.types import Float8E4M3FNType, Float8E5M2Type
+    floats = (AnyFloat, Float8E4M3FNType, Float8E5M2Type)
+    if isinstance(src, (Float8E4M3FNType, Float8E5M2Type)) and isinstance(dst, (Float8E4M3FNType, Float8E5M2Type)):
+        raise ValueError("cross-format FP8 conversion is not qualified")
     if isinstance(dst, IntegerType) and dst.width.data == 1:
         # PyTorch truth conversion is nonzero, not truncation to the low bit.
         # Unordered comparison keeps NaN true while both signed zeros are false.
-        if isinstance(src, AnyFloat):
+        if isinstance(src, floats):
             zero = ConstantOp(FloatAttr(0.0, src))
             op = CmpfOp(x, zero.result, "une")
         elif isinstance(src, IntegerType):
@@ -240,12 +265,12 @@ def _cast_scalar_arg(x, dst, *, source_unsigned=False):
             return [], x
         return [zero, op], op.results[0]
 
-    if isinstance(src, AnyFloat) and isinstance(dst, AnyFloat):
+    if isinstance(src, floats) and isinstance(dst, floats):
         op = TruncFOp(x, dst) if dst.bitwidth < src.bitwidth else ExtFOp(x, dst)
-    elif isinstance(src, IntegerType) and isinstance(dst, AnyFloat):
+    elif isinstance(src, IntegerType) and isinstance(dst, floats):
         # i1 is a boolean: signed conversion would turn True into -1.
         op = UIToFPOp(x, dst) if source_unsigned or src.width.data == 1 else SIToFPOp(x, dst)
-    elif isinstance(src, AnyFloat) and isinstance(dst, IntegerType):
+    elif isinstance(src, floats) and isinstance(dst, IntegerType):
         op = FPToSIOp(x, dst)
     elif isinstance(src, IntegerType) and isinstance(dst, IntegerType):
         if dst.width.data < src.width.data:
@@ -435,7 +460,7 @@ def decompose_linear(
     ops.append(wt_empty)
 
     perm = DenseArrayBase.from_list(i64, [1, 0])
-    transpose = TransposeOp(
+    transpose = _storage_transpose(
         input=w,
         init=wt_empty.results[0],
         permutation=perm,
@@ -894,7 +919,7 @@ def decompose_transpose(
 
     t_empty = _make_empty(result_type)
     perm = DenseArrayBase.from_list(i64, [1, 0])
-    transpose = TransposeOp(
+    transpose = _storage_transpose(
         input=operands[0],
         init=t_empty.results[0],
         permutation=perm,
@@ -927,7 +952,7 @@ def decompose_permute(
         result_type = TensorType(elem, result_shape)
         empty = _make_empty(result_type)
         perm = DenseArrayBase.from_list(i64, [int(d) for d in dims])
-        transpose = TransposeOp(
+        transpose = _storage_transpose(
             input=operands[0], init=empty.results[0], permutation=perm, result=result_type
         )
         rid = _next_region_id("permute")
@@ -984,7 +1009,7 @@ def decompose_pixel_shuffle(operands, meta, node_name):
     rid = _next_region_id("pixel_shuffle")
     # (n, c, r, r, h, w) -> (n, c, h, r, w, r): source dim order 0,1,4,2,5,3.
     perm = DenseArrayBase.from_list(i64, [0, 1, 4, 2, 5, 3])
-    transpose = TransposeOp(input=split[1], init=empty.results[0], permutation=perm,
+    transpose = _storage_transpose(input=split[1], init=empty.results[0], permutation=perm,
                             result=mid_type)
     _attach_region_id(transpose, rid)
     ops += [empty, transpose]
@@ -1092,7 +1117,7 @@ def decompose_lstm(operands, meta, node_name):
         """x[m,k] @ w[n,k]^T -> [m,n]; torch stores both weights output-major."""
         wt_type = TensorType(elem, [k, n])
         empty_t = _make_empty(wt_type)
-        tr = TransposeOp(input=w, init=empty_t.results[0],
+        tr = _storage_transpose(input=w, init=empty_t.results[0],
                          permutation=DenseArrayBase.from_list(i64, [1, 0]), result=wt_type)
         rt = TensorType(elem, [m, n])
         empty_m = _make_empty(rt)
@@ -2506,7 +2531,7 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
         res = rr[1]
     else:
         t_empty = _make_empty(out_type)
-        tr = TransposeOp(input=fr[1], init=t_empty.results[0],
+        tr = _storage_transpose(input=fr[1], init=t_empty.results[0],
                          permutation=DenseArrayBase.from_list(i64, [1, 0, 2, 3]),
                          result=out_type)
         ops += [t_empty, tr]
@@ -3131,7 +3156,7 @@ def _move_axis_last(src, shape: list[int], axis: int, elem: Any):
     if perm != list(range(rank)):
         t_type = TensorType(elem, [shape[i] for i in perm])
         t_empty = _make_empty(t_type)
-        tr = TransposeOp(input=cur, init=t_empty.results[0],
+        tr = _storage_transpose(input=cur, init=t_empty.results[0],
                          permutation=DenseArrayBase.from_list(i64, perm), result=t_type)
         ops += [t_empty, tr]
         cur = tr.results[0]
@@ -3162,7 +3187,7 @@ def _restore_axis(src, rest: list[int], out_len: int, axis: int, rank: int, elem
         cur_shape = [*rest, out_len]
         t_type = TensorType(elem, [cur_shape[i] for i in inv])
         t_empty = _make_empty(t_type)
-        tr = TransposeOp(input=cur, init=t_empty.results[0],
+        tr = _storage_transpose(input=cur, init=t_empty.results[0],
                          permutation=DenseArrayBase.from_list(i64, inv), result=t_type)
         ops += [t_empty, tr]
         cur = tr.results[0]
@@ -4645,7 +4670,7 @@ def decompose_transpose_int(operands, meta, node_name):
     perm[d0], perm[d1] = perm[d1], perm[d0]
     result_type = TensorType(meta_elem, out_shape)
     empty = _make_empty(result_type)
-    transpose = TransposeOp(input=operands[0], init=empty.results[0],
+    transpose = _storage_transpose(input=operands[0], init=empty.results[0],
                             permutation=DenseArrayBase.from_list(i64, perm), result=result_type)
     rid = _next_region_id("transpose")
     _attach_region_id(transpose, rid)
@@ -6223,12 +6248,11 @@ def _element_type_from_meta(meta: dict[str, Any]) -> Any:
         return IntegerType(32)
     if d == torch.int64:
         return IntegerType(64)
-    # fp8 flows through compute as f32 (xDSL has no builtin Float8 / closed AnyFloat
-    # union; see _torch_dtype_to_xdsl). The fp8 scheme is recorded as a module attribute.
-    _f8 = {getattr(torch, n, None) for n in ("float8_e4m3fn", "float8_e5m2",
-                                             "float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu")}
-    if d in _f8:
-        return Float32Type()
+    from m2m.ir.types.float8 import torch_fp8_type
+
+    fp8 = torch_fp8_type(d)
+    if fp8 is not None:
+        return fp8
     return Float32Type()
 
 

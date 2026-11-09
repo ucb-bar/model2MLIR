@@ -253,19 +253,11 @@ def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:
         torch.float16: Float16Type,
         torch.bfloat16: BFloat16Type,
     }
-    # FP8: torch's float8 dtypes (e4m3fn / e5m2) have MLIR-native equivalents
-    # (f8E4M3FN, f8E5M2) but xDSL 0.65 ships no builtin Float8 type and its
-    # `AnyFloat` is a closed union, so linalg body-builders (transpose/generic)
-    # reject our custom Float8 type with an AnyFloat assertion. Since we can't
-    # patch xDSL (and fp8 here is for representation, not execution), fp8 tensors
-    # flow through the compute path as f32; the exact torchAO fp8 scheme is recorded
-    # as the module attribute `prov.quantization` so the quantization is still captured.
-    # `Float8E4M3FNType`/`Float8E5M2Type` remain available for a future xDSL that
-    # supports f8 natively (or a torch-mlir round-trip).
-    _f8 = {getattr(torch, n, None) for n in ("float8_e4m3fn", "float8_e5m2",
-                                             "float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu")}
-    if dtype in _f8:
-        return Float32Type()
+    from m2m.ir.types.float8 import torch_fp8_type
+
+    fp8 = torch_fp8_type(dtype)
+    if fp8 is not None:
+        return fp8
     # Bool -> i1 (so arith.select conds / comparison results verify) and integers ->
     # their bitwidth, instead of silently defaulting to f32.
     from xdsl.dialects.builtin import IntegerType
@@ -1131,6 +1123,16 @@ class FXImporter:
 
         region = Region([block])
         main_func = FuncOp("forward", func_type, region)
+        # Actual positional placeholder binding, not a name/content match.
+        # This records type correspondence only, not value/ownership admission.
+        source_ids = [(p.meta.get("custom") or {}).get("m2m_node_id") for p in placeholders]
+        fp8_arguments = any(isinstance(t, TensorType) and isinstance(t.element_type,
+                              (Float8E4M3FNType, Float8E5M2Type)) for t in arg_types)
+        if fp8_arguments and source_ids and all(isinstance(sid, str) and sid for sid in source_ids):
+            from xdsl.dialects.builtin import ArrayAttr
+            main_func.attributes["prov.argument_source_node_ids"] = ArrayAttr(
+                [StringAttr(sid) for sid in source_ids]
+            )
 
         # Externs merged from while_loop body sub-imports (renamed, collision-free).
         pending = getattr(self, "_pending_extern_funcs", [])

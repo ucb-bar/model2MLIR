@@ -255,7 +255,7 @@ def test_bf16_and_fp16_capture_keep_native_typed_edges():
         assert result.capture_trace["precision"]["status"] == "no_known_projection"
 
 
-def test_fp8_storage_projection_is_explicit_and_not_qualified():
+def test_fp8_storage_is_preserved_before_explicit_fp32_widening():
     class StoredFP8(nn.Module):
         def __init__(self, dtype):
             super().__init__()
@@ -267,13 +267,15 @@ def test_fp8_storage_projection_is_explicit_and_not_qualified():
     for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         result = m2m.convert(StoredFP8(dtype).eval(), (torch.ones(2, 8),),
                              backend="fx_importer", capture_trace=True)
-        assert result.ok  # preserve the legacy diagnostic representation
-        assert result.capture_trace["status"] == "diagnostic"
+        assert result.ok
         precision = result.capture_trace["precision"]
-        assert precision["status"] == "projected" and precision["projections"]
+        assert precision["status"] == "preserved"
+        assert not precision["projections"] and not precision["unknown_values"]
+        assert precision["arithmetic_qualified"] is False
+        assert any(op.name == "arith.extf" for op in result.module.walk())
         assert all(row["frontend_dtype"] == str(dtype).removeprefix("torch.")
-                   and row["mlir_storage_dtype"] == "f32" for row in precision["projections"])
-        assert any("FP8 storage" in reason for reason in result.capture_trace["blockers"])
+                   for row in precision["values"])
+        assert not any("FP8 storage is projected" in reason for reason in result.capture_trace["blockers"])
 
 
 def test_owned_precision_conversion_keeps_exact_original_source_identity():

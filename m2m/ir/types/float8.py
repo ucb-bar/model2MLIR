@@ -28,12 +28,12 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from xdsl.dialects.builtin import FixedBitwidthType
+from xdsl.dialects.builtin import _FloatType
 from xdsl.ir import ParametrizedAttribute
 from xdsl.irdl import irdl_attr_definition
 
 
-class _Float8Base(ParametrizedAttribute, FixedBitwidthType):
+class _Float8Base(ParametrizedAttribute, _FloatType):
     """Shared implementation for FP8 types.
 
     Each subclass is a parameterless type attribute. Format metadata
@@ -47,6 +47,26 @@ class _Float8Base(ParametrizedAttribute, FixedBitwidthType):
     HAS_INFINITY: ClassVar[bool] = False
     HAS_NAN: ClassVar[bool] = False
     MAX_FINITE: ClassVar[float] = 0.0
+
+    def iter_unpack(self, buffer, /):
+        raise NotImplementedError(
+            "FP8 encoding belongs to the original framework tensor"
+        )
+
+    def unpack(self, buffer, num, /):
+        raise NotImplementedError(
+            "FP8 encoding belongs to the original framework tensor"
+        )
+
+    def pack_into(self, buffer, offset, value):
+        raise NotImplementedError(
+            "FP8 encoding belongs to the original framework tensor"
+        )
+
+    def pack(self, values):
+        raise NotImplementedError(
+            "FP8 encoding belongs to the original framework tensor"
+        )
 
     @property
     def bitwidth(self) -> int:
@@ -97,7 +117,7 @@ class Float8E4M3FNType(_Float8Base):
     paths.
     """
 
-    name = "builtin_ext.f8E4M3FN"
+    name = "f8E4M3FN"
 
     EXPONENT_BITS: ClassVar[int] = 4
     MANTISSA_BITS: ClassVar[int] = 3
@@ -117,7 +137,7 @@ class Float8E5M2Type(_Float8Base):
     precision.
     """
 
-    name = "builtin_ext.f8E5M2"
+    name = "f8E5M2"
 
     EXPONENT_BITS: ClassVar[int] = 5
     MANTISSA_BITS: ClassVar[int] = 2
@@ -130,3 +150,58 @@ __all__ = [
     "Float8E4M3FNType",
     "Float8E5M2Type",
 ]
+
+
+def torch_fp8_type(dtype):
+    """Preserve only exact supported framework formats; unknown FP8 refuses."""
+    import torch
+
+    if dtype is torch.float8_e4m3fn:
+        return Float8E4M3FNType()
+    if dtype is torch.float8_e5m2:
+        return Float8E5M2Type()
+    if str(dtype).startswith("torch.float8_"):
+        raise ValueError("unsupported FP8 storage format: " + str(dtype))
+    return None
+
+
+def register_fp8_types():
+    """Idempotent standard-type parser and arith float-constraint registration.
+
+    These storage types encode no values and grant no arithmetic lowering.
+    xDSL currently has a closed builtin float table/constraint union; register
+    these exact two standard spellings without changing other parse behavior.
+    """
+    from xdsl.irdl.constraints import BaseAttr
+    from xdsl.parser.attribute_parser import AttrParser
+    from xdsl.utils.mlir_lexer import MLIRTokenKind
+
+    types = {"f8E4M3FN": Float8E4M3FNType(), "f8E5M2": Float8E5M2Type()}
+    if not getattr(AttrParser, "_m2m_fp8_parse_hook", False):
+        original = getattr(AttrParser, "_parse_optional_integer_or_float_type", None)
+        if original is None:
+            raise RuntimeError("selected xDSL cannot parse standard FP8 storage types")
+
+        def parse(self):
+            token = self._current_token
+            if token.kind == MLIRTokenKind.BARE_IDENT and token.text in types:
+                self._consume_token()
+                return types[token.text]
+            return original(self)
+
+        AttrParser._parse_optional_integer_or_float_type = parse
+        AttrParser._m2m_fp8_parse_hook = True
+    for name in ("arith", "math"):
+        module = __import__("xdsl.dialects." + name, fromlist=["floatingPointLike"])
+        constraint = getattr(
+            getattr(module, "floatingPointLike", None), "elem_constr", None
+        )
+        if constraint is None or not hasattr(constraint, "_based_constrs"):
+            # Preserve the selected xDSL's verifier; unsupported FP8 casts then
+            # refuse instead of silently projecting into another storage type.
+            continue
+        for value in types.values():
+            constraint._based_constrs.setdefault(type(value), BaseAttr(type(value)))
+
+
+register_fp8_types()

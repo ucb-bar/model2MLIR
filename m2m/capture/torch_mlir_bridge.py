@@ -99,6 +99,8 @@ def _parse_mlir_text_to_xdsl(mlir_text: str) -> ModuleOp | None:
     from xdsl.dialects.tensor import Tensor
     from xdsl.parser import Parser
 
+    from m2m.ir.types.float8 import register_fp8_types
+    register_fp8_types()
     ctx = Context(allow_unregistered=True)
     ctx.load_dialect(Builtin)
     ctx.load_dialect(Arith)
