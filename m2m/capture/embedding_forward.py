@@ -1,6 +1,7 @@
 """Closed unary embedding wrapper admission, not arbitrary Python verification."""
 
 from __future__ import annotations
+import __future__
 
 import ast
 import builtins
@@ -11,6 +12,7 @@ import json
 import math
 import struct
 import textwrap
+import tokenize
 from collections import OrderedDict
 from dataclasses import dataclass
 from types import CodeType, FunctionType
@@ -111,15 +113,60 @@ def _code_parts(code):
         code.co_kwonlyargcount,
         code.co_freevars,
         code.co_cellvars,
-        code.co_flags
-        & (
-            inspect.CO_VARARGS
-            | inspect.CO_VARKEYWORDS
-            | inspect.CO_GENERATOR
-            | inspect.CO_COROUTINE
-            | inspect.CO_ASYNC_GENERATOR
-        ),
+        code.co_flags,
+        code.co_stacksize,
+        code.co_nlocals,
+        getattr(code, "co_exceptiontable", b"").hex(),
     )
+
+
+def _source_context(fn):
+    """Recover compiler context from physical source, never candidate code flags."""
+    path = inspect.getsourcefile(fn)
+    if path is None:
+        _error("physical source context unavailable")
+    try:
+        with tokenize.open(path) as stream:
+            source = stream.read(1_048_577)
+        if len(source) > 1_048_576:
+            _error("physical source context exceeds proof bound")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError, UnicodeError) as exc:
+        _error("physical source context: " + str(exc))
+    flags = 0
+    for statement in tree.body:
+        if (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and type(statement.value.value) is str
+        ):
+            continue
+        if (
+            not isinstance(statement, ast.ImportFrom)
+            or statement.module != "__future__"
+        ):
+            break
+        for alias in statement.names:
+            if alias.name not in __future__.all_feature_names:
+                _error("unproved future context")
+            flags |= getattr(__future__, alias.name).compiler_flag
+    found = []
+
+    def visit(node, depth):
+        function = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        if (
+            function
+            and node.lineno == fn.__code__.co_firstlineno
+            and node.name == fn.__code__.co_name
+        ):
+            found.append(depth > 0)
+        for child in ast.iter_child_nodes(node):
+            visit(child, depth + int(function))
+
+    visit(tree, 0)
+    if len(found) != 1:
+        _error("unproved source definition/qualification context")
+    return flags, found[0]
 
 
 def _grammar(fn, module):
@@ -221,25 +268,46 @@ def _grammar(fn, module):
         _error("scale is not an ordinary owned attribute")
     # Compile but NEVER execute the source. This proves source text describes
     # the actual code object, including names/constants/closure and operands.
-    template = ast.Module(
-        body=[
-            ast.ClassDef(
-                name="_Proof",
-                bases=[],
-                keywords=[],
-                body=[copy.deepcopy(definition)],
+    source_flags, nested = _source_context(fn)
+    definition_class = ast.ClassDef(
+        name="_Proof",
+        bases=[],
+        keywords=[],
+        body=[copy.deepcopy(definition)],
+        decorator_list=[],
+    )
+    body = [definition_class]
+    if nested:
+        body = [
+            ast.FunctionDef(
+                name="_LexicalContext",
+                args=ast.arguments(
+                    posonlyargs=[],
+                    args=[],
+                    vararg=None,
+                    kwonlyargs=[],
+                    kw_defaults=[],
+                    kwarg=None,
+                    defaults=[],
+                ),
+                body=body,
                 decorator_list=[],
             )
-        ],
-        type_ignores=[],
-    )
+        ]
+    template = ast.Module(body=body, type_ignores=[])
     module_code = compile(
         ast.fix_missing_locations(template),
         "<embedding-forward-proof>",
         "exec",
+        flags=source_flags,
         dont_inherit=True,
     )
-    class_code = next(c for c in module_code.co_consts if type(c) is CodeType)
+    context_code = next(c for c in module_code.co_consts if type(c) is CodeType)
+    class_code = (
+        next(c for c in context_code.co_consts if type(c) is CodeType)
+        if nested
+        else context_code
+    )
     code = next(c for c in class_code.co_consts if type(c) is CodeType)
     if _code_parts(fn.__code__) != _code_parts(code):
         _error("source/code mismatch")

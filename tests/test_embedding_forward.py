@@ -1,6 +1,9 @@
 """Closed executed wrapper grammar, including indirect Python-effect refusals."""
 
 from __future__ import annotations
+import __future__
+
+import inspect
 
 import pytest
 import torch
@@ -279,3 +282,53 @@ def test_global_module_hook_refuses(monkeypatch):
     )
     with pytest.raises(DynamicLinearLineageError, match="global module hooks"):
         LinearInstrumentation(model, embedding_policy=Int8WeightOnlyEmbeddingPolicy())
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "exception_table",
+        "stack",
+        "locals",
+        "optimized",
+        "newlocals",
+        "nested",
+        "future",
+    ],
+)
+def test_executed_code_structure_refuses_before_model_call(change, monkeypatch):
+    model, _ = prepare(BufferScaled())
+    fn = BufferScaled.forward
+    code = fn.__code__
+    if change == "exception_table":
+        if not hasattr(code, "co_exceptiontable"):
+            pytest.skip("exception opcodes already part of co_code on Python3.10")
+        changed = code.replace(co_exceptiontable=b"\x80\x01\x00\x00")
+    elif change == "stack":
+        changed = code.replace(co_stacksize=code.co_stacksize + 1)
+    elif change == "locals":
+        changed = code.replace(
+            co_nlocals=code.co_nlocals + 1, co_varnames=code.co_varnames + ("unproved",)
+        )
+    else:
+        flag = {
+            "optimized": inspect.CO_OPTIMIZED,
+            "newlocals": inspect.CO_NEWLOCALS,
+            "nested": inspect.CO_NESTED,
+            "future": __future__.annotations.compiler_flag,
+        }[change]
+        changed = code.replace(co_flags=code.co_flags ^ flag)
+    monkeypatch.setattr(fn, "__code__", changed)
+    with pytest.raises(DynamicLinearLineageError, match="source/code mismatch"):
+        LinearInstrumentation(model, embedding_policy=Int8WeightOnlyEmbeddingPolicy())
+    assert "forward" not in model.embedding.__dict__
+
+
+def test_real_nested_pure_class_context_is_supported():
+    class Nested(torch.nn.Embedding):
+        def forward(self, ids):
+            return super().forward(ids)
+
+    model, _ = prepare(Nested(17, 23))
+    with LinearInstrumentation(model, embedding_policy=Int8WeightOnlyEmbeddingPolicy()):
+        pass

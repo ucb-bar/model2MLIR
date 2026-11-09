@@ -120,8 +120,11 @@ lookup, optionally multiplied by a finite builtin instance scalar or owned
 ordinary F32 scalar buffer (optionally cast to the weight dtype). Compile-only
 comparison binds the accepted syntax to the executed code; ordinary module
 lookup, call path, scale ownership, code and closure remain checked. Other
-Python calls, stores, helpers, descriptors and hooks refuse. This does not prove
-arbitrary Python effects. Mutable
+Python calls, stores, helpers, descriptors and hooks refuse. Execution flags,
+local/stack counts and exception tables must match compilation in the actual
+source future-import and lexical context. Source filenames, line tables and
+qualification metadata are not a Python debugging or exception-text guarantee.
+This does not prove arbitrary Python effects. Mutable
 `max_norm`, unrelated weight reads, repeated invocations and unknown behavior
 refuse. Original ties may split into independently checked public encodings; no
 storage deduplication or new tie is inferred. The original capability references,
