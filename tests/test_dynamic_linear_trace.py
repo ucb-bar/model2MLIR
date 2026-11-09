@@ -439,3 +439,104 @@ def test_shared_converter_failure_never_falls_back(tmp_path, failure):
             shared_program_converter=converter,
         )
     assert calls == ["one"]
+
+
+class RepeatedCaller(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(32, 32, bias=False)
+        self.cross = False
+
+    def forward(self, value):
+        first = torch.zeros((), dtype=torch.float32)
+        second = torch.zeros((), dtype=torch.float32)
+        first = first + 1
+        second = second + 2
+        mixed = value + (second if self.cross else first)
+        return self.linear(mixed) + (first if self.cross else second)
+
+
+def test_repeated_identical_calls_bind_distinct_actual_ordered_occurrences():
+    torch.manual_seed(23)
+    model = RepeatedCaller().eval().requires_grad_(False)
+    inputs = (torch.randn(1, 32),)
+    quant = QuantizationConfig(scheme="int8_dyn_act_int8_weight")
+    with LinearInstrumentation(model) as owner:
+        source = owner.capture_source(model, inputs)
+        apply_quantization(model, quant)
+        selected, proof = owner.export_selected(
+            source, model, inputs, quantization=quant
+        )
+        assert proof["complete_root_call_occurrences_verified"] == 7
+        zeros = [
+            node
+            for node in selected.graph.nodes
+            if node.target is torch.ops.aten.zeros.default
+        ]
+        assert len(zeros) == 2
+        source_ids = [(node.meta["custom"]["m2m_lineage"])[-1] for node in zeros]
+        assert len(set(source_ids)) == 2
+        assert source_ids == [
+            row["id"]
+            for row in source.snapshot["nodes"]
+            if row["target"] == "aten.zeros.default"
+        ]
+
+
+def test_same_shape_duplicate_call_output_swap_does_not_prove_caller_relation():
+    model = RepeatedCaller().eval().requires_grad_(False)
+    inputs = (torch.randn(1, 32),)
+    quant = QuantizationConfig(scheme="int8_dyn_act_int8_weight")
+    with LinearInstrumentation(model) as owner:
+        source = owner.capture_source(model, inputs)
+        apply_quantization(model, quant)
+        model.cross = True
+        with pytest.raises(DynamicLinearLineageError, match="caller|occurrence"):
+            owner.export_selected(source, model, inputs, quantization=quant)
+
+
+def test_independent_call_reorder_is_not_silently_certified():
+    from m2m.capture.dynamic_linear_trace import _bind_pair
+
+    class Ordered(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(32, 32, bias=False)
+
+        def forward(self, value):
+            sine = value.sin()
+            cosine = value.cos()
+            return self.linear(sine + cosine)
+
+    model = Ordered().eval().requires_grad_(False)
+    inputs = (torch.randn(1, 32),)
+    quant = QuantizationConfig(scheme="int8_dyn_act_int8_weight")
+    with LinearInstrumentation(model) as owner:
+        source = owner.capture_source(model, inputs)
+        apply_quantization(model, quant)
+        selected = torch.export.export(
+            model,
+            inputs,
+            strict=True,
+            preserve_module_call_signature=tuple(source.sites),
+        )
+        sine = next(
+            node
+            for node in selected.graph.nodes
+            if node.target is torch.ops.aten.sin.default
+        )
+        cosine = next(
+            node
+            for node in selected.graph.nodes
+            if node.target is torch.ops.aten.cos.default
+        )
+        sine.prepend(cosine)
+        selected.graph_module.recompile()
+        selected.validate()
+        with pytest.raises(DynamicLinearLineageError, match="occurrence"):
+            _bind_pair(source.exported, selected, source.sites)
+        assert not any(
+            str(origin).startswith("g:original:")
+            for node in selected.graph.nodes
+            for origin in (node.meta.get("custom") or {}).get("m2m_lineage", [])
+        )

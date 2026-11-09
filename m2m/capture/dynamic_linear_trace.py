@@ -453,89 +453,81 @@ def _bind_pair(source, selected, sites):
         claims[identity] = weight_rows[receiver]
         kind[identity] = "declared_weight_field_reencoding"
     source_sites = {b["output"] for b in sb.values()}
-    pending = [
-        r
-        for r in old["nodes"]
-        if r["op"] == "call_function"
-        and r["id"] not in source_sites
-        and r["graph_id"] == "g:original:root"
+    source_order = [
+        row
+        for row in old["nodes"]
+        if row["op"] == "call_function" and row["graph_id"] == "g:original:root"
     ]
+    selected_outputs = {boundary["output"] for boundary in db.values()}
+    selected_order = [
+        row
+        for row in new["nodes"]
+        if row["op"] == "call_function"
+        and row["graph_id"] == "g:quantized:root"
+        and (row["id"] not in claims or row["id"] in selected_outputs)
+    ]
+    if len(source_order) != len(selected_order):
+        raise DynamicLinearLineageError("source caller occurrence roster changed")
     identity = {identity: identity for identity in oldrows}
-    while pending:
-        progress = False
-        for row in list(pending):
-            if row["id"] in old_contexts:
-                context = old_contexts[row["id"]]
-                matches = []
-                for candidate in new_contexts.values():
-                    if (
-                        candidate.identity in claims
-                        or candidate.control != context.control
-                    ):
-                        continue
-                    if candidate.canonical_body != context.canonical_body:
-                        continue
-                    if _types(oldrows[context.identity]) != _types(
-                        newrows[candidate.identity]
-                    ):
-                        continue
-                    try:
-                        equal = _frame(context.arguments, oldrows, identity) == _frame(
-                            candidate.arguments, newrows, mapping
-                        )
-                    except KeyError:
-                        equal = False
-                    if equal:
-                        matches.append(candidate)
-                if len(matches) == 1:
-                    candidate = matches[0]
-                    mapping[candidate.function_id] = context.function_id
-                    claims[candidate.function_id] = context.function_id
-                    kind[candidate.function_id] = "exact_context_function_binding"
-                    mapping[candidate.identity] = context.identity
-                    claims[candidate.identity] = context.identity
-                    kind[candidate.identity] = "exact_readonly_context_call"
-                    for before, after in zip(context.body, candidate.body, strict=True):
-                        mapping[after["id"]] = before["id"]
-                        claims[after["id"]] = before["id"]
-                        kind[after["id"]] = "exact_readonly_context_body"
-                    pending.remove(row)
-                    progress = True
-                continue
+    # The contract requires the complete global call order to be unchanged.
+    # Collapse ONLY independently verified actual Linear regions, then bind
+    # each occurrence by this total order AND its exact typed DAG operands.
+    # Repeated identical calls still have separate, ordered occurrences; no
+    # arbitrary candidate, node name or shape-only correspondence is selected.
+    for row, other in zip(source_order, selected_order, strict=True):
+        if row["id"] in source_sites:
+            if (
+                other["id"] not in selected_outputs
+                or claims.get(other["id"]) != row["id"]
+            ):
+                raise DynamicLinearLineageError("Linear occurrence/call order changed")
+            continue
+        if other["id"] in claims:
+            raise DynamicLinearLineageError("selected caller occurrence already owned")
+        if row["id"] in old_contexts:
+            context = old_contexts[row["id"]]
+            candidate = new_contexts.get(other["id"])
+            if candidate is None or (
+                candidate.control != context.control
+                or candidate.canonical_body != context.canonical_body
+                or _types(row) != _types(other)
+            ):
+                raise DynamicLinearLineageError("context occurrence/body changed")
             try:
-                k = _key(row, oldrows, identity)
+                equal = _frame(context.arguments, oldrows, identity) == _frame(
+                    candidate.arguments, newrows, mapping
+                )
             except KeyError:
-                raise DynamicLinearLineageError("original has unbound operands")
-            matches = []
-            for other in new["nodes"]:
-                if (
-                    other["op"] != "call_function"
-                    or other["id"] in claims
-                    or other["graph_id"] != "g:quantized:root"
-                    or other["id"] in new_contexts
-                ):
-                    continue
-                if old["operator_schemas"].get(row["target"]) != new[
-                    "operator_schemas"
-                ].get(other["target"]):
-                    continue
-                try:
-                    equal = _key(other, newrows, mapping) == k
-                except KeyError:
-                    equal = False
-                if equal:
-                    matches.append(other)
-            if len(matches) == 1:
-                other = matches[0]
-                mapping[other["id"]] = row["id"]
-                claims[other["id"]] = row["id"]
-                kind[other["id"]] = "exact_unchanged_call"
-                pending.remove(row)
-                progress = True
-        if not progress:
-            raise DynamicLinearLineageError(
-                "unchanged source calls not uniquely anchored"
+                equal = False
+            if not equal:
+                raise DynamicLinearLineageError(
+                    "context ordered caller operands changed"
+                )
+            mapping[candidate.function_id] = context.function_id
+            claims[candidate.function_id] = context.function_id
+            kind[candidate.function_id] = "exact_context_function_binding"
+            mapping[candidate.identity] = context.identity
+            claims[candidate.identity] = context.identity
+            kind[candidate.identity] = "exact_readonly_context_call"
+            for before, after in zip(context.body, candidate.body, strict=True):
+                mapping[after["id"]] = before["id"]
+                claims[after["id"]] = before["id"]
+                kind[after["id"]] = "exact_readonly_context_body"
+            continue
+        try:
+            equal = (
+                other["id"] not in new_contexts
+                and old["operator_schemas"].get(row["target"])
+                == new["operator_schemas"].get(other["target"])
+                and _key(row, oldrows, identity) == _key(other, newrows, mapping)
             )
+        except KeyError:
+            equal = False
+        if not equal:
+            raise DynamicLinearLineageError("typed caller occurrence/operands changed")
+        mapping[other["id"]] = row["id"]
+        claims[other["id"]] = row["id"]
+        kind[other["id"]] = "exact_unchanged_call"
     for path in sites:
         if mapping.get(db[path]["input"]) != sb[path]["input"]:
             raise DynamicLinearLineageError("linear caller changed")
@@ -590,6 +582,7 @@ def _bind_pair(source, selected, sites):
         "actual_quantized_calls": sum(r["op"] == "call_function" for r in new["nodes"]),
         "sites": len(sites),
         "caller_graph_and_order_verified": True,
+        "complete_root_call_occurrences_verified": len(source_order),
         "all_original_weight_encodings_verified": True,
         "site_bindings": site_records,
     }
