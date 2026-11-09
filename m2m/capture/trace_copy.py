@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import functools
 from collections import defaultdict
 from dataclasses import fields
+from enum import Enum
 from types import BuiltinFunctionType, FunctionType, ModuleType
 
 import torch
@@ -31,6 +33,7 @@ def _metadata(value):
         (
             type,
             torch.dtype,
+            torch.qscheme,
             torch.device,
             torch.layout,
             torch.memory_format,
@@ -39,6 +42,76 @@ def _metadata(value):
         ),
     ):
         return value
+    if isinstance(value, (Enum, torch.SymInt, torch.SymFloat, torch.SymBool)):
+        return value  # Preserve symbolic guards/descriptors; never concretize them.
+    if type(value).__module__ in {
+        "torch.fx.experimental.symbolic_shapes",
+        "torch.utils._pytree",
+    }:
+        from torch.fx.experimental import symbolic_shapes
+        from torch.utils import _pytree
+
+        key_types = tuple(
+            cls
+            for cls in (
+                getattr(symbolic_shapes, "CallMethodKey", None),
+                getattr(symbolic_shapes, "DivideByKey", None),
+                getattr(_pytree, "SequenceKey", None),
+                getattr(_pytree, "MappingKey", None),
+                getattr(_pytree, "GetAttrKey", None),
+            )
+            if cls is not None
+        )
+        if type(value) in key_types:
+            # Typed path descriptors are copied without ever calling get().
+            return type(value)(
+                **{
+                    field.name: _metadata(getattr(value, field.name))
+                    for field in fields(value)
+                }
+            )
+    from sympy import Basic
+
+    if isinstance(value, Basic):
+        return value  # Immutable symbolic expression; no guard evaluation.
+    if type(value).__module__ == "torch.utils._sympy.value_ranges":
+        from torch.utils._sympy.value_ranges import ValueRanges
+
+        if type(value) is ValueRanges:
+            owned = object.__new__(ValueRanges)
+            for field in fields(ValueRanges):
+                object.__setattr__(
+                    owned, field.name, _metadata(getattr(value, field.name))
+                )
+            return (
+                owned  # Keep the already-validated bound; never rerun its comparator.
+            )
+    if type(value) is functools.partial:
+        owned = functools.partial(
+            _metadata(value.func), *_metadata(value.args), **_metadata(value.keywords)
+        )
+        owned.__dict__.update(_metadata(value.__dict__))
+        return owned
+    if type(value).__module__.startswith("torch.ao.quantization."):
+        from torch.ao.quantization.fx.custom_config import PrepareCustomConfig
+        from torch.ao.quantization.fx.utils import ObservedGraphModuleAttrs
+        from torch.ao.quantization.observer import _PartialWrapper
+        from torch.ao.quantization.qconfig_mapping import QConfigMapping
+
+        expected = None
+        if type(value) is ObservedGraphModuleAttrs:
+            expected = {field.name for field in fields(ObservedGraphModuleAttrs)}
+        elif type(value) in (PrepareCustomConfig, QConfigMapping):
+            expected = set(vars(type(value)()))
+        elif type(value) is _PartialWrapper:
+            expected = {"p", "callable_args"}
+        if expected is not None:
+            if set(vars(value)) != expected:
+                raise ValueError("unsupported extra quantization trace metadata fields")
+            owned = object.__new__(type(value))
+            for key, item in vars(value).items():
+                object.__setattr__(owned, key, _metadata(item))
+            return owned
     if type(value) is FunctionType:
         return value  # Captured callable identity, like the unchanged FX node target.
     if type(value) is BuiltinFunctionType and (

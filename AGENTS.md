@@ -142,6 +142,11 @@ provenance records are copied by their typed fields, and unknown opaque objects
 refuse without invoking arbitrary deepcopy hooks. Linear source annotations are
 an optional runtime capability, loaded only when that opt-in owner is requested.
 Byte identities flatten scalar and one-element strided tensors before reinterpretation.
+Typed FX/PT2E observer configuration and partial callback bindings retain owned
+configuration fields without invoking callbacks or opaque deepcopy hooks.
+Symbolic scalar/expression identities, typed shape paths and already-validated
+range bounds are preserved without concretization, constraint evaluation or
+removing runtime guards. Unknown nested objects or extra unproved fields refuse.
 
 Disabled `aten.dropout` may be proved as a forward tensor identity only with
 its selected schema, explicit `train=False`, a finite valid probability, exact
