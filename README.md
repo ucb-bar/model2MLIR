@@ -96,6 +96,33 @@ correspondence remains diagnostic. Already-quantized loaders without an original
 receipt are explicitly unknown; they never masquerade as the original float graph.
 Capture failures do not trigger a hidden replacement export in traced conversion.
 
+`LinearInstrumentation` can additionally prove the public default-v2 per-row
+weight-only INT8 transform of a read-only embedding through an explicit capability:
+
+```python
+from m2m.capture.dynamic_linear_trace import LinearInstrumentation
+from m2m.capture.embedding_trace import Int8WeightOnlyEmbeddingPolicy
+
+with LinearInstrumentation(model, embedding_policy=Int8WeightOnlyEmbeddingPolicy()) as owner:
+    original = owner.capture_source(model, inputs)
+    # Apply actual public TorchAO dynamic-INT8 Linear and weight-only-INT8
+    # Embedding transforms here. The owner never applies a quantizer.
+    selected, proof = owner.export_selected(original, model, inputs, quantization=config)
+```
+
+This opt-in proves the actual `aten.embedding` weight/index/control boundary and
+independently repacks the original FP32 weight with the public recipe. Typed
+qdata/scales/zero-points, field geometry, owners, aliases and unchanged surrounding
+caller arithmetic must agree. A subclass postscale remains an ordinary exact
+source operation; no subclass name grants numerical permission. Mutable
+`max_norm`, unrelated weight reads, repeated invocations and unknown behavior
+refuse. Original ties may split into independently checked public encodings; no
+storage deduplication or new tie is inferred. The original capability references,
+graphs, fields, state and exact examples remain sealed through conversion.
+The absent-policy path keeps the original Linear-only contract. This is source
+correspondence and complete example export equality, not quantization quality,
+target memory fit, deployment support or model accuracy.
+
 Check `r.capture_trace["status"]` and `blockers`. `complete` certifies structural
 accounting only, not backend support, correct quantization, numerical execution, or
 whole-model compilation. Opaque calls are still accounted for but do not prove a

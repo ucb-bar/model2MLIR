@@ -105,7 +105,7 @@ def _readonly(snapshot, *, contexts=None, live=None):
                     raise DynamicLinearLineageError("external input/state mutation")
 
 
-def _instrument(model):
+def _instrument(model, embedding_policy=None):
     try:
         from torch.fx.traceback import annotate
     except ImportError as exc:
@@ -115,12 +115,19 @@ def _instrument(model):
     candidates = []
     seen = set()
     for path, module in model.named_modules(remove_duplicate=False):
-        if not isinstance(module, torch.nn.Linear):
+        embedding = embedding_policy is not None and isinstance(
+            module, torch.nn.Embedding
+        )
+        if not isinstance(module, torch.nn.Linear) and not embedding:
             continue
         if id(module) in seen:
             raise DynamicLinearLineageError("aliased module paths")
         seen.add(id(module))
-        if (
+        if embedding:
+            from m2m.capture import embedding_trace
+
+            embedding_trace.admit(module, embedding_policy)
+        elif (
             type(module) is not torch.nn.Linear
             or getattr(module.forward, "__func__", None) is not torch.nn.Linear.forward
             or module._forward_hooks
@@ -165,8 +172,15 @@ def _instrument(model):
             "instance_forward": module.__dict__.get("forward"),
             "token": token,
             "weight": module.weight,
-            "bias": module.bias,
+            "bias": getattr(module, "bias", None),
         }
+        if embedding_policy is not None and isinstance(module, torch.nn.Embedding):
+            from m2m.capture import embedding_trace
+
+            sites[path].update(
+                embedding_policy=embedding_policy,
+                embedding_options=embedding_trace.options(module),
+            )
         module.forward = wrapped
     return sites
 
@@ -197,6 +211,13 @@ def _boundaries(exported, sites, snapshot, *, source):
             if n.op == "call_function"
             and (n.meta.get("custom") or {}).get("m2m_dynamic_site") == site["token"]
         ]
+        if "embedding_policy" in site:
+            from m2m.capture import embedding_trace
+
+            result[path] = embedding_trace.boundary(
+                exported, site, inside, sig, byname, rows, source=source
+            )
+            continue
         if source and (
             len(inside) != 1 or inside[0].target is not torch.ops.aten.linear.default
         ):
@@ -312,15 +333,20 @@ def _bind_pair(source, selected, sites):
             or config.granularity != PerRow(-1)
         ):
             raise DynamicLinearLineageError("unsupported actual AO recipe")
-        expected = Int8Tensor.from_hp(
-            site["weight"],
-            PerRow(-1),
-            mapping_type=MappingType.SYMMETRIC,
-            act_quant_kwargs=QuantizeTensorToInt8Kwargs(
-                PerRow(-1), config.act_mapping_type, config.reduce_range
-            ),
-            reduce_range=config.reduce_range,
-        )
+        if "embedding_policy" in site:
+            from m2m.capture import embedding_trace
+
+            expected = embedding_trace.expected_weight(site)
+        else:
+            expected = Int8Tensor.from_hp(
+                site["weight"],
+                PerRow(-1),
+                mapping_type=MappingType.SYMMETRIC,
+                act_quant_kwargs=QuantizeTensorToInt8Kwargs(
+                    PerRow(-1), config.act_mapping_type, config.reduce_range
+                ),
+                reduce_range=config.reduce_range,
+            )
         names, meta = weight.__tensor_flatten__()
         en, em = expected.__tensor_flatten__()
         if (
@@ -331,6 +357,17 @@ def _bind_pair(source, selected, sites):
             raise DynamicLinearLineageError(
                 "weight encoding differs from original FP32 recipe"
             )
+        if "embedding_policy" in site:
+            if embedding_trace.frozen_metadata(meta) != embedding_trace.frozen_metadata(
+                em
+            ):
+                raise DynamicLinearLineageError(
+                    "embedding recipe metadata kinds or bits differ"
+                )
+            for name in names:
+                embedding_trace.verify_field_geometry(
+                    getattr(weight, name), getattr(expected, name)
+                )
         for node in selected.graph.nodes:
             sp = qspec.get(node.name)
             if (
@@ -339,7 +376,15 @@ def _bind_pair(source, selected, sites):
                 and sp.target in selected.state_dict
                 and selected.state_dict[sp.target] is weight
             ):
-                weight_rows[node.meta["_m2m_node_id"]] = sb[path]["weight"]
+                identity = node.meta["_m2m_node_id"]
+                if (
+                    identity in weight_rows
+                    and weight_rows[identity] != sb[path]["weight"]
+                ):
+                    raise DynamicLinearLineageError(
+                        "selected weight has ambiguous original owners"
+                    )
+                weight_rows[identity] = sb[path]["weight"]
         so, qo = sb[path]["output"], db[path]["output"]
         if _types(oldrows[so]) != _types(newrows[qo]):
             raise DynamicLinearLineageError("linear output ABI changed")
@@ -371,7 +416,23 @@ def _bind_pair(source, selected, sites):
             if identity in claims:
                 raise DynamicLinearLineageError("overlapping module region")
             claims[identity] = so
-            kind[identity] = "declared_dynamic_linear_quantization"
+            kind[identity] = (
+                "declared_weight_only_embedding_quantization"
+                if "embedding_policy" in site
+                else "declared_dynamic_linear_quantization"
+            )
+        if "embedding_policy" in site:
+            site_records[-1].update(
+                source_operator="aten.embedding.default",
+                selected_recipe="default_v2_per_row_weight_only_INT8",
+                original_module_post_arithmetic_collapsed=False,
+                module_output_source_id=sb[path]["module_output"],
+                module_output_selected_id=db[path]["module_output"],
+            )
+    if any("embedding_policy" in site for site in sites.values()):
+        from m2m.capture import embedding_trace
+
+        embedding_trace.verify_weight_uses(source, selected, sites, sb, db)
     # Bind source-owned global parameters/buffers and positional public inputs.
     op = [
         r
@@ -536,6 +597,16 @@ def _bind_pair(source, selected, sites):
     for path in sites:
         if mapping.get(db[path]["input"]) != sb[path]["input"]:
             raise DynamicLinearLineageError("linear caller changed")
+        if "embedding_policy" in sites[path]:
+            before, after = oldrows[sb[path]["output"]], newrows[db[path]["output"]]
+            if old["operator_schemas"].get(before["target"]) != new[
+                "operator_schemas"
+            ].get(after["target"]) or _key(before, oldrows, identity) != _key(
+                after, newrows, mapping
+            ):
+                raise DynamicLinearLineageError(
+                    "embedding schema, controls or typed index caller changed"
+                )
     output_old = next(
         r
         for r in old["nodes"]
@@ -599,11 +670,12 @@ class _Seal:
     value: Any
     description: tuple
     sha256: str
-    storage: int
+    storage: tuple[int, int, int]
 
 
 def _storage(value):
-    return value.untyped_storage()._cdata
+    storage = value.untyped_storage()
+    return storage._cdata, storage.data_ptr(), storage.nbytes()
 
 
 def _seal(target, value):
@@ -676,6 +748,7 @@ class LinearSource:
     inputs: tuple
     input_seals: tuple[_Seal, ...]
     call_contract: tuple
+    capabilities: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -685,6 +758,8 @@ class _StateBinding:
     fields: tuple[str, ...]
     metadata: Any
     leaves: tuple[_Seal, ...]
+    recipe_kind: str | None = None
+    recipe_metadata: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -695,9 +770,53 @@ class _SelectedBinding:
     states: tuple[_StateBinding, ...]
     input_seals: tuple[_Seal, ...]
     call_contract: tuple
+    capabilities: tuple = ()
 
 
-def _state_bindings(exported):
+def _capabilities(sites):
+    return tuple(
+        (path, "weight_only_embedding_v2", site["embedding_policy"])
+        for path, site in sites.items()
+        if "embedding_policy" in site
+    )
+
+
+def _check_capabilities(source, expected):
+    """Recheck the original typed capability references, never serialized permission."""
+    actual = _capabilities(source.sites)
+    if len(source.capabilities) != len(expected) or len(actual) != len(expected):
+        raise DynamicLinearLineageError("sealed source capability roster changed")
+    for rows in zip(source.capabilities, actual, expected, strict=True):
+        path, kind, policy = rows[2]
+        if any(row[:2] != (path, kind) or row[2] is not policy for row in rows):
+            raise DynamicLinearLineageError(
+                "sealed source capability reference changed"
+            )
+        if kind == "weight_only_embedding_v2":
+            from m2m.capture.embedding_trace import (
+                Int8WeightOnlyEmbeddingPolicy,
+                validate_site,
+            )
+
+            if type(policy) is not Int8WeightOnlyEmbeddingPolicy:
+                raise DynamicLinearLineageError(
+                    "sealed embedding capability type changed"
+                )
+            validate_site(source.sites[path])
+        else:
+            raise DynamicLinearLineageError("unknown sealed source capability")
+
+
+def _recipe_metadata(kind, value):
+    # Fixed source-owned capabilities, never caller-supplied validation callbacks.
+    if kind == "weight_only_embedding_v2":
+        from m2m.capture.embedding_trace import frozen_metadata
+
+        return frozen_metadata(value)
+    raise DynamicLinearLineageError("unknown sealed source recipe capability")
+
+
+def _state_bindings(exported, *, source_recipes=()):
     from torchao.quantization import Int8Tensor
 
     result = []
@@ -717,6 +836,17 @@ def _state_bindings(exported):
                     tuple(fields),
                     copy.deepcopy(metadata),
                     tuple(_seal(name, getattr(value, name)) for name in fields),
+                    next(
+                        (kind for owner, kind in source_recipes if value is owner), None
+                    ),
+                    next(
+                        (
+                            _recipe_metadata(kind, metadata)
+                            for owner, kind in source_recipes
+                            if value is owner
+                        ),
+                        None,
+                    ),
                 )
             )
         else:
@@ -758,6 +888,7 @@ def validate_selected_source(exported, inputs):
             "source correspondence has no owned live binding"
         )
     source = binding.source
+    _check_capabilities(source, binding.capabilities)
     _check_call_contract(source.exported, source.call_contract)
     _check_call_contract(exported, binding.call_contract)
     for program, snapshot in (
@@ -787,7 +918,15 @@ def validate_selected_source(exported, inputs):
             raise DynamicLinearLineageError("sealed selected state owner changed")
         if state.fields:
             fields, metadata = owner.__tensor_flatten__()
-            if tuple(fields) != state.fields or metadata != state.metadata:
+            if (
+                tuple(fields) != state.fields
+                or metadata != state.metadata
+                or (
+                    state.recipe_metadata is not None
+                    and _recipe_metadata(state.recipe_kind, metadata)
+                    != state.recipe_metadata
+                )
+            ):
                 raise DynamicLinearLineageError(
                     "sealed selected recipe metadata changed"
                 )
@@ -800,6 +939,7 @@ def validate_selected_source(exported, inputs):
         raise DynamicLinearLineageError("sealed selected input roster changed")
     for value, seal in zip(inputs, binding.input_seals, strict=True):
         _check_seal(value, seal)
+    _check_capabilities(source, binding.capabilities)
     return True
 
 
@@ -811,8 +951,16 @@ class LinearInstrumentation:
     stages have been exported; ordinary forwards remain numerically unchanged.
     """
 
-    def __init__(self, model):
-        self._sites = _instrument(model)
+    def __init__(self, model, *, embedding_policy=None):
+        if embedding_policy is not None:
+            from m2m.capture.embedding_trace import Int8WeightOnlyEmbeddingPolicy
+
+            if type(embedding_policy) is not Int8WeightOnlyEmbeddingPolicy:
+                raise DynamicLinearLineageError(
+                    "explicit Int8WeightOnlyEmbeddingPolicy required"
+                )
+        self._embedding_policy = embedding_policy
+        self._sites = _instrument(model, embedding_policy)
         if not self._sites:
             raise DynamicLinearLineageError("no source plain FP32 Linear sites")
         self._closed = False
@@ -831,6 +979,14 @@ class LinearInstrumentation:
                 raise DynamicLinearLineageError("aliased module paths in program")
             if module.forward is not site["wrapper"]:
                 raise DynamicLinearLineageError("owned module callable changed")
+            if "embedding_policy" in site:
+                from m2m.capture import embedding_trace
+
+                if site["embedding_policy"] is not self._embedding_policy:
+                    raise DynamicLinearLineageError(
+                        "owned embedding capability reference changed"
+                    )
+                embedding_trace.validate_site(site)
             seen.add(id(module))
             sites[path] = site
         if not sites:
@@ -844,9 +1000,10 @@ class LinearInstrumentation:
         ):
             raise DynamicLinearLineageError("explicit tensor tuple inputs required")
         sites = self._program_sites(model)
+        capabilities = _capabilities(sites)
         if any(
             site["module"].weight is not site["weight"]
-            or site["module"].bias is not site["bias"]
+            or getattr(site["module"], "bias", None) is not site["bias"]
             for site in sites.values()
         ):
             raise DynamicLinearLineageError(
@@ -867,10 +1024,14 @@ class LinearInstrumentation:
                 "source nested scope lacks a readonly context proof"
             )
         _readonly(snapshot, contexts=contexts, live=live_nodes(exported, snapshot))
-        _boundaries(exported, sites, snapshot, source=True)
+        boundaries = _boundaries(exported, sites, snapshot, source=True)
+        if any("embedding_policy" in site for site in sites.values()):
+            from m2m.capture import embedding_trace
+
+            embedding_trace.verify_source_weight_uses(exported, sites, boundaries)
         states = {**exported.state_dict, **exported.constants}
         seals = tuple(_seal(target, value) for target, value in states.items())
-        return LinearSource(
+        source = LinearSource(
             exported,
             copy.deepcopy(snapshot),
             dict(sites),
@@ -878,7 +1039,10 @@ class LinearInstrumentation:
             inputs,
             tuple(_seal(str(index), value) for index, value in enumerate(inputs)),
             _call_contract(exported),
+            capabilities,
         )
+        _check_capabilities(source, capabilities)
+        return source
 
     def export_selected(self, source: LinearSource, model, inputs, *, quantization):
         """Prove an actual selected stage and return its exact exported program.
@@ -898,6 +1062,8 @@ class LinearInstrumentation:
             )
         if not isinstance(source, LinearSource):
             raise TypeError("an owned original LinearSource is required")
+        capabilities = source.capabilities
+        _check_capabilities(source, capabilities)
         if not isinstance(inputs, tuple) or any(
             not isinstance(x, torch.Tensor) for x in inputs
         ):
@@ -955,14 +1121,29 @@ class LinearInstrumentation:
             target_execution=False,
             application_accuracy=False,
         )
+        embedding_count = sum("embedding_policy" in site for site in sites.values())
+        if embedding_count:
+            proof.update(
+                embedding_weight_only_sites=embedding_count,
+                scope="declared default-v2 dynamic Linear and per-row weight-only embedding source correspondence only",
+                embedding_module_post_arithmetic_unchanged=True,
+            )
         selected._m2m_trace_dynamic_linear_proof = proof
         selected._m2m_dynamic_linear_binding = _SelectedBinding(
             selected,
             source,
             copy.deepcopy(snapshot_exported_program(selected, stage="quantized")),
-            _state_bindings(selected),
+            _state_bindings(
+                selected,
+                source_recipes=tuple(
+                    (site["module"].weight, "weight_only_embedding_v2")
+                    for site in sites.values()
+                    if "embedding_policy" in site
+                ),
+            ),
             tuple(_seal(str(index), value) for index, value in enumerate(inputs)),
             _call_contract(selected),
+            capabilities,
         )
         validate_selected_source(selected, inputs)
         return selected, proof
