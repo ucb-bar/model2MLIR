@@ -231,6 +231,9 @@ def _prepare_exported_program(
             subclass_fields = observe(
                 exported_program, quantized_frontend_snapshot=quantized_frontend_snapshot
             )
+        from m2m.capture.call_boundary_trace import normalize_call_boundary_aliases
+
+        exported_program, boundary_aliases = normalize_call_boundary_aliases(exported_program)
         from m2m.capture.trace import tuple_selection_trace_program
 
         exported_program = tuple_selection_trace_program(exported_program)
@@ -259,10 +262,15 @@ def _prepare_exported_program(
                 return result
             return traced
         table = {target: wrap(target, function) for target, function in table.items()}
+    if not capture_trace:
+        from m2m.capture.call_boundary_trace import normalize_call_boundary_aliases
+
+        exported_program, boundary_aliases = normalize_call_boundary_aliases(exported_program)
     prepared = exported_program.run_decompositions(table)
     if capture_trace:
         from m2m.capture.subclass_trace import bind
 
+        prepared._m2m_trace_call_boundary_aliases = boundary_aliases
         prepared._m2m_trace_subclass_fields = bind(subclass_fields, prepared)
         prepared._m2m_trace_eliminations = eliminations
     return prepared, targets

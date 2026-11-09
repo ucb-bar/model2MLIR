@@ -241,7 +241,7 @@ class SourceStorageAliases:
         spec = self.schema(node)
         if spec is None or len(spec.returns) != 1:
             return None
-        if node["target"] in {"aten.to.dtype", "aten.to.dtype_layout", "aten.dropout.default"}:
+        if node["target"] in {"aten.to.dtype", "aten.to.dtype_layout", "aten.dropout.default", "aten.type_as.default"}:
             exact = _forward_identity_value(self.source, node)
             if exact is not None:
                 self.roots[identity] = self.root(exact[0])

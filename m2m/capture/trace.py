@@ -285,6 +285,9 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
     fields = getattr(exported, "_m2m_trace_subclass_fields", ())
     if fields:
         body["tensor_subclass_fields"] = list(fields)
+    boundary_aliases = getattr(exported, "_m2m_trace_call_boundary_aliases", ())
+    if boundary_aliases:
+        body["module_call_boundary_aliases"] = list(boundary_aliases)
     dynamic = getattr(exported, "_m2m_trace_dynamic_linear_proof", None)
     if dynamic:
         body["dynamic_linear_proof"] = dynamic
@@ -984,7 +987,7 @@ def _forward_identity_value(source: dict[str, Any], node: dict[str, Any], *, sou
     target = node.get("target")
     if node.get("op") != "call_function" or target not in {
             "aten.to.dtype", "aten.to.dtype_layout", "aten.to.device", "aten.detach_.default",
-            "aten.dropout.default"}:
+            "aten.dropout.default", "aten.type_as.default"}:
         return None
     args, kwargs = node.get("args"), node.get("kwargs") or {}
     if not isinstance(args, list) or not args or not isinstance(kwargs, dict):
@@ -1005,7 +1008,23 @@ def _forward_identity_value(source: dict[str, Any], node: dict[str, Any], *, sou
         return raw is None or (isinstance(raw, dict)
                                and raw.get("kind") == kind and raw.get("value") == expected)
 
-    if target == "aten.dropout.default":
+    if target == "aten.type_as.default":
+        import torch
+
+        if (len(args) != 2 or kwargs
+                or source.get("operator_schemas", {}).get(target)
+                != str(torch.ops.aten.type_as.default._schema)):
+            return None
+        reference = args[1]
+        other = sources.get(reference.get("node_id")) if isinstance(reference, dict) else None
+        values = other.get("results") or [] if other else []
+        if (len(values) != 1 or reference.get("value_id") != values[0].get("id")
+                or values[0].get("kind") != "tensor"
+                or any(values[0].get(field) != original.get(field)
+                       for field in ("dtype", "device", "layout"))
+                or original.get("layout") != "torch.strided"):
+            return None
+    elif target == "aten.dropout.default":
         import math
         import torch
 
@@ -1195,7 +1214,7 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
     uses = terminal_uses(node, output, set())
     if not uses:
         return None
-    if node["target"] == "aten.dropout.default":
+    if node["target"] in {"aten.dropout.default", "aten.type_as.default"}:
         from m2m.capture.view_trace import unchanged_through_uses
 
         if not unchanged_through_uses(
@@ -1224,7 +1243,7 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
                        ("kind", "dtype", "storage_dtype", "compute_dtype", "shape",
                         "device", "layout", "stride"))):
             return None
-        if node["target"] == "aten.dropout.default":
+        if node["target"] in {"aten.dropout.default", "aten.type_as.default"}:
             destination_aliases = context.destination_aliases
             owner = destination_aliases.nodes.get(matching_edges[0]["producer_node_id"])
             if (owner is None or not unchanged_through_uses(
@@ -1238,6 +1257,8 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
                        if node["target"] == "aten.detach_.default" else
                        "disabled inference dropout with exact typed consumer-edge bypass"
                        if node["target"] == "aten.dropout.default" else
+                       "type-preserving type_as with exact typed consumer-edge bypass"
+                       if node["target"] == "aten.type_as.default" else
                        "type/device/layout-preserving aten.to with exact typed consumer-edge bypass"),
             "proof": {"input_node_id": producer["id"], "typed_bypass_edges": sorted(set(matched)),
                       "scope": "forward tensor values; autograd metadata is not certified"}}

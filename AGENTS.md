@@ -155,6 +155,14 @@ versions must remain unchanged through every consuming edge. Training dropout,
 unknown controls, wrong consumers and intervening alias writes decline; this does
 not certify training/autograd semantics or numerical target execution.
 
+`capture/call_boundary_trace.py` normalizes owned module-call signature slots
+only through an exact no-op `aten.type_as` primitive with typed operand/result
+and unchanged consumer-lifetime proofs. It leaves the arithmetic graph and raw
+export untouched, records each actual module-call entry/slot and source IDs,
+and keeps real dtype/device conversions as operations. This repairs framework
+callee-signature maintenance when decomposition erases the identity; it never
+clears call metadata or bypasses exported-program validation.
+
 Frontend snapshots preserve historical `results` slots and add versioned
 `result_metadata` describing actual FX `val` presence, container and every
 existing result ordinal. Missing metadata stays unobserved; explicit None is
