@@ -172,6 +172,17 @@ and keeps real dtype/device conversions as operations. This repairs framework
 callee-signature maintenance when decomposition erases the identity; it never
 clears call metadata or bypasses exported-program validation.
 
+`capture/functional_view_trace.py` can bind replayed static views of one
+exactly proved `aten.add_.Tensor` to its functional `aten.add.Tensor` result.
+Ordered operand ownership, unchanged input versions, registered schemas and
+explicit alias paths establish the storage version; derived offsets, strides,
+positive static bounds and every source/prepared consumer lifetime must agree.
+Repeated pure views retain distinct source call IDs. Equal-batch matmul inputs
+are checked at the actual BMM operand slots through zero-copy batch reshapes,
+not a generated prefix view's argument index. Copying/broadcasting decompositions,
+unknown writes, cross-context roots and unproved geometry remain diagnostic.
+This is source correspondence, not numerical accuracy or a target execution gate.
+
 Frontend snapshots preserve historical `results` slots and add versioned
 `result_metadata` describing actual FX `val` presence, container and every
 existing result ordinal. Missing metadata stays unobserved; explicit None is

@@ -2047,6 +2047,12 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
     consumed.update(identity for relation in anchored_views for identity in relation["source_ids"])
     unknown = [identity for identity in unknown if identity not in {
         target for relation in anchored_views for target in relation["destination_ids"]}]
+    from m2m.capture.functional_view_trace import functional_view_relations
+    functional_views = functional_view_relations(source, dest, relations, consumed)
+    relations.extend(functional_views)
+    consumed.update(identity for relation in functional_views for identity in relation["source_ids"])
+    unknown = [identity for identity in unknown if identity not in {
+        target for relation in functional_views for target in relation["destination_ids"]}]
     dead = _dead_forward_value_relations(source, consumed)
     relations.extend(dead)
     consumed.update(origin for relation in dead for origin in relation["source_ids"])
