@@ -87,6 +87,13 @@ selected eager/export outputs. Failed checks publish no source IDs. Repeated
 module invocations, custom Linear behavior, unknown effects and unsupported
 recipes refuse. Use the owner as a context manager to restore temporary metadata
 wrappers. This is source correspondence, not model accuracy or target execution.
+Read-only `wrap_with_set_grad_enabled` regions may remain in both actual exports.
+Their exact control value, ordered typed caller operands, schema-owned nonwriting
+body, output slots and call order must match. Context projections grant no fresh
+storage fact; writes through their aliases refuse. Nested context Linear sites,
+unknown effects and shared/ambiguous context bodies remain unsupported. Contexts
+are never erased to manufacture a source graph, and this source-pair proof does
+not establish post-inline subclass-field lifting.
 `write_quantized_multi_program_bundle(shared_program_converter=...)` can consume
 these exact exports through an explicit successful `ConversionResult`; it keeps
 actual stage objects, eager goldens, routing, shared tensor checks and file

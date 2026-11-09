@@ -18,7 +18,7 @@ from typing import Any
 import torch
 from torch.fx.traceback import annotate
 
-from m2m.capture.subclass_trace import observe
+from m2m.capture.context_trace import context_projection, live_nodes, observe_contexts
 from m2m.capture.trace import snapshot_exported_program
 from m2m.capture.view_trace import SourceStorageAliases
 
@@ -72,7 +72,8 @@ def _key(row, nodes, mapping):
     )
 
 
-def _readonly(snapshot):
+def _readonly(snapshot, *, contexts=None, live=None):
+    contexts = contexts or {}
     aliases = SourceStorageAliases(snapshot)
     roots = {
         aliases.root(n)
@@ -84,13 +85,21 @@ def _readonly(snapshot):
             continue
         if row["op"] != "call_function":
             raise DynamicLinearLineageError("non-schema call")
+        if row["id"] in contexts:
+            continue
         schema = aliases.schema(row)
         if schema is None:
-            if aliases.tuple_projection_root(row) is None:
+            if aliases.tuple_projection_root(row) is None and not (
+                live is not None and context_projection(row, snapshot, contexts, live)
+            ):
                 raise DynamicLinearLineageError("unknown source effects")
             continue
         for i, arg in enumerate(schema.arguments):
             if arg.alias_info and arg.alias_info.is_write:
+                # Context tuple selection grants no storage-freshness fact.
+                # Its alias root remains unknown, so writes through it (or its
+                # views) decline below. Independent proven-fresh AO temporaries
+                # retain their ordinary schema-owned storage lifetimes.
                 parent = aliases.tensor_ref(aliases.argument(row, i, arg.name))
                 root = aliases.root(parent) if parent else None
                 if root is None or root in roots:
@@ -159,9 +168,12 @@ def _instrument(model):
 
 def _boundaries(exported, sites, snapshot, *, source):
     byname = {n.name: n for n in exported.graph.nodes}
-    rows = {
-        n.name: r for n, r in zip(exported.graph.nodes, snapshot["nodes"], strict=True)
-    }
+    root_rows = [
+        row
+        for row in snapshot["nodes"]
+        if row["graph_id"] == f"g:{snapshot['stage']}:root"
+    ]
+    rows = {n.name: r for n, r in zip(exported.graph.nodes, root_rows, strict=True)}
     calls = {
         entry.fqn: entry.signature
         for entry in exported.module_call_graph
@@ -185,6 +197,10 @@ def _boundaries(exported, sites, snapshot, *, source):
         ):
             raise DynamicLinearLineageError(
                 "source is not one actual plain Linear call"
+            )
+        if sig.outputs[0].name not in byname or sig.inputs[0].name not in byname:
+            raise DynamicLinearLineageError(
+                "Linear invocation inside a context is unsupported"
             )
         output = byname[sig.outputs[0].name]
         incoming = byname[sig.inputs[0].name]
@@ -247,12 +263,23 @@ def _bind_pair(source, selected, sites):
 
     old = snapshot_exported_program(source, stage="original")
     new = snapshot_exported_program(selected, stage="quantized")
-    if len(old["nodes"]) != len(list(source.graph.nodes)) or len(new["nodes"]) != len(
-        list(selected.graph.nodes)
-    ):
-        raise DynamicLinearLineageError("nested scope unsupported")
-    _readonly(old)
-    _readonly(new)
+    old_live, new_live = live_nodes(source, old), live_nodes(selected, new)
+    old_contexts, new_contexts = (
+        observe_contexts(source, old),
+        observe_contexts(selected, new),
+    )
+    for snapshot, contexts in ((old, old_contexts), (new, new_contexts)):
+        nested = {
+            row["graph_id"]
+            for row in snapshot["nodes"]
+            if row["graph_id"] != f"g:{snapshot['stage']}:root"
+        }
+        if nested != {context.scope for context in contexts.values()}:
+            raise DynamicLinearLineageError(
+                "nested scope lacks an exact readonly context binding"
+            )
+    _readonly(old, contexts=old_contexts, live=old_live)
+    _readonly(new, contexts=new_contexts, live=new_live)
     sb = _boundaries(source, sites, old, source=True)
     db = _boundaries(selected, sites, new, source=False)
     if (
@@ -262,9 +289,7 @@ def _bind_pair(source, selected, sites):
         raise DynamicLinearLineageError("public input/output call contract changed")
     oldrows = {n["id"]: n for n in old["nodes"]}
     newrows = {n["id"]: n for n in new["nodes"]}
-    newnodes = {
-        r["id"]: n for r, n in zip(new["nodes"], selected.graph.nodes, strict=True)
-    }
+    newnodes = new_live
     qspec = {s.arg.name: s for s in selected.graph_signature.input_specs}
     mapping = {}
     claims = {}
@@ -343,8 +368,16 @@ def _bind_pair(source, selected, sites):
             claims[identity] = so
             kind[identity] = "declared_dynamic_linear_quantization"
     # Bind source-owned global parameters/buffers and positional public inputs.
-    op = [r for r in old["nodes"] if r["op"] == "placeholder"]
-    qp = [r for r in new["nodes"] if r["op"] == "placeholder"]
+    op = [
+        r
+        for r in old["nodes"]
+        if r["op"] == "placeholder" and r["graph_id"] == "g:original:root"
+    ]
+    qp = [
+        r
+        for r in new["nodes"]
+        if r["op"] == "placeholder" and r["graph_id"] == "g:quantized:root"
+    ]
     ous = [r for r in op if r["input_kind"] == "USER_INPUT"]
     qus = [r for r in qp if r["input_kind"] == "USER_INPUT"]
     if len(ous) != len(qus):
@@ -376,36 +409,111 @@ def _bind_pair(source, selected, sites):
                 or not _exact(a, b)
             ):
                 raise DynamicLinearLineageError("unchanged state payload differs")
-    # Explicit field operations are verified by the independent lifting observer.
-    fields = observe(selected)
-    if fields is None:
-        raise DynamicLinearLineageError("field/effect observation unavailable")
-    for field in fields.fields:
-        node = newnodes[field.source_id]
-        receiver = node.args[0].meta["_m2m_node_id"]
+    # Source reencoding is distinct from post-decomposition field lifting.
+    # The selected weight bytes/metadata were independently repacked above.
+    for identity, node in new_live.items():
+        if (
+            node.op != "call_function"
+            or node.target is not torch.ops.export.access_subclass_inner_tensor.default
+        ):
+            continue
+        if (
+            len(node.args) != 2
+            or node.kwargs
+            or not isinstance(node.args[0], torch.fx.Node)
+        ):
+            raise DynamicLinearLineageError("malformed actual field accessor")
+        receiver = node.args[0].meta.get("_m2m_node_id")
         if receiver not in weight_rows:
             raise DynamicLinearLineageError(
                 "field receiver not an exact selected site weight"
             )
-        claims[field.source_id] = weight_rows[receiver]
-        kind[field.source_id] = "declared_weight_field_reencoding"
+        spec = qspec.get(node.args[0].name)
+        wrapper = selected.state_dict.get(spec.target) if spec else None
+        names, _metadata = wrapper.__tensor_flatten__()
+        if node.args[1] not in names:
+            raise DynamicLinearLineageError(
+                "field accessor is outside the verified weight fields"
+            )
+        value = torch.ops.export.access_subclass_inner_tensor.default(
+            wrapper, node.args[1]
+        )
+        observed = node.meta.get("val")
+        if (
+            not isinstance(observed, torch.Tensor)
+            or value.dtype != observed.dtype
+            or value.shape != observed.shape
+            or value.stride() != observed.stride()
+            or value.storage_offset() != observed.storage_offset()
+            or value.device != observed.device
+        ):
+            raise DynamicLinearLineageError(
+                "field accessor type contradicts the live value"
+            )
+        claims[identity] = weight_rows[receiver]
+        kind[identity] = "declared_weight_field_reencoding"
     source_sites = {b["output"] for b in sb.values()}
     pending = [
         r
         for r in old["nodes"]
-        if r["op"] == "call_function" and r["id"] not in source_sites
+        if r["op"] == "call_function"
+        and r["id"] not in source_sites
+        and r["graph_id"] == "g:original:root"
     ]
     identity = {identity: identity for identity in oldrows}
     while pending:
         progress = False
         for row in list(pending):
+            if row["id"] in old_contexts:
+                context = old_contexts[row["id"]]
+                matches = []
+                for candidate in new_contexts.values():
+                    if (
+                        candidate.identity in claims
+                        or candidate.control != context.control
+                    ):
+                        continue
+                    if candidate.canonical_body != context.canonical_body:
+                        continue
+                    if _types(oldrows[context.identity]) != _types(
+                        newrows[candidate.identity]
+                    ):
+                        continue
+                    try:
+                        equal = _frame(context.arguments, oldrows, identity) == _frame(
+                            candidate.arguments, newrows, mapping
+                        )
+                    except KeyError:
+                        equal = False
+                    if equal:
+                        matches.append(candidate)
+                if len(matches) == 1:
+                    candidate = matches[0]
+                    mapping[candidate.function_id] = context.function_id
+                    claims[candidate.function_id] = context.function_id
+                    kind[candidate.function_id] = "exact_context_function_binding"
+                    mapping[candidate.identity] = context.identity
+                    claims[candidate.identity] = context.identity
+                    kind[candidate.identity] = "exact_readonly_context_call"
+                    for before, after in zip(context.body, candidate.body, strict=True):
+                        mapping[after["id"]] = before["id"]
+                        claims[after["id"]] = before["id"]
+                        kind[after["id"]] = "exact_readonly_context_body"
+                    pending.remove(row)
+                    progress = True
+                continue
             try:
                 k = _key(row, oldrows, identity)
             except KeyError:
                 raise DynamicLinearLineageError("original has unbound operands")
             matches = []
             for other in new["nodes"]:
-                if other["op"] != "call_function" or other["id"] in claims:
+                if (
+                    other["op"] != "call_function"
+                    or other["id"] in claims
+                    or other["graph_id"] != "g:quantized:root"
+                    or other["id"] in new_contexts
+                ):
                     continue
                 if old["operator_schemas"].get(row["target"]) != new[
                     "operator_schemas"
@@ -431,20 +539,38 @@ def _bind_pair(source, selected, sites):
     for path in sites:
         if mapping.get(db[path]["input"]) != sb[path]["input"]:
             raise DynamicLinearLineageError("linear caller changed")
-    output_old = next(r for r in old["nodes"] if r["op"] == "output")
-    output_new = next(r for r in new["nodes"] if r["op"] == "output")
+    output_old = next(
+        r
+        for r in old["nodes"]
+        if r["op"] == "output" and r["graph_id"] == "g:original:root"
+    )
+    output_new = next(
+        r
+        for r in new["nodes"]
+        if r["op"] == "output" and r["graph_id"] == "g:quantized:root"
+    )
     if _frame(output_old["args"], oldrows, identity) != _frame(
         output_new["args"], newrows, mapping
     ):
         raise DynamicLinearLineageError("output mapping changed")
     if any(r["op"] == "call_function" and r["id"] not in claims for r in new["nodes"]):
         raise DynamicLinearLineageError("unaccounted introduced call")
-    expected_order = [r["id"] for r in old["nodes"] if r["op"] == "call_function"]
+    expected_order = [
+        r["id"]
+        for r in old["nodes"]
+        if r["op"] == "call_function" and r["graph_id"] == "g:original:root"
+    ]
     observed_order = []
     outputs = {b["output"] for b in db.values()}
     for row in new["nodes"]:
-        if row["op"] == "call_function" and (
-            kind.get(row["id"]) == "exact_unchanged_call" or row["id"] in outputs
+        if (
+            row["op"] == "call_function"
+            and row["graph_id"] == "g:quantized:root"
+            and (
+                kind.get(row["id"])
+                in {"exact_unchanged_call", "exact_readonly_context_call"}
+                or row["id"] in outputs
+            )
         ):
             observed_order.append(claims[row["id"]])
     if observed_order != expected_order:
@@ -459,7 +585,8 @@ def _bind_pair(source, selected, sites):
         custom.update(m2m_lineage=origins, m2m_transform=kind[node_id])
         node.meta["custom"] = custom
     return old, {
-        "source_calls": len(expected_order),
+        "source_calls": sum(r["op"] == "call_function" for r in old["nodes"]),
+        "verified_readonly_contexts": len(old_contexts),
         "actual_quantized_calls": sum(r["op"] == "call_function" for r in new["nodes"]),
         "sites": len(sites),
         "caller_graph_and_order_verified": True,
@@ -574,7 +701,17 @@ class LinearInstrumentation:
             model, inputs, strict=True, preserve_module_call_signature=tuple(sites)
         )
         snapshot = snapshot_exported_program(exported, stage="original")
-        _readonly(snapshot)
+        contexts = observe_contexts(exported, snapshot)
+        nested = {
+            row["graph_id"]
+            for row in snapshot["nodes"]
+            if row["graph_id"] != "g:original:root"
+        }
+        if nested != {context.scope for context in contexts.values()}:
+            raise DynamicLinearLineageError(
+                "source nested scope lacks a readonly context proof"
+            )
+        _readonly(snapshot, contexts=contexts, live=live_nodes(exported, snapshot))
         _boundaries(exported, sites, snapshot, source=True)
         states = {**exported.state_dict, **exported.constants}
         seals = tuple(
