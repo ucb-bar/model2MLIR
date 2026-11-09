@@ -12,7 +12,7 @@ The self-updating coverage loop lives under `m2m.capture.unsupported`;
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from xdsl.dialects.builtin import ModuleOp
 
@@ -67,6 +67,7 @@ def convert(
     calibration_inputs: Any | None = None,
     capture_trace: bool = False,
     original_frontend_snapshot: dict[str, Any] | None = None,
+    normalize: Callable[[ModuleOp, dict[str, Any] | None], ModuleOp] | None = None,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -91,7 +92,14 @@ def convert(
         original_frontend_snapshot: optional pre-quantization snapshot captured
             before an external quantizer mutates the model. An unavailable
             snapshot is preserved as unknown, never replaced by a quantized graph.
+        normalize: optional provider transform called once with the imported module
+            and validated external manifest, before text and trace finalization.
+            Requires capture_trace=True and a PyTorch frontend.
     """
+    if normalize is not None and not capture_trace:
+        raise ValueError("normalize requires capture_trace=True")
+    if normalize is not None and not callable(normalize):
+        raise TypeError("normalize must be callable")
     if quantization_preapplied and quantization is None:
         raise ValueError("quantization_preapplied requires a quantization config")
     if backend == "torch_mlir":
@@ -103,12 +111,16 @@ def convert(
     from pathlib import Path as _Path
 
     if isinstance(model, (str, _Path)) and str(model).endswith(".gguf"):
+        if normalize is not None:
+            raise ValueError("normalize requires the PyTorch frontend")
         from m2m.frontends.gguf import convert_gguf
 
         return convert_gguf(model, example_inputs, level=level)
 
     _is_torch = isinstance(model, torch.nn.Module) or type(model).__name__ == "ExportedProgram"
     if not _is_torch:
+        if normalize is not None:
+            raise ValueError("normalize requires the PyTorch frontend")
         try:
             import jax  # noqa: F401
 
@@ -177,7 +189,8 @@ def convert(
             if decompose:
                 exported_program, _ = _prepare_exported_program(
                     raw, run_default_decompositions=True,
-                    export_decomposition_table=torch_mlir_gap_decompositions(), capture_trace=True)
+                    export_decomposition_table=torch_mlir_gap_decompositions(), capture_trace=True,
+                    opaque_custom_ops=normalize is not None)
             else:
                 exported_program = raw
             for _ in range(8):
@@ -225,6 +238,7 @@ def convert(
         emit_named_ops=emit_named,
         weights_path=weights_path,
         capture_trace=capture_trace,
+        opaque_custom_ops=normalize is not None,
     )
     # Stamp the representation level so downstream/merlin knows which contract it received
     # (default portable standard form vs the opt-in structured high-level form).
@@ -332,9 +346,17 @@ def convert(
         except Exception:  # noqa: BLE001
             pass
 
+    if normalize is not None:
+        if result.module is None:
+            raise ValueError("normalize requires a parsed MLIR module")
+        result.module = normalize(result.module, external_manifest)
+        if not isinstance(result.module, ModuleOp):
+            raise TypeError("normalize must return a ModuleOp")
+        result.module.verify()
+
     mlir_text = (
         module_to_text(result.module, generic=capture_trace)
-        if isinstance(quantization, ExternalQuantizationConfig) and result.module is not None
+        if (normalize is not None or isinstance(quantization, ExternalQuantizationConfig)) and result.module is not None
         else result.mlir_text or (module_to_text(result.module, generic=capture_trace)
                                   if result.module is not None else "")
     )

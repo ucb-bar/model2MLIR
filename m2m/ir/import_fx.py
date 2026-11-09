@@ -14,6 +14,7 @@ Invariants:
 from __future__ import annotations
 
 import io
+import json
 import operator
 import re
 from dataclasses import dataclass, field
@@ -41,12 +42,14 @@ def _canonicalize_fx_target_str(s: str) -> str:
     """
     return _HEX_ADDR_RE.sub(">", s)
 from xdsl.dialects.builtin import (
+    ArrayAttr,
     BFloat16Type,
     FlatSymbolRefAttr,
     Float16Type,
     Float32Type,
     Float64Type,
     FunctionType,
+    DictionaryAttr,
     ModuleOp,
     StringAttr,
     TensorType,
@@ -59,7 +62,7 @@ def FlatSymbolRefAttr_ref(name: str) -> FlatSymbolRefAttr:
     return FlatSymbolRefAttr(name)
 
 
-from xdsl.ir import Attribute, Block, Operation, Region, SSAValue
+from xdsl.ir import Attribute, Block, BlockArgument, Operation, Region, SSAValue
 from xdsl.printer import Printer
 
 from m2m.ir.decompositions import (
@@ -370,6 +373,40 @@ def _tensor_type_from_meta(val: Any) -> TensorType | None:
     return None
 
 
+def _schema_arguments(node: Any) -> list[tuple[str, Any]]:
+    """Resolve positional, keyword, and default arguments in schema order."""
+    schema = getattr(node.target, "_schema", None)
+    if schema is None:
+        return []
+    return [(spec.name, node.args[i] if i < len(node.args)
+             else node.kwargs.get(spec.name, spec.default_value))
+            for i, spec in enumerate(schema.arguments)]
+
+
+def _contains_fx_node(value: Any) -> bool:
+    if isinstance(value, torch.fx.Node):
+        return True
+    if isinstance(value, (tuple, list)):
+        return any(_contains_fx_node(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_fx_node(item) for item in value.values())
+    return False
+
+
+def _opaque_literal_attributes(node: Any) -> dict[str, Attribute]:
+    """Keep schema-named literals with the same lossless encoding as traces."""
+    from m2m.capture.trace import _literal
+
+    if getattr(node.target, "_schema", None) is None:
+        return {}
+    attributes: dict[str, Attribute] = {"m2m.schema": StringAttr(str(node.target._schema))}
+    for name, value in _schema_arguments(node):
+        if not _contains_fx_node(value):
+            attributes[f"m2m.literal.{name}"] = StringAttr(json.dumps(
+                _literal(value), sort_keys=True, separators=(",", ":"), allow_nan=False))
+    return attributes
+
+
 @dataclass
 class ImportDiagnostic:
     """Diagnostic from an import operation.
@@ -401,6 +438,7 @@ class FXImporter:
     explicit_blackboxes: set[str] = field(default_factory=set)
     dynamic_decompositions: dict[str, DecompFn] = field(default_factory=dict)
     emit_named_ops: bool = False  # high-level form: emit linalg_ext.* composites
+    opaque_custom_ops: bool = False  # provider normalization owns custom-op semantics
     trace_dispositions: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -461,7 +499,8 @@ class FXImporter:
             carried_types = [v.type for v in carried_ssa]
 
             sub = FXImporter(allow_opaque_fallback=self.allow_opaque_fallback,
-                             emit_named_ops=self.emit_named_ops)
+                             emit_named_ops=self.emit_named_ops,
+                             opaque_custom_ops=self.opaque_custom_ops)
             fake_ep = SimpleNamespace(graph=body_gm.graph, graph_module=body_gm,
                                       graph_signature=getattr(body_gm, "graph_signature", None))
             sub_mod = sub.import_graph(fake_ep)
@@ -641,6 +680,19 @@ class FXImporter:
         # Build the function body
         block = Block(arg_types=arg_types)
         value_map: dict[str, SSAValue] = {}
+        value_aliases: dict[SSAValue, list[dict[str, Any]]] = {}
+
+        def record_value_alias(value: SSAValue, node_ids: list[str]) -> None:
+            alias = {"node_ids": sorted(set(node_ids)),
+                     "result_index": 0 if isinstance(value, BlockArgument) else value.index,
+                     "alias_result_index": 0}
+            value_aliases.setdefault(value, []).append(alias)
+            if not isinstance(value, BlockArgument):
+                # Tie aliases to their exact SSA result, including tuple results.
+                attrs = value.owner.attributes
+                prior = json.loads(attrs["prov.value_aliases"].data) if "prov.value_aliases" in attrs else []
+                attrs["prov.value_aliases"] = StringAttr(json.dumps(
+                    [*prior, alias], sort_keys=True, separators=(",", ":")))
         multi_results: dict[str, list[SSAValue]] = {}  # split/unbind: node -> per-output SSA
         for i, p in enumerate(placeholders):
             value_map[p.name] = block.args[i]
@@ -884,7 +936,11 @@ class FXImporter:
             ):
                 outs = multi_results[node.args[0].name]
                 idx = node.args[1]
-                if isinstance(idx, int) and 0 <= idx < len(outs):
+                if isinstance(idx, int) and (
+                    0 <= idx < len(outs)
+                    or self.opaque_custom_ops and -len(outs) <= idx < 0
+                ):
+                    idx %= len(outs)
                     value_map[node.name] = outs[idx]
                     source_id = node.meta.get("_m2m_node_id")
                     if source_id:
@@ -893,6 +949,8 @@ class FXImporter:
                             "result_index": idx,
                         }
                     continue
+                if self.opaque_custom_ops:
+                    raise ValueError(f"Invalid tuple result index {idx!r} for {node.args[0].name}")
 
             if (
                 target_str == "<built-in function getitem>"
@@ -1034,6 +1092,10 @@ class FXImporter:
                                 aliased = next((arg for arg in node.all_input_nodes
                                                 if value_map.get(arg.name) is result.result), None)
                                 if source_id and aliased is not None:
+                                    if self.opaque_custom_ops:
+                                        custom = node.meta.get("custom") or {}
+                                        origins = node.meta.get("_m2m_origin_ids", custom.get("m2m_lineage", ()))
+                                        record_value_alias(result.result, [source_id, *origins])
                                     self.trace_dispositions[source_id] = {
                                         "status": "alias",
                                         "alias_of_node_id": aliased.meta.get("_m2m_node_id"),
@@ -1074,25 +1136,59 @@ class FXImporter:
                 )
                 continue
 
-            # Fallback: opaque func.call
-            base_name = target_str.replace(".", "_")
-            operand_types = tuple(str(v.type) for v in operands)
-            sig_key = f"{base_name}:{operand_types}:{result_type}"
+            # Fallback: opaque func.call. Provider normalization opts into the
+            # lossless schema ABI; default imports retain their original IR.
+            if self.opaque_custom_ops:
+                # Opaque calls preserve the full tensor result ABI. Decompositions
+                # may use a primary-result representative, but externs cannot.
+                values = node.meta.get("val")
+                values = list(values) if isinstance(values, (tuple, list)) else [values]
+                result_types = [_tensor_type_from_meta(value) for value in values]
+                if any(tt is None for tt in result_types):
+                    raise ValueError(f"Opaque {target_str} has an unsupported non-tensor result")
+                schema_args = _schema_arguments(node)
+                if schema_args:
+                    operands = []
 
-            if sig_key not in declared_sigs:
-                count = name_counters.get(base_name, 0)
-                unique_name = base_name if count == 0 else f"{base_name}_{count}"
-                name_counters[base_name] = count + 1
-                declared_sigs[sig_key] = unique_name
-                real_operand_types = [v.type for v in operands]
-                ext_func = FuncOp.external(unique_name, real_operand_types, [result_type])
-                extern_funcs.append(ext_func)
+                    def collect(value: Any) -> None:
+                        if isinstance(value, torch.fx.Node):
+                            if value.name in multi_results:
+                                operands.extend(multi_results[value.name])
+                            elif value.name in value_map:
+                                operands.append(value_map[value.name])
+                            else:
+                                raise ValueError(f"Opaque {target_str} has an unresolved operand {value.name}")
+                        elif isinstance(value, (tuple, list)):
+                            for item in value:
+                                collect(item)
+                        elif isinstance(value, dict):
+                            for item in value.values():
+                                collect(item)
 
-            func_name = declared_sigs[sig_key]
-            call_op = CallOp(func_name, operands, [result_type])
+                    for _, value in schema_args:
+                        collect(value)
+                call_op = CallOp(target_str.replace(".", "_"), operands, result_types)
+                call_op.attributes.update(_opaque_literal_attributes(node))
+                ensure_external_decl(call_op)
+                func_name = call_op.callee.string_value()
+            else:
+                base_name = target_str.replace(".", "_")
+                operand_types = tuple(str(v.type) for v in operands)
+                sig_key = f"{base_name}:{operand_types}:{result_type}"
+                if sig_key not in declared_sigs:
+                    count = name_counters.get(base_name, 0)
+                    unique_name = base_name if count == 0 else f"{base_name}_{count}"
+                    name_counters[base_name] = count + 1
+                    declared_sigs[sig_key] = unique_name
+                    ext_func = FuncOp.external(unique_name, [v.type for v in operands], [result_type])
+                    extern_funcs.append(ext_func)
+                func_name = declared_sigs[sig_key]
+                call_op = CallOp(func_name, operands, [result_type])
             _forward_fx_meta(call_op, node.meta)
             block.add_op(call_op)
             value_map[node.name] = call_op.res[0]
+            if self.opaque_custom_ops and isinstance(node.meta.get("val"), (tuple, list)):
+                multi_results[node.name] = list(call_op.results)
 
             self.opaque_count += 1
             level = "warning" if target_str in self.explicit_blackboxes else "info"
@@ -1104,15 +1200,80 @@ class FXImporter:
                 )
             )
 
+        if self.opaque_custom_ops:
+            # Export decompositions can erase identity nodes before import. Resolve
+            # their certified input bindings through exact carried identities.
+            from m2m.capture.trace import _literal
+
+            bindings: dict[tuple[str, int], set[SSAValue]] = {}
+            value_abis: dict[SSAValue, list[Any]] = {}
+            for source in nodes:
+                values = multi_results.get(source.name)
+                if values is None:
+                    value = value_map.get(source.name)
+                    values = [] if value is None else [value]
+                custom = source.meta.get("custom") or {}
+                identities = set(custom.get("m2m_lineage") or ())
+                if source.meta.get("_m2m_node_id"):
+                    identities.add(source.meta["_m2m_node_id"])
+                metadata = source.meta.get("val")
+                metadata = list(metadata) if isinstance(metadata, (tuple, list)) else [metadata]
+                for index, value in enumerate(values):
+                    if index < len(metadata):
+                        value_abis.setdefault(value, []).append(_literal(metadata[index]))
+                    for identity in identities:
+                        bindings.setdefault((identity, index), set()).add(value)
+            certificates = [*getattr(exported_program, "_m2m_trace_eliminations", ()),
+                            *getattr(exported_program, "_m2m_value_aliases", ())]
+            pending_aliases = [row for row in certificates
+                               if row.get("reason") == "identity decomposition" and row.get("alias_input_source_ids")]
+            while pending_aliases:
+                remaining = []
+                for row in pending_aliases:
+                    candidates: set[SSAValue] = set()
+                    for identity in row["alias_input_source_ids"]:
+                        candidates.update(bindings.get((identity, row["alias_input_result_index"]), ()))
+                    # A source reshape can expand to a clone plus a view with
+                    # shared lineage. Require the certified source input ABI;
+                    # shape alone never establishes ancestry or breaks a tie.
+                    if "alias_input_abi" in row:
+                        candidates = {value for value in candidates
+                                      if row["alias_input_abi"] in value_abis.get(value, ())}
+                    if len(candidates) > 1:
+                        raise ValueError("Ambiguous prepared identity alias input binding")
+                    if not candidates:
+                        remaining.append(row)
+                        continue
+                    value = next(iter(candidates))
+                    record_value_alias(value, row["source_ids"])
+                    for identity in row["source_ids"]:
+                        bindings.setdefault((identity, 0), set()).add(value)
+                if len(remaining) == len(pending_aliases):
+                    raise ValueError("Missing prepared identity alias input binding")
+                pending_aliases = remaining
+
         # Add return
         ret_values: list[SSAValue] = []
         if output_nodes:
             out_args = output_nodes[0].args[0] if output_nodes[0].args else ()
             if not isinstance(out_args, (tuple, list)):
                 out_args = (out_args,)
-            for a in out_args:
-                if hasattr(a, "name") and a.name in value_map:
-                    ret_values.append(value_map[a.name])
+            def collect_returns(value: Any) -> None:
+                if isinstance(value, (tuple, list)):
+                    for item in value:
+                        collect_returns(item)
+                elif hasattr(value, "name"):
+                    if value.name in multi_results:
+                        ret_values.extend(multi_results[value.name])
+                    elif value.name in value_map:
+                        ret_values.append(value_map[value.name])
+
+            if self.opaque_custom_ops:
+                collect_returns(out_args)
+            else:
+                for value in out_args:
+                    if hasattr(value, "name") and value.name in value_map:
+                        ret_values.append(value_map[value.name])
 
         if ret_values:
             # Emit ALL outputs, not just the first: a single-output collapse here
@@ -1135,7 +1296,27 @@ class FXImporter:
                 func_type = FunctionType.from_lists(arg_types, actual_ret_types)
 
         region = Region([block])
-        main_func = FuncOp("forward", func_type, region)
+        lifted = {**_in2param, **_in2buf,
+                  **dict(getattr(sig, "inputs_to_lifted_tensor_constants", {}) or {})}
+        arg_attrs = []
+        for index, placeholder in enumerate(placeholders):
+            attrs: dict[str, Attribute] = {}
+            source_id = placeholder.meta.get("_m2m_node_id")
+            if source_id:
+                attrs["prov.source_node_ids"] = ArrayAttr([StringAttr(source_id)])
+            custom = placeholder.meta.get("custom") or {}
+            origins = placeholder.meta.get("_m2m_origin_ids", custom.get("m2m_lineage", ()))
+            if origins:
+                attrs["prov.origin_node_ids"] = ArrayAttr([StringAttr(value) for value in sorted(set(origins))])
+            if placeholder.name in lifted:
+                attrs["prov.get_attr"] = StringAttr(lifted[placeholder.name])
+                attrs["prov.input_target"] = StringAttr(lifted[placeholder.name])
+            if block.args[index] in value_aliases:
+                attrs["prov.value_aliases"] = StringAttr(json.dumps(
+                    value_aliases[block.args[index]], sort_keys=True, separators=(",", ":")))
+            arg_attrs.append(DictionaryAttr(attrs))
+        main_func = FuncOp("forward", func_type, region,
+                           arg_attrs=ArrayAttr(arg_attrs) if self.opaque_custom_ops else None)
 
         # Externs merged from while_loop body sub-imports (renamed, collision-free).
         pending = getattr(self, "_pending_extern_funcs", [])
