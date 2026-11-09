@@ -8,7 +8,11 @@ change additionally requires the existing complete HOP caller-input proof.
 
 from __future__ import annotations
 
-from m2m.capture.view_trace import SourceStorageAliases, _tensor_value
+from m2m.capture.view_trace import (
+    SourceStorageAliases,
+    _tensor_value,
+    unchanged_through_uses,
+)
 
 _TARGETS = {
     "aten.transpose.int",
@@ -202,7 +206,7 @@ def static_view_relations(source, dest, relations, consumed):
         ):
             continue
         uses = outgoing[id(source)].get(node["id"], ())
-        if not uses:
+        if not unchanged_through_uses(aliases, node, uses):
             continue
         candidates = []
         for owner_id in mapped.get(producer["id"], ()):
@@ -236,6 +240,11 @@ def static_view_relations(source, dest, relations, consumed):
                         and destination_state[1]["ordinal"] > owner["ordinal"]
                     )
                     or not _input_edge(dest, candidate, owner, incoming[id(dest)])
+                    or not unchanged_through_uses(
+                        destination_aliases,
+                        candidate,
+                        outgoing[id(dest)].get(candidate["id"], ()),
+                    )
                 ):
                     continue
                 matched = []

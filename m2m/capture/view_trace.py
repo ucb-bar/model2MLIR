@@ -188,7 +188,25 @@ class SourceStorageAliases:
 
     def last_writer(self, node):
         """Return (storage root, last writer), or None for unknown ownership."""
-        root = self.root(node)
+        return self._last_writer_before(self.root(node), node)
+
+    def last_writer_at(self, value_node, boundary):
+        """Storage version of this captured value immediately before a use.
+
+        Both nodes must belong to this immutable snapshot and the same scope.
+        A view remains an alias after creation, so its own ordinal alone cannot
+        establish the version observed by a later consumer.
+        """
+        if (self.nodes.get(value_node.get("id")) is not value_node
+                or self.nodes.get(boundary.get("id")) is not boundary
+                or value_node.get("graph_id") != boundary.get("graph_id")
+                or type(value_node.get("ordinal")) is not int
+                or type(boundary.get("ordinal")) is not int
+                or boundary["ordinal"] < value_node["ordinal"]):
+            return None
+        return self._last_writer_before(self.root(value_node), boundary)
+
+    def _last_writer_before(self, root, node):
         if root is None:
             return None
         writers = []
@@ -223,9 +241,43 @@ def _tensor_value(node):
     return values[0] if len(values) == 1 and values[0].get("kind") == "tensor" else None
 
 
+def unchanged_through_uses(aliases, node, uses):
+    """Require the same known storage version at every typed consuming edge.
+
+    No write may intervene between creation of a view and any reader, even if
+    an earlier reader already ran. Unknown ownership/effects or cross-scope
+    edges refuse instead of assuming that a tensor alias materialized a copy.
+    """
+    value = _tensor_value(node)
+    initial = aliases.last_writer(node)
+    if value is None or initial is None or not uses:
+        return False
+    version = (initial[0], initial[1]["id"] if initial[1] else None)
+    for use in uses:
+        if (use.get("producer_node_id") != node["id"]
+                or use.get("producer_value_id") != value["id"]
+                or use.get("value_kind") != "tensor"
+                or use.get("dtype") != value.get("dtype")
+                or use.get("shape") != value.get("shape")):
+            return False
+        consumer = aliases.nodes.get(use.get("consumer_node_id"))
+        if consumer is None:
+            return False
+        current = aliases.last_writer_at(node, consumer)
+        if current is None or (current[0], current[1]["id"] if current[1] else None) != version:
+            return False
+        if consumer.get("op") == "call_function":
+            spec = aliases.schema(consumer)
+            if spec is None or any(arg.alias_info is not None and arg.alias_info.is_write
+                                   for arg in spec.arguments):
+                return False
+    return True
+
+
 def replayed_view_relations(source: dict, dest: dict, relations: list[dict], consumed: set[str]) -> list[dict]:
     aliases = SourceStorageAliases(source)
-    if not aliases.valid or source.get("runtime_versions") != dest.get("runtime_versions"):
+    destination_aliases = SourceStorageAliases(dest)
+    if not aliases.valid or not destination_aliases.valid or source.get("runtime_versions") != dest.get("runtime_versions"):
         return []
     mapped: dict[str, set[str]] = {}
     for relation in relations:
@@ -285,7 +337,8 @@ def replayed_view_relations(source: dict, dest: dict, relations: list[dict], con
             continue
         state = aliases.last_writer(node)
         expected = view_key(node, _tensor_value(producer))
-        if state is None or state[1] is None or expected is None:
+        if (state is None or state[1] is None or expected is None
+                or not unchanged_through_uses(aliases, node, source_uses.get(node["id"], ()))):
             continue
         root, writer = state
         candidates = []
@@ -308,6 +361,8 @@ def replayed_view_relations(source: dict, dest: dict, relations: list[dict], con
                 or typed(observed_input) != typed(_tensor_value(producer))
                 or typed(observed_output) != typed(_tensor_value(node))
                 or view_key(candidate, observed_input) != expected
+                or not unchanged_through_uses(destination_aliases, candidate,
+                                              destination_uses.get(candidate["id"], ()))
             ):
                 continue
             uses = source_uses.get(node["id"], ())
