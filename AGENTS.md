@@ -77,6 +77,15 @@ A loader is a `.py` exposing `get_model_and_inputs() -> (model_or_fn, tuple_of_i
 
 ## Coverage / adding op support
 
+Tensor-subclass field lineage in `capture/subclass_trace.py` observes actual
+state-field accesses before decomposition and binds only unique, unchanged live
+storage and bytes in the prepared parameters. It rejects unknown source effects,
+external input/state writes, changed source graphs/owners/fields and ambiguous
+liftings. Exact multi-return tensor slots are separate storage owners; repeated
+selection of one slot retains its intervening writes. This closes a specific
+quantized-to-prepared proof and does not certify original-to-TorchAO attribution,
+quantization quality, arbitrary tensor subclasses or target execution.
+
 Frontend snapshots preserve historical `results` slots and add versioned
 `result_metadata` describing actual FX `val` presence, container and every
 existing result ordinal. Missing metadata stays unobserved; explicit None is

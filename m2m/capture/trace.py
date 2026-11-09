@@ -282,6 +282,9 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
                                   (getattr(exported, "range_constraints", {}) or {}).items()},
             "runtime_versions": {"torch": __import__("torch").__version__}}
     body["eliminations"] = list(getattr(exported, "_m2m_trace_eliminations", ()))
+    fields = getattr(exported, "_m2m_trace_subclass_fields", ())
+    if fields:
+        body["tensor_subclass_fields"] = list(fields)
     body["sha256"] = _digest(body)
     return body
 

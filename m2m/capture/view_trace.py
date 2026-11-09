@@ -148,6 +148,80 @@ class SourceStorageAliases:
             and incoming[0].get("shape") == source["shape"]
         )
 
+    def tuple_projection_root(self, node):
+        """Bind a fresh tensor return's exact tuple slot, including repeated selections.
+
+        A Python getitem has no operator schema. It may inherit a storage class
+        only from an actual same-scope, schema-owned multi-return call. This is
+        not tensor indexing, container mutation, or a shape-based alias guess.
+        """
+        if (
+            node.get("op") != "call_function"
+            or node.get("target") != "<built-in function getitem>"
+            or node.get("kwargs")
+            or not isinstance(node.get("args"), list)
+            or len(node["args"]) != 2
+            or type(node["args"][1]) is not int
+        ):
+            return None
+        ref, slot = node["args"]
+        if not isinstance(ref, dict) or set(ref) != {"node_id", "value_id"}:
+            return None
+        parent = self.nodes.get(ref["node_id"])
+        if (
+            parent is None
+            or parent.get("op") != "call_function"
+            or parent.get("graph_id") != node.get("graph_id")
+            or type(parent.get("ordinal")) is not int
+            or type(node.get("ordinal")) is not int
+            or parent["ordinal"] >= node["ordinal"]
+        ):
+            return None
+        schema = self.schema(parent)
+        values = parent.get("results") or []
+        if (
+            schema is None
+            or len(schema.returns) < 2
+            or len(schema.returns) != len(values)
+            or not -len(values) <= slot < len(values)
+            or any(
+                arg.alias_info is not None and arg.alias_info.is_write
+                for arg in schema.arguments
+            )
+        ):
+            return None
+        slot %= len(values)
+        if schema.returns[slot].alias_info is not None or str(schema.returns[slot].type) != "Tensor":
+            return None
+        selected = values[slot]
+        result = _tensor_value(node)
+        if (
+            result is None
+            or selected.get("kind") != "tensor"
+            or ref["value_id"] != selected.get("id")
+            or {k: v for k, v in selected.items() if k != "id"}
+            != {k: v for k, v in result.items() if k != "id"}
+        ):
+            return None
+        incoming = [
+            edge
+            for edge in self.source.get("edges") or []
+            if edge.get("consumer_node_id") == node["id"]
+        ]
+        if (
+            len(incoming) != 1
+            or incoming[0].get("producer_node_id") != parent["id"]
+            or incoming[0].get("producer_value_id") != selected["id"]
+            or incoming[0].get("argument_path") != "args/0"
+            or incoming[0].get("value_kind") != "tensor"
+            or incoming[0].get("dtype") != selected.get("dtype")
+            or incoming[0].get("shape") != selected.get("shape")
+        ):
+            return None
+        # One parent/slot is one storage owner. A repeated getitem must not
+        # hide a write performed through another selection of that same slot.
+        return parent["id"] + ":tuple_slot:" + str(slot)
+
     def root(self, node):
         from m2m.capture.trace import _forward_identity_value
 
@@ -160,6 +234,10 @@ class SourceStorageAliases:
         if node["op"] in {"placeholder", "get_attr"}:
             self.roots[identity] = identity
             return identity
+        projection = self.tuple_projection_root(node)
+        if projection is not None:
+            self.roots[identity] = projection
+            return projection
         spec = self.schema(node)
         if spec is None or len(spec.returns) != 1:
             return None

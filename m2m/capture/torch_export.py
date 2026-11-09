@@ -209,7 +209,11 @@ def _prepare_exported_program(
     eliminations: list[dict[str, Any]] = list(
         getattr(exported_program.graph_module, "_m2m_trace_eliminations", ())
     ) if capture_trace else []
+    subclass_fields = None
     if capture_trace:
+        from m2m.capture.subclass_trace import observe
+
+        subclass_fields = observe(exported_program)
         from m2m.capture.trace import tuple_selection_trace_program
 
         exported_program = tuple_selection_trace_program(exported_program)
@@ -240,6 +244,9 @@ def _prepare_exported_program(
         table = {target: wrap(target, function) for target, function in table.items()}
     prepared = exported_program.run_decompositions(table)
     if capture_trace:
+        from m2m.capture.subclass_trace import bind
+
+        prepared._m2m_trace_subclass_fields = bind(subclass_fields, prepared)
         prepared._m2m_trace_eliminations = eliminations
     return prepared, targets
 
