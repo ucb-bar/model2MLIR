@@ -246,8 +246,9 @@ def bridge_fx_graph(
             gm = getattr(exported, "graph_module", None)
             if gm is not None:
                 for _ in range(8):  # bounded fixpoint (nested HOPs); guards against spin
-                    if not inline_set_grad_hops(gm):
+                    if not inline_set_grad_hops(gm, graph_signature=exported.graph_signature):
                         break
+                    exported.validate()
         except Exception:  # noqa: BLE001 - non-fatal
             pass
         importer = FXImporter(emit_named_ops=emit_named_ops)

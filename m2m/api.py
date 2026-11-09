@@ -172,8 +172,9 @@ def convert(
             # carry their own identities. Decomposition otherwise attributes every
             # operation in a region to its outer wrapper and loses the per-op proof.
             for _ in range(8):
-                if not inline_set_grad_hops(raw.graph_module):
+                if not inline_set_grad_hops(raw.graph_module, graph_signature=raw.graph_signature):
                     break
+                raw.validate()
             if decompose:
                 exported_program, _ = _prepare_exported_program(
                     raw, run_default_decompositions=True,
@@ -181,8 +182,10 @@ def convert(
             else:
                 exported_program = raw
             for _ in range(8):
-                if not inline_set_grad_hops(exported_program.graph_module):
+                if not inline_set_grad_hops(exported_program.graph_module,
+                                            graph_signature=exported_program.graph_signature):
                     break
+                exported_program.validate()
             trace_graphs["prepared"] = snapshot_exported_program(exported_program, stage="prepared")
         except Exception as exc:  # Tracing remains diagnostic; no silent recapture.
             return ConversionResult(diagnostics=[f"traced frontend capture failed: {exc}"],
@@ -204,8 +207,10 @@ def convert(
             if exported_program is not None:
                 try:
                     for _ in range(8):  # bounded fixpoint (nested HOPs); guards against spin
-                        if not inline_set_grad_hops(exported_program.graph_module):
+                        if not inline_set_grad_hops(exported_program.graph_module,
+                                                    graph_signature=exported_program.graph_signature):
                             break
+                        exported_program.validate()
                 except Exception:  # noqa: BLE001 - non-fatal; importer handles residual
                     pass
         except Exception:  # noqa: BLE001 - bridge will re-export as a fallback

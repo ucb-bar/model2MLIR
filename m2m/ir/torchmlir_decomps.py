@@ -86,7 +86,7 @@ def _chunk(input, chunks, dim=0):
     return torch.tensor_split(input, chunks, dim=dim)
 
 
-def inline_set_grad_hops(gm) -> bool:
+def inline_set_grad_hops(gm, *, graph_signature=None) -> bool:
     """Flatten ALL ``wrap_with_*`` higher-order ops (torch.no_grad / torch.autocast regions,
     arbitrarily nested) by recursively rebuilding the FX graph.
 
@@ -98,13 +98,22 @@ def inline_set_grad_hops(gm) -> bool:
     HOP's subgraph inline (recursively) with its placeholders bound to the HOP's operands.
     get_attr'd attributes (tensor constants + nested submodules) are transferred to ``gm``.
     Returns True if any HOP was flattened. One call fully flattens (recursion handles nesting).
+    When ``gm`` belongs to an ExportedProgram, pass its graph_signature so named
+    arguments follow the actual value substitutions. Output order, kinds, targets,
+    aliases and literal values are retained; no stale-name verifier bypass occurs.
     """
     import operator
+    from dataclasses import replace
 
     import torch.fx as fx
+    from torch.export.graph_signature import TensorArgument
 
     if not any(n.op == "call_function" and "wrap_with_" in str(n.target) for n in gm.graph.nodes):
         return False
+
+    old_inputs = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    old_output = next(n for n in gm.graph.nodes if n.op == "output").args[0]
+    old_outputs = list(old_output) if isinstance(old_output, (tuple, list)) else [old_output]
 
     new_g = fx.Graph()
 
@@ -232,8 +241,46 @@ def inline_set_grad_hops(gm) -> bool:
     outs = emit(gm, [n for n in gm.graph.nodes if n.op != "placeholder"], top_env)
     new_g.output(tuple(outs) if outs else ())
     new_g.lint()
+    signature_inputs = signature_outputs = None
+    if graph_signature is not None:
+        def remap_spec(spec, original, replacement):
+            # Only the replacement of this exact old graph value can rename a
+            # signature slot. A same-shaped, unrelated node is insufficient.
+            if isinstance(original, fx.Node):
+                if (getattr(spec.arg, "name", None) != original.name
+                        or not isinstance(replacement, fx.Node)):
+                    raise ValueError("HOP signature slot does not name its exact graph value")
+                old_value, new_value = original.meta.get("val"), replacement.meta.get("val")
+                if isinstance(spec.arg, TensorArgument) and not isinstance(old_value, torch.Tensor):
+                    raise ValueError("HOP tensor signature substitution requires tensor metadata")
+                if isinstance(old_value, torch.Tensor):
+                    if not _same_tensor_value(old_value, new_value):
+                        raise ValueError("HOP signature substitution changed tensor type or layout")
+                elif old_value is not new_value:
+                    raise ValueError("HOP signature substitution lacks identical non-tensor metadata")
+                return replace(spec, arg=replace(spec.arg, name=replacement.name))
+            if (not hasattr(spec.arg, "value") or type(original) is not type(replacement)
+                    or original != replacement or spec.arg.value != original):
+                raise ValueError("HOP signature substitution changed a literal output")
+            return spec
+
+        if (len(graph_signature.input_specs) != len(old_inputs)
+                or len(graph_signature.output_specs) != len(old_outputs)
+                or len(outs or []) != len(old_outputs)):
+            raise ValueError("HOP inlining changed the exported argument slot count")
+        signature_inputs = [
+            remap_spec(spec, node, top_env[node])
+            for spec, node in zip(graph_signature.input_specs, old_inputs, strict=True)
+        ]
+        signature_outputs = [
+            remap_spec(spec, node, result)
+            for spec, node, result in zip(graph_signature.output_specs, old_outputs, outs, strict=True)
+        ]
     gm.graph = new_g
     gm.recompile()
+    if graph_signature is not None:
+        graph_signature.input_specs = signature_inputs
+        graph_signature.output_specs = signature_outputs
     return True
 
 
