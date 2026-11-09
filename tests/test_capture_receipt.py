@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import sympy
 import torch
 from m2m.capture.bundle import (
@@ -66,6 +67,61 @@ def test_bundle_golden_numpy_storage_policy_leaves_representable_dtypes_exact():
     bf16 = torch.tensor([1.25, -0.0], dtype=torch.bfloat16)
     assert _numpy_safe(bf16).dtype == np.dtype("float32")
     np.testing.assert_array_equal(_numpy_safe(bf16), bf16.float().numpy())
+
+
+def test_runtime_input_name_and_unrelated_extras_do_not_become_constants(tmp_path):
+    class Runtime(torch.nn.Module):
+        def forward(self, c_model_model_lifted_tensor_input):
+            return c_model_model_lifted_tensor_input
+
+    value = torch.tensor([-0.0, 1.25])
+    write_bundle(Runtime(), (value,), tmp_path, capture_regions=False, capture_trace=True)
+    assert json.loads((tmp_path / "input_order.json").read_text()) == {
+        "c_model_model_lifted_tensor_input": 0}
+    np.savez(tmp_path / "extra.npz", c_model_model_lifted_tensor_input=value.numpy(),
+             c_model_model_lifted_tensor_0=value.numpy())
+    receipt = capture_receipt(tmp_path)
+    assert receipt["lifted_constants"] == {}
+    assert receipt["materialized_abi"] == {"complete": True, "inputs": 1, "lifted_constants": []}
+
+
+def test_nested_lifted_constant_requires_its_declared_extra_and_closed_role(tmp_path):
+    import pytest
+
+    class Literal(torch.nn.Module):
+        def forward(self, x):
+            return x + torch.tensor(-0.0)
+
+    class Wrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Literal()
+
+        def forward(self, x):
+            return self.model(x)
+
+    write_bundle(Wrapper(), (torch.ones(2),), tmp_path, capture_regions=False, capture_trace=True)
+    path = tmp_path / "weights.safetensors.manifest.json"
+    manifest = json.loads(path.read_text())
+    index, row = next((index, row) for index, row in manifest.items() if row["kind"] == "constant")
+    assert row["name"] == "c_model_lifted_tensor_0"
+    for mutation in ("unknown_field", "runtime_role", "runtime_overlap", "missing_extra"):
+        changed = {key: dict(value) for key, value in manifest.items()}
+        if mutation == "unknown_field":
+            changed[index]["unknown"] = True
+        elif mutation == "runtime_role":
+            changed[index] = {"kind": "input", "name": row["name"]}
+        elif mutation == "runtime_overlap":
+            order_path = tmp_path / "input_order.json"
+            original_order = order_path.read_bytes()
+            order_path.write_text(json.dumps({row["name"]: 0}))
+        else:
+            np.savez(tmp_path / "extra.npz", unrelated=np.array(-0.0, dtype="float32"))
+        path.write_text(json.dumps(changed))
+        with pytest.raises(ValueError, match="fields|position|incomplete"):
+            capture_receipt(tmp_path)
+        if mutation == "runtime_overlap":
+            order_path.write_bytes(original_order)
 
 
 def test_bundle_receipt_binds_source_tool_framework_and_materialized_abi(tmp_path):
@@ -273,3 +329,130 @@ def test_bundle_extra_preserves_registered_buffer_dtypes_and_values(tmp_path):
             actual = extra["buf::" + name]
             assert actual.dtype == expected.dtype
             np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_exported_bundle_reuses_real_conversion_and_preserves_nested_roles(tmp_path, monkeypatch, dtype):
+    import m2m
+    import m2m.capture.torch_export as frontend
+    from safetensors import safe_open
+
+    class Leaf(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1.5, -0.5], dtype=dtype))
+            self.register_buffer("weight_codes", torch.tensor([129, 7], dtype=torch.uint8), persistent=False)
+            self.register_buffer("weight_scale_exp", torch.tensor([-3, 1], dtype=torch.int32), persistent=False)
+
+        def forward(self, x):
+            codes = self.weight_codes.to(dtype)
+            exponents = self.weight_scale_exp.to(dtype)
+            return x * self.weight + codes * (exponents + 1) + torch.tensor(-0.0, dtype=dtype)
+
+    class Nested(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Leaf()
+
+        def forward(self, x):
+            return self.model(x)
+
+    def tensor_bytes(value):
+        return value.detach().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+
+    def record(ep):
+        return {
+            "graph": str(ep.graph), "signature": str(ep.graph_signature),
+            "stores": {label: {name: (str(value.dtype), tuple(value.shape), tensor_bytes(value))
+                               for name, value in values.items()}
+                       for label, values in (("state_dict", ep.state_dict), ("constants", ep.constants))},
+        }
+
+    inputs = (torch.tensor([2.0, -1.0], dtype=dtype),)
+    ep = torch.export.export(Nested().eval(), inputs)
+    before = record(ep)
+    expected = ep.module()(*inputs).detach()
+    token_bytes = tensor_bytes(inputs[0])
+    out = tmp_path / "bundle"
+    out.mkdir()
+    converted = m2m.convert(ep, inputs, backend="fx_importer", capture_trace=True,
+                            decompose=False, weights_path=str(out / "weights.safetensors"))
+    assert converted.ok and converted.exported_program is ep
+    weights_before = (out / "weights.safetensors").read_bytes()
+    manifest_before = (out / "weights.safetensors.manifest.json").read_bytes()
+    assert record(ep) == before
+
+    def unexpected_capture(*args, **kwargs):
+        raise AssertionError("publication must not convert or export again")
+
+    monkeypatch.setattr(m2m, "convert", unexpected_capture)
+    monkeypatch.setattr(torch.export, "export", unexpected_capture)
+    monkeypatch.setattr(frontend, "capture_frontend_artifact", unexpected_capture)
+    forwards = []
+
+    def observed_forward(module, args, output):
+        if isinstance(module, torch.fx.GraphModule) and isinstance(output, torch.Tensor):
+            forwards.append((output.device.type, output.dtype, tensor_bytes(output)))
+
+    hook = torch.nn.modules.module.register_module_forward_hook(observed_forward)
+    try:
+        write_bundle(ep, inputs, out, capture_regions=False, capture_trace=True,
+                     conversion_result=converted, exported_program=ep)
+    finally:
+        hook.remove()
+    assert forwards == [("cpu", dtype, tensor_bytes(expected))]
+    assert record(ep) == before and record(converted.exported_program) == before
+    assert tensor_bytes(inputs[0]) == token_bytes
+    assert (out / "weights.safetensors").read_bytes() == weights_before
+    assert (out / "weights.safetensors.manifest.json").read_bytes() == manifest_before
+    assert (out / "model.mlir").read_text() == converted.mlir_text
+    trace = json.loads((out / "frontend-trace.json").read_text())
+    assert trace == converted.capture_trace and trace["status"] == "complete"
+    assert trace["mlir"]["sha256"] == hashlib.sha256(converted.mlir_text.encode()).hexdigest()
+    manifest = json.loads(manifest_before)
+    lifted = [spec for spec in ep.graph_signature.input_specs if spec.kind.name != "USER_INPUT"]
+    targets = {spec.target for spec in lifted}
+    assert {spec.kind.name for spec in lifted} == {"PARAMETER", "BUFFER", "CONSTANT_TENSOR"}
+    with safe_open(str(out / "weights.safetensors"), framework="pt", device="cpu") as archive:
+        assert set(archive.keys()) == targets
+        for ordinal, spec in enumerate(ep.graph_signature.input_specs):
+            if spec.kind.name == "USER_INPUT":
+                continue
+            source = ep.state_dict.get(spec.target, ep.constants.get(spec.target))
+            row = manifest[str(ordinal)]
+            assert row["weight"] == spec.target and not row.get("stub") and "error" not in row
+            assert row["kind"] == {"PARAMETER": "param", "BUFFER": "buffer", "CONSTANT_TENSOR": "constant"}[spec.kind.name]
+            actual = archive.get_tensor(spec.target)
+            assert actual.dtype == source.dtype and tuple(actual.shape) == tuple(source.shape)
+            assert tensor_bytes(actual) == tensor_bytes(source)
+            if spec.kind.name == "CONSTANT_TENSOR":
+                assert row["name"] == spec.arg.name
+    constant = next(spec for spec in lifted if spec.kind.name == "CONSTANT_TENSOR")
+    assert constant.arg.name.startswith("c_model_")
+    receipt = capture_receipt(out)
+    assert receipt["materialized_abi"] == {"complete": True, "inputs": 1,
+                                         "lifted_constants": [constant.arg.name]}
+    with np.load(out / "extra.npz", allow_pickle=False) as extra:
+        np.testing.assert_array_equal(extra[constant.arg.name],
+                                      ep.constants[constant.target].float().numpy())
+    golden = np.load(out / "golden.npy", allow_pickle=False)
+    expected_numpy = expected.float().numpy() if dtype == torch.bfloat16 else expected.numpy()
+    assert golden.dtype == expected_numpy.dtype and golden.shape == expected_numpy.shape
+    np.testing.assert_array_equal(golden.view("uint32"), expected_numpy.view("uint32"))
+
+
+def test_bundle_still_evaluates_ordinary_training_modules(tmp_path):
+    class Training(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dropout = torch.nn.Dropout(1.0)
+
+        def forward(self, x):
+            return self.dropout(x)
+
+    model = Training()
+    assert model.training and model.dropout.training
+    inputs = (torch.ones(2),)
+    write_bundle(model, inputs, tmp_path, capture_regions=False, capture_trace=True)
+    assert not model.training and not model.dropout.training
+    np.testing.assert_array_equal(np.load(tmp_path / "golden.npy", allow_pickle=False), inputs[0].numpy())

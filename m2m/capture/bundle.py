@@ -94,8 +94,8 @@ def _flatten_subclass(obj: Any, prefix: str, out: dict) -> None:
         out[f"qinner::{prefix}"] = arr
 
 
-def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> None:
-    """Populate c_lifted_tensor_<i> from m2m's own export (graph order matches the importer)."""
+def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> set[str]:
+    """Populate exact CONSTANT_TENSOR placeholder names from m2m's own export."""
     try:
         from torch.export.graph_signature import InputKind
 
@@ -109,17 +109,22 @@ def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> Non
             ep = artifact.exported_program or artifact.original_exported_program
         consts = dict(getattr(ep, "constants", {}) or {})
         sd = dict(getattr(ep, "state_dict", {}) or {})
-        li = 0
+        names = set()
         for spec in ep.graph_signature.input_specs:
             if spec.kind != InputKind.CONSTANT_TENSOR:
                 continue
+            name = getattr(spec.arg, "name", None)
+            if not isinstance(name, str) or not name.isidentifier() or name in extra:
+                raise ValueError("lifted tensor has an invalid or duplicate source placeholder")
             val = consts.get(str(spec.target), sd.get(str(spec.target)))
             if val is not None and hasattr(val, "detach"):
-                extra[f"c_lifted_tensor_{li}"] = _numpy_safe(val)
-            li += 1
+                extra[name] = _numpy_safe(val)
+                names.add(name)
+        return names
     except Exception as exc:  # noqa: BLE001
         import traceback
         print(f"[warn] lifted-constant export failed: {exc}\n{traceback.format_exc()[-800:]}")
+        return set()
 
 
 def _extract_prov_fqns(mlir_text: str) -> list[str]:
@@ -492,7 +497,10 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         raise ValueError("ordinary quantization quality requires quant and no session; sessions use trajectory quality")
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    mdl.eval()
+    # ExportedProgram already fixes training behavior, and its public module()
+    # deliberately refuses eval()/train(). Preserve that contract and its graph.
+    if not isinstance(mdl, torch.export.ExportedProgram):
+        mdl.eval()
     inputs = tuple(inputs)
 
     prequant_outputs = None
@@ -647,8 +655,8 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     for pname, p in runtime_mdl.named_parameters():
         if type(p).__name__ not in ("Parameter", "Tensor") or hasattr(p, "__tensor_flatten__"):
             _flatten_subclass(p, pname, extra)
-    _lifted_constants(runtime_mdl, inputs, extra,
-                      exported_program=r.exported_program if r.exported_program is not None else exported_program)
+    lifted_names = _lifted_constants(runtime_mdl, inputs, extra,
+                                    exported_program=r.exported_program if r.exported_program is not None else exported_program)
     np.savez(out / "extra.npz", **extra)
 
     man = json.loads(Path(weights_path + ".manifest.json").read_text())
@@ -657,7 +665,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     for i in range(len(man)):
         meta = man[str(i)]
         nm = meta.get("name", "") or ""
-        if meta["kind"] in ("param", "buffer") or "lifted_tensor" in nm:
+        if meta["kind"] in ("param", "buffer", "constant") or nm in lifted_names:
             continue
         order[nm] = k
         k += 1

@@ -413,18 +413,40 @@ def decompose_linear(
     """Decompose aten.linear.default(input, weight, bias?) -> matmul + bias add.
 
     linear(x, w, b) = x @ w^T + b
-    - x: [M, K], w: [N, K] (note: weight is transposed), b: [N]
-    - output: [M, N]
+    - x: [..., K], w: [N, K] (note: weight is transposed), b: [N]
+    - output: [..., N]
     """
     ops: list[Operation] = []
     region_ids: list[str] = []
 
-    x = operands[0]  # input: [M, K]
+    x = operands[0]  # input: [..., K]
     w = operands[1]  # weight: [N, K]
 
     # Get result type from metadata (preserve operand dtype, e.g. bf16)
     val: Any = meta["val"]
     result_type = TensorType(_t_elem(x), _static_shape(val.shape))
+    x_shape, w_shape = _shape_of(x), _shape_of(w)
+    if (x_shape is None or not x_shape or w_shape is None or len(w_shape) != 2
+            or any(d < 0 for d in (*x_shape, *w_shape, *result_type.get_shape()))
+            or x_shape[-1] != w_shape[1] or _t_elem(x) != _t_elem(w)
+            or list(result_type.get_shape()) != [*x_shape[:-1], w_shape[0]]):
+        return _opaque_decomp("aten_linear", operands, meta, "contraction", pattern_hint="linear")
+    bias = operands[2] if len(operands) > 2 else None
+    if bias is not None and (not isinstance(bias.type, TensorType)
+            or _t_elem(bias) != result_type.element_type
+            or _broadcast_map(bias.type.get_shape(), result_type.get_shape()) is None):
+        return _opaque_decomp("aten_linear", operands, meta, "contraction", pattern_hint="linear")
+
+    # Named linalg.matmul is rank two. Flatten only the independent leading
+    # dimensions, keeping K and the logical element order unchanged.
+    from math import prod
+
+    rows = prod(x_shape[:-1])
+    matrix_type = TensorType(_t_elem(x), [rows, w_shape[0]])
+    reshaped = _emit_reshape(x, [rows, x_shape[-1]], _t_elem(x))
+    assert reshaped is not None  # Static shapes with exactly equal element counts.
+    reshape_ops, matrix_input = reshaped
+    ops.extend(reshape_ops)
 
     # Step 1: Transpose weight [N, K] -> [K, N]
     w_type = w.type
@@ -453,13 +475,13 @@ def decompose_linear(
     ops.append(transpose)
 
     # Step 2: Matmul: x [M, K] @ w^T [K, N] -> [M, N]
-    mm_empty = _make_empty(result_type)
+    mm_empty = _make_empty(matrix_type)
     ops.append(mm_empty)
 
     matmul = MatmulOp(
-        inputs=[x, transpose.results[0]],
+        inputs=[matrix_input, transpose.results[0]],
         outputs=[mm_empty.results[0]],
-        res=[result_type],
+        res=[matrix_type],
     )
     rid = _next_region_id("matmul")
     _attach_region_id(matmul, rid)
@@ -473,7 +495,10 @@ def decompose_linear(
     region_ids.append(rid)
     ops.append(matmul)
 
-    result = matmul.results[0]
+    restored = _emit_reshape(matmul.results[0], list(result_type.get_shape()), _t_elem(x))
+    assert restored is not None  # [..., N] has rows*N elements, including rank one.
+    restore_ops, result = restored
+    ops.extend(restore_ops)
 
     # Step 3: Bias addition. linear(x, w, b) = matmul + b, with b ([N]) broadcast over the
     # leading dims of the result ([..., N]). Emit a linalg.generic add whose bias input uses a
@@ -487,7 +512,6 @@ def decompose_linear(
     # decompose_linear is the sole handler for aten.linear.default (torch emits the 2-D
     # activation case as aten.addmm, handled separately), so adding the bias here can't double
     # it. In practice this fires for over-rank (>=3-D) linears.
-    bias = operands[2] if len(operands) > 2 else None
     out_shape = result_type.get_shape()
     elem = result_type.element_type
     if bias is not None and isinstance(bias.type, TensorType):
@@ -6145,6 +6169,67 @@ def _make_dim_extremum(is_min, indices_only):
     return decompose
 
 
+def decompose_diff(operands, meta, node_name):
+    """Static aten.diff with exact dtype arithmetic and optional prepend/append."""
+    from xdsl.dialects.arith import XOrIOp
+    from xdsl.dialects.builtin import IntegerType
+    from xdsl.dialects.tensor import ConcatOp, ExtractSliceOp
+
+    kw = meta.get("_fx_kwargs", {})
+    n = _fx_arg(meta, 1, kw.get("n", 1))
+    dim = _fx_arg(meta, 2, kw.get("dim", -1))
+    if not operands or not isinstance(operands[0].type, TensorType) or type(n) is not int or n < 0:
+        raise TypeError("diff requires a static nonnegative order and a ranked tensor")
+    source = operands[0]
+    shape = list(source.type.get_shape())
+    rank = len(shape)
+    if type(dim) is not int or not -rank <= dim < rank or any(d < 0 for d in shape):
+        raise TypeError("diff requires a static shape and a valid static dimension")
+    dim %= rank
+    if n == 0:
+        return DecompResult(result=source, pattern_hint="diff")
+    elem = source.type.element_type
+    args = meta.get("_fx_ssa_args", {})
+    pieces = []
+    for pos, key in ((3, "prepend"), (0, "self"), (4, "append")):
+        raw = _fx_arg(meta, pos, kw.get(key))
+        value = source if pos == 0 else args.get(pos)
+        if value is None and hasattr(raw, "name"):
+            # Keywords are tensor operands too; recover their SSA by FX name.
+            value = meta.get("_fx_ssa_kwargs", {}).get(key)
+        if pos != 0 and raw is None:
+            continue
+        if value is None or value.type.element_type != elem:
+            raise TypeError("diff prepend/append must preserve the source dtype")
+        other = list(value.type.get_shape())
+        if len(other) != rank or any(d < 0 for d in other) or any(other[i] != shape[i] for i in range(rank) if i != dim):
+            raise TypeError("diff prepend/append shapes must match outside the difference dimension")
+        pieces.append(value)
+    ops = []
+    if len(pieces) > 1:
+        shape[dim] = sum(v.type.get_shape()[dim] for v in pieces)
+        concat = ConcatOp(inputs=pieces, dim=dim, result_type=TensorType(elem, shape))
+        ops.append(concat)
+        source = concat.results[0]
+    for _ in range(min(n, shape[dim])):
+        shape[dim] -= 1
+        offsets = [0] * rank
+        before = ExtractSliceOp.from_static_parameters(source, offsets, shape, [1] * rank)
+        offsets[dim] = 1
+        after = ExtractSliceOp.from_static_parameters(source, offsets, shape, [1] * rank)
+        ops.extend([before, after])
+        builder = _bin_build(XOrIOp) if isinstance(elem, IntegerType) and elem.width.data == 1 else _arith_build2("SubfOp", "SubiOp")
+        emitted = _elementwise([after.results[0], before.results[0]], TensorType(elem, shape), builder)
+        if emitted is None:
+            raise TypeError("diff elementwise subtraction is unsupported")
+        ops.extend(emitted[0])
+        source = emitted[1]
+    rid = _next_region_id("diff")
+    for op in ops:
+        _attach_region_id(op, rid)
+    return DecompResult(ops=ops, result=source, region_ids=[rid], pattern_hint="diff")
+
+
 def decompose_slice_tensor(operands, meta, node_name):
     """aten.slice.Tensor(input, dim, start, end, step) -> tensor.extract_slice."""
     if not operands or not isinstance(operands[0].type, TensorType):
@@ -7348,6 +7433,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.transpose.default": decompose_transpose_int,
     "aten.matmul.default": decompose_matmul,
     "aten.slice.Tensor": decompose_slice_tensor,
+    "aten.diff.default": decompose_diff,
     # --- wave 6 C.2: TorchAO quantized_decomposed + packed GEMMs ---
     "torch.ops.quantized_decomposed.quantize_per_tensor.default": decompose_quantize_per_tensor,
     "torch.ops.quantized_decomposed.dequantize_per_tensor.default": decompose_dequantize_per_tensor,

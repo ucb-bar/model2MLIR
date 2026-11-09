@@ -982,6 +982,11 @@ class FXImporter:
                     for i, arg in enumerate(node.args)
                     if hasattr(arg, "name") and arg.name in value_map
                 }
+                meta["_fx_ssa_kwargs"] = {
+                    key: value_map[arg.name]
+                    for key, arg in node.kwargs.items()
+                    if hasattr(arg, "name") and arg.name in value_map
+                }
                 meta["_aten_target"] = target_str  # provenance: source aten op
                 meta["_emit_named_ops"] = self.emit_named_ops  # high-level form toggle
                 meta["_quant_inner"] = _quant_inner_key.get(node.name)  # subclass attr path

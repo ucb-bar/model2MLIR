@@ -179,28 +179,62 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
         pointer = meta.get("frontend_trace") or {}
         if pointer.get("path") != "frontend-trace.json" or pointer.get("sha256") != artifacts["frontend-trace.json"]["sha256"]:
             raise ValueError("bundle metadata does not bind its exact frontend trace")
+    manifest = json.loads((out / "weights.safetensors.manifest.json").read_text())
+    input_order = json.loads((out / "input_order.json").read_text())
+    if not isinstance(manifest, dict) or not isinstance(input_order, dict):
+        raise ValueError("capture argument manifest or input order is not a mapping")
+    declarations = {}
+    for entry in manifest.values():
+        if not isinstance(entry, dict):
+            raise ValueError("lifted-constant manifest has a malformed row")
+        name = entry.get("name")
+        legacy = (entry.get("kind") == "input" and isinstance(name, str)
+                  and name.startswith("c_lifted_tensor_") and name not in input_order)
+        if entry.get("kind") == "input" and not legacy and (
+            set(entry) != {"kind", "name"} or not isinstance(name, str) or name not in input_order
+        ):
+            raise ValueError("runtime input manifest lacks a declared position")
+        if entry.get("kind") != "constant" and not legacy:
+            continue
+        fields = {"kind", "name", "weight", "dtype", "shape"} if "weight" in entry else {"kind", "name"}
+        if (set(entry) != fields or not isinstance(name, str) or not name.isidentifier()
+                or name in declarations or name in input_order):
+            raise ValueError("lifted constant has invalid fields or occupies a runtime input position")
+        if "weight" in entry and (
+            not isinstance(entry["weight"], str) or not entry["weight"]
+            or not isinstance(entry["dtype"], str) or not entry["dtype"]
+            or not isinstance(entry["shape"], list)
+            or any(type(size) is not int or size < 0 for size in entry["shape"])
+        ):
+            raise ValueError("archived lifted constant has an invalid source declaration")
+        declarations[name] = entry
+    expected_lifted = sorted(declarations)
     lifted = {}
     with np.load(out / "extra.npz", allow_pickle=False) as extras:
-        for name in sorted(extras.files):
-            if not name.startswith("c_lifted_tensor_"):
-                continue
+        if len(extras.files) != len(set(extras.files)):
+            raise ValueError("extra archive has duplicate tensor names")
+        unexpected = {name for name in extras.files if name.startswith("c_lifted_tensor_")
+                      and name not in declarations and name not in input_order}
+        if set(declarations) - set(extras.files) or unexpected:
+            raise ValueError("lifted-constant ABI is incomplete: declared extra tensors differ")
+        for name in expected_lifted:
             value = np.asarray(extras[name])
+            declaration = declarations[name]
+            if "weight" in declaration:
+                dtype = declaration["dtype"]
+                storage_dtype = "float32" if dtype == "bfloat16" or "float8" in dtype else dtype
+                if list(value.shape) != declaration["shape"] or str(value.dtype) != storage_dtype:
+                    raise ValueError("lifted extra tensor differs from its source shape or dtype")
             lifted[name] = {
                 "shape": list(value.shape),
                 "dtype": str(value.dtype),
                 "sha256": hashlib.sha256(value.tobytes()).hexdigest(),
             }
-    manifest = json.loads((out / "weights.safetensors.manifest.json").read_text())
-    expected_lifted = sorted({
-        str(entry.get("name")) for entry in manifest.values()
-        if isinstance(entry, dict) and str(entry.get("name", "")).startswith("c_lifted_tensor_")
-    })
     if expected_lifted != sorted(lifted):
         raise ValueError(
             "lifted-constant ABI is incomplete: "
             f"manifest requires {expected_lifted}, extra.npz provides {sorted(lifted)}"
         )
-    input_order = json.loads((out / "input_order.json").read_text())
     with np.load(out / "inputs.npz", allow_pickle=False) as inputs:
         materialized_inputs = set(inputs.files)
     expected_inputs = {f"in{i}" for i in range(len(input_order))}
