@@ -331,3 +331,31 @@ directory, pass `conversion_result=r` to `write_bundle` to reuse it without
 recapture or rewriting weights. With `quant` supplied, this also requires
 `quantization_preapplied=True`. A trace that is diagnostic remains diagnostic in
 the bundle; materialization does not turn it into an execution qualification.
+
+### Explicit finite FP8 Linear source correspondence
+
+`LinearInstrumentation` additionally accepts an explicit
+`FiniteFloat8LinearPolicy()` and an ordinary tuple `float8_modules` containing
+actual owned source `nn.Linear` objects. This fixed capability admits only public
+TorchAO E4M3FN, per-row TORCH encoding with F32 scales, a `1e-12` maximum-absolute
+value floor for both weights and dynamic activations, and
+`Float8MMConfig(False, False, False)`. Other Linears retain the independently
+verified default dynamic W8A8 recipe. An exact `QuantizationConfig("none",
+per_module=...)` describes the already transformed heterogeneous source; it does
+not apply or authorize a transform. The caller still constructs each selected
+weight from its original FP32 parameter using the actual public AO API.
+
+The owner installs explicit graph-safe finite-input assertions at the declared
+FP8 sites in **both fresh original and selected exports**. This changes the guard
+encoding from an external Python hook; it preserves the finite-only domain and
+leaves the quantizer unchanged, without claiming identical exception types.
+These guards lower to ordered `cf.assert` operations. Weight bytes, scale bytes,
+closed typed recipe metadata, field storage, input/output contracts, complete
+caller order and live permission references are independently checked. Unknown
+recipes or state uses refuse; no caller callback can exempt state.
+
+This establishes source tensor-graph correspondence, not arbitrary enclosing
+Python effects, application accuracy or target execution. The optional ordered
+`_scaled_mm` conversion still requires its separate numerical permission and
+retains the explicit scale/reduction-order diagnostic. This capability grants
+neither an all-operators FP8 claim nor an FP8 arithmetic implementation on RVV.

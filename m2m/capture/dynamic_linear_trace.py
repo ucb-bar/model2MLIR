@@ -1,4 +1,4 @@
-"""Opt-in source-bound lineage for default TorchAO v2 dynamic-int8 Linear calls.
+"""Opt-in source-bound lineage for explicitly supported actual TorchAO calls.
 
 Opaque tokens carry actual module execution context. Public export module-call
 signatures, exact typed caller DAG/order, unchanged state payloads and independently
@@ -105,7 +105,7 @@ def _readonly(snapshot, *, contexts=None, live=None):
                     raise DynamicLinearLineageError("external input/state mutation")
 
 
-def _instrument(model, embedding_policy=None):
+def _instrument(model, embedding_policy=None, float8_policy=None, float8_modules=()):
     try:
         from torch.fx.traceback import annotate
     except ImportError as exc:
@@ -156,14 +156,19 @@ def _instrument(model, embedding_policy=None):
         tag = {"m2m_dynamic_site": token}
         original = module.forward
 
-        def wrap(original, tag):
+        def wrap(original, tag, finite):
             def forward(input):
+                if finite:
+                    from m2m.capture.float8_linear_trace import guard_input
+
+                    guard_input(input)
                 with annotate(tag):
                     return original(input)
 
             return forward
 
-        wrapped = wrap(original, tag)
+        finite = any(module is selected for selected in float8_modules)
+        wrapped = wrap(original, tag, finite)
         sites[path] = {
             "module": module,
             "wrapper": wrapped,
@@ -183,6 +188,8 @@ def _instrument(model, embedding_policy=None):
                 embedding_options=embedding_trace.options(module),
                 embedding_forward_contract=observe(module),
             )
+        if finite:
+            sites[path]["float8_policy"] = float8_policy
         module.forward = wrapped
     return sites
 
@@ -329,13 +336,21 @@ def _bind_pair(source, selected, sites):
             raise DynamicLinearLineageError("source module callable replaced")
         weight = site["module"].weight
         config = Int8DynamicActivationInt8WeightConfig()
-        if (
+        if "float8_policy" not in site and (
             type(weight) is not Int8Tensor
             or config.version != 2
             or config.granularity != PerRow(-1)
         ):
             raise DynamicLinearLineageError("unsupported actual AO recipe")
-        if "embedding_policy" in site:
+        if "float8_policy" in site:
+            from m2m.capture import float8_linear_trace
+
+            expected = float8_linear_trace.expected_weight(site)
+            if type(weight) is not type(expected):
+                raise DynamicLinearLineageError(
+                    "unsupported actual finite FP8 AO owner"
+                )
+        elif "embedding_policy" in site:
             from m2m.capture import embedding_trace
 
             expected = embedding_trace.expected_weight(site)
@@ -353,12 +368,22 @@ def _bind_pair(source, selected, sites):
         en, em = expected.__tensor_flatten__()
         if (
             names != en
-            or meta != em
+            or (
+                float8_linear_trace.frozen_metadata(meta)
+                != float8_linear_trace.frozen_metadata(em)
+                if "float8_policy" in site
+                else meta != em
+            )
             or any(not _exact(getattr(weight, n), getattr(expected, n)) for n in names)
         ):
             raise DynamicLinearLineageError(
                 "weight encoding differs from original FP32 recipe"
             )
+        if "float8_policy" in site:
+            for name in names:
+                float8_linear_trace.verify_field_geometry(
+                    getattr(weight, name), getattr(expected, name)
+                )
         if "embedding_policy" in site:
             if embedding_trace.frozen_metadata(meta) != embedding_trace.frozen_metadata(
                 em
@@ -410,7 +435,7 @@ def _bind_pair(source, selected, sites):
                     }
                     for name in names
                 },
-                "default_v2_recipe_verified": True,
+                "default_v2_recipe_verified": "float8_policy" not in site,
                 "exact_module_boundary": True,
             }
         )
@@ -421,7 +446,16 @@ def _bind_pair(source, selected, sites):
             kind[identity] = (
                 "declared_weight_only_embedding_quantization"
                 if "embedding_policy" in site
+                else "declared_finite_float8_linear_quantization"
+                if "float8_policy" in site
                 else "declared_dynamic_linear_quantization"
+            )
+        if "float8_policy" in site:
+            site_records[-1].update(
+                selected_recipe=float8_linear_trace.RECIPE_ID,
+                finite_activation_guard="aten.isfinite/all/_assert_async in both original and selected",
+                guard_encoding_changed=True,
+                source_operator="aten.linear.default",
             )
         if "embedding_policy" in site:
             from m2m.capture.embedding_forward import summary
@@ -523,6 +557,18 @@ def _bind_pair(source, selected, sites):
             )
         claims[identity] = weight_rows[receiver]
         kind[identity] = "declared_weight_field_reencoding"
+    metadata_assertions = {}
+    if any("float8_policy" in site for site in sites.values()):
+        from m2m.capture import float8_linear_trace
+
+        float8_linear_trace.verify_weight_uses(source, selected, sites, sb, db)
+        metadata_assertions = float8_linear_trace.input_metadata_assertions(
+            selected, sites, db
+        )
+        if any(node_id in claims for node_id in metadata_assertions):
+            raise DynamicLinearLineageError(
+                "FP8 metadata assertion region is ambiguous"
+            )
     source_sites = {b["output"] for b in sb.values()}
     source_order = [
         row
@@ -535,6 +581,7 @@ def _bind_pair(source, selected, sites):
         for row in new["nodes"]
         if row["op"] == "call_function"
         and row["graph_id"] == "g:quantized:root"
+        and row["id"] not in metadata_assertions
         and (row["id"] not in claims or row["id"] in selected_outputs)
     ]
     if len(source_order) != len(selected_order):
@@ -599,6 +646,20 @@ def _bind_pair(source, selected, sites):
         mapping[other["id"]] = row["id"]
         claims[other["id"]] = row["id"]
         kind[other["id"]] = "exact_unchanged_call"
+    # An input may be an unchanged global caller result, not a placeholder.
+    # Its source identity is available only after the complete ordered DAG is
+    # bound. Reserve only typed always-true ABI assertions above; publish no
+    # claim until that actual operand has an exact source correspondence.
+    for node_id, input_id in metadata_assertions.items():
+        expected_inputs = {
+            sb[path]["input"]
+            for path, site in sites.items()
+            if "float8_policy" in site and db[path]["input"] == input_id
+        }
+        if len(expected_inputs) != 1 or mapping.get(input_id) not in expected_inputs:
+            raise DynamicLinearLineageError("FP8 metadata assertion caller is unproved")
+        claims[node_id] = mapping[input_id]
+        kind[node_id] = "source_input_metadata_assertion"
     for path in sites:
         if mapping.get(db[path]["input"]) != sb[path]["input"]:
             raise DynamicLinearLineageError("linear caller changed")
@@ -666,6 +727,15 @@ def _bind_pair(source, selected, sites):
         "complete_root_call_occurrences_verified": len(source_order),
         "all_original_weight_encodings_verified": True,
         "site_bindings": site_records,
+        "typed_input_metadata_assertions_verified": [
+            {
+                "selected_assertion": identity,
+                "selected_input": incoming,
+                "source_input": mapping[incoming],
+                "qualification": "exact_CPU_strided_F32_input_type_not_value_or_shape_inference",
+            }
+            for identity, incoming in metadata_assertions.items()
+        ],
     }
 
 
@@ -780,9 +850,13 @@ class _SelectedBinding:
 
 def _capabilities(sites):
     return tuple(
-        (path, "weight_only_embedding_v2", site["embedding_policy"])
+        (path, kind, site[key])
         for path, site in sites.items()
-        if "embedding_policy" in site
+        for key, kind in (
+            ("embedding_policy", "weight_only_embedding_v2"),
+            ("float8_policy", "finite_float8_linear_v1"),
+        )
+        if key in site
     )
 
 
@@ -808,6 +882,17 @@ def _check_capabilities(source, expected):
                     "sealed embedding capability type changed"
                 )
             validate_site(source.sites[path])
+        elif kind == "finite_float8_linear_v1":
+            from m2m.capture.float8_linear_trace import (
+                FiniteFloat8LinearPolicy,
+                validate_site,
+            )
+
+            if type(policy) is not FiniteFloat8LinearPolicy:
+                raise DynamicLinearLineageError(
+                    "sealed finite FP8 capability type changed"
+                )
+            validate_site(source.sites[path])
         else:
             raise DynamicLinearLineageError("unknown sealed source capability")
 
@@ -818,11 +903,15 @@ def _recipe_metadata(kind, value):
         from m2m.capture.embedding_trace import frozen_metadata
 
         return frozen_metadata(value)
+    if kind == "finite_float8_linear_v1":
+        from m2m.capture.float8_linear_trace import frozen_metadata
+
+        return frozen_metadata(value)
     raise DynamicLinearLineageError("unknown sealed source recipe capability")
 
 
 def _state_bindings(exported, *, source_recipes=()):
-    from torchao.quantization import Int8Tensor
+    from torchao.quantization import Float8Tensor, Int8Tensor
 
     result = []
     for target, value in {**exported.state_dict, **exported.constants}.items():
@@ -830,7 +919,13 @@ def _state_bindings(exported, *, source_recipes=()):
             result.append(
                 _StateBinding(target, value, (), None, (_seal(target, value),))
             )
-        elif type(value) is Int8Tensor:
+        elif type(value) is Int8Tensor or (
+            type(value) is Float8Tensor
+            and any(
+                value is owner and kind == "finite_float8_linear_v1"
+                for owner, kind in source_recipes
+            )
+        ):
             fields, metadata = value.__tensor_flatten__()
             if not fields or any(type(name) is not str for name in fields):
                 raise DynamicLinearLineageError("unknown selected state fields")
@@ -839,7 +934,7 @@ def _state_bindings(exported, *, source_recipes=()):
                     target,
                     value,
                     tuple(fields),
-                    copy.deepcopy(metadata),
+                    None if type(value) is Float8Tensor else copy.deepcopy(metadata),
                     tuple(_seal(name, getattr(value, name)) for name in fields),
                     next(
                         (kind for owner, kind in source_recipes if value is owner), None
@@ -925,7 +1020,10 @@ def validate_selected_source(exported, inputs):
             fields, metadata = owner.__tensor_flatten__()
             if (
                 tuple(fields) != state.fields
-                or metadata != state.metadata
+                or (
+                    state.recipe_kind != "finite_float8_linear_v1"
+                    and metadata != state.metadata
+                )
                 or (
                     state.recipe_metadata is not None
                     and _recipe_metadata(state.recipe_kind, metadata)
@@ -953,10 +1051,17 @@ class LinearInstrumentation:
 
     It never quantizes a module. All source stages must be captured before the
     caller applies its one actual transform. Close the owner after all selected
-    stages have been exported; ordinary forwards remain numerically unchanged.
+    stages have been exported. A finite FP8 capability adds explicit graph-safe
+    domain guards to both fresh source programs; finite arithmetic is unchanged.
     """
 
-    def __init__(self, model, *, embedding_policy=None):
+    def __init__(
+        self, model, *, embedding_policy=None, float8_policy=None, float8_modules=()
+    ):
+        from m2m.capture.float8_linear_trace import modules
+
+        self._float8_modules = modules(model, float8_policy, float8_modules)
+        self._float8_policy = float8_policy
         if embedding_policy is not None:
             from m2m.capture.embedding_trace import Int8WeightOnlyEmbeddingPolicy
 
@@ -965,7 +1070,9 @@ class LinearInstrumentation:
                     "explicit Int8WeightOnlyEmbeddingPolicy required"
                 )
         self._embedding_policy = embedding_policy
-        self._sites = _instrument(model, embedding_policy)
+        self._sites = _instrument(
+            model, embedding_policy, float8_policy, self._float8_modules
+        )
         if not self._sites:
             raise DynamicLinearLineageError("no source plain FP32 Linear sites")
         self._closed = False
@@ -992,6 +1099,16 @@ class LinearInstrumentation:
                         "owned embedding capability reference changed"
                     )
                 embedding_trace.validate_site(site)
+            if "float8_policy" in site:
+                from m2m.capture.float8_linear_trace import validate_site
+
+                if site["float8_policy"] is not self._float8_policy or not any(
+                    module is selected for selected in self._float8_modules
+                ):
+                    raise DynamicLinearLineageError(
+                        "owned finite FP8 capability reference or module roster changed"
+                    )
+                validate_site(site)
             seen.add(id(module))
             sites[path] = site
         if not sites:
@@ -1034,6 +1151,10 @@ class LinearInstrumentation:
             from m2m.capture import embedding_trace
 
             embedding_trace.verify_source_weight_uses(exported, sites, boundaries)
+        if any("float8_policy" in site for site in sites.values()):
+            from m2m.capture.float8_linear_trace import verify_source_weight_uses
+
+            verify_source_weight_uses(exported, sites, boundaries)
         states = {**exported.state_dict, **exported.constants}
         seals = tuple(_seal(target, value) for target, value in states.items())
         source = LinearSource(
@@ -1056,14 +1177,34 @@ class LinearInstrumentation:
         the public tensor ABI/caller graph remains exact. This method does not
         assert equal FP32/quantized input payloads or application accuracy.
         """
-        if (
-            quantization.scheme != "int8_dyn_act_int8_weight"
-            or quantization.per_module
-            or quantization.group_size is not None
-            or quantization.extra_args
-        ):
+        mixed = any("float8_policy" in site for site in self._sites.values())
+        if mixed:
+            from m2m.capture.float8_linear_trace import RECIPE_ID
+
+            declared = {
+                path: RECIPE_ID
+                if "float8_policy" in site
+                else "int8_dyn_act_int8_weight"
+                for path, site in self._sites.items()
+                if "embedding_policy" not in site
+            }
+            supported = (
+                quantization.scheme == "none"
+                and type(quantization.per_module) is dict
+                and quantization.per_module == declared
+                and quantization.group_size is None
+                and not quantization.extra_args
+            )
+        else:
+            supported = (
+                quantization.scheme == "int8_dyn_act_int8_weight"
+                and not quantization.per_module
+                and quantization.group_size is None
+                and not quantization.extra_args
+            )
+        if not supported:
             raise DynamicLinearLineageError(
-                "only the default explicit dynamic W8A8 recipe is supported"
+                "explicit exact default W8A8 or declared fixed mixed recipe map required"
             )
         if not isinstance(source, LinearSource):
             raise TypeError("an owned original LinearSource is required")
@@ -1133,6 +1274,14 @@ class LinearInstrumentation:
                 scope="declared default-v2 dynamic Linear and per-row weight-only embedding source correspondence only",
                 embedding_module_post_arithmetic_unchanged=True,
             )
+        fp8_count = sum("float8_policy" in site for site in sites.values())
+        if fp8_count:
+            proof.update(
+                finite_float8_linear_sites=fp8_count,
+                scope="explicit finite FP8 and dynamic INT8 Linear source correspondence only",
+                guard_encoding_changed=True,
+                application_accuracy=False,
+            )
         selected._m2m_trace_dynamic_linear_proof = proof
         selected._m2m_dynamic_linear_binding = _SelectedBinding(
             selected,
@@ -1141,9 +1290,13 @@ class LinearInstrumentation:
             _state_bindings(
                 selected,
                 source_recipes=tuple(
-                    (site["module"].weight, "weight_only_embedding_v2")
+                    (site["module"].weight, kind)
                     for site in sites.values()
-                    if "embedding_policy" in site
+                    for key, kind in (
+                        ("embedding_policy", "weight_only_embedding_v2"),
+                        ("float8_policy", "finite_float8_linear_v1"),
+                    )
+                    if key in site
                 ),
             ),
             tuple(_seal(str(index), value) for index, value in enumerate(inputs)),
