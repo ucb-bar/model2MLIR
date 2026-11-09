@@ -501,6 +501,42 @@ def _audit_staged_float_precision(exported: Any, graph_module: Any, inputs: Any,
             "checked_floating_values": checked, "non_target_floating_values": 0}
 
 
+def _exported_train_eval_helper():
+    """Resolve the public provider API without requiring the quant extra.
+
+    Older Torch exports the limited exported-graph mode adapter directly;
+    newer versions moved it to TorchAO's public PT2E namespace. A missing API
+    leaves Torch's original train/eval restriction intact. An installed but
+    broken provider or a noncallable API is not silently ignored.
+    """
+    from importlib import import_module
+
+    for namespace in ("torch.ao.quantization", "torchao.quantization.pt2e"):
+        try:
+            provider = import_module(namespace)
+        except ModuleNotFoundError as error:
+            if error.name and (namespace == error.name or namespace.startswith(error.name + ".")):
+                continue
+            raise
+        helper = getattr(provider, "allow_exported_model_train_eval", None)
+        if helper is not None:
+            if not callable(helper):
+                raise TypeError("exported train/eval provider API must be callable")
+            return helper
+    return None
+
+
+def _allow_owned_exported_mode_api(module):
+    """Keep the provider's limited mode semantics on this owned module only."""
+    import torch
+
+    if not isinstance(module, torch.fx.GraphModule):
+        raise TypeError("exported train/eval adapter requires an owned GraphModule")
+    helper = _exported_train_eval_helper()
+    if helper is not None:
+        helper(module)
+
+
 def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
                                   original_frontend_snapshot: dict[str, Any] | None = None,
                                   retarget_float_dtype_arguments: bool = False):
@@ -574,8 +610,7 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
                                       "to_dtype": str(dtype), "shape": list(value.shape)})
     cast_inputs = tree_map(lambda v: v.to(dtype=dtype) if isinstance(v, torch.Tensor)
                           and v.is_floating_point() else v, tuple(inputs))
-    from torch.ao.quantization import allow_exported_model_train_eval
-    allow_exported_model_train_eval(gm)
+    _allow_owned_exported_mode_api(gm)
     decisions = None
     constants = None
     staged_snapshot = None
@@ -604,7 +639,7 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
         verify_constants(staged)
         snapshot_exported_program(staged, stage="staged")
         gm = staged.module()
-        allow_exported_model_train_eval(gm)
+        _allow_owned_exported_mode_api(gm)
         prepare_lifted_constant_lineage(gm)
         defer_lifted_constant_user_lineage(gm, staged)
         # The returned module has its own final lineage/constant metadata.

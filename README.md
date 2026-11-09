@@ -184,6 +184,14 @@ The helper uses an owned materialized graph and fresh parameters/buffers, leavin
 the source model unchanged. Its deterministic receipt lists exact state/input
 precision conversions. It converts the captured static program, not dtype-dependent
 Python branches: any different Python specialization needs a separate capture.
+It never requests a train/eval transition during materialization. On the owned
+result it uses the public exported-graph mode adapter from Torch, or its newer
+TorchAO PT2E namespace when available. That provider adapter supports only its
+documented limited dropout/BatchNorm rewrites; it cannot recapture Python
+branches specialized by the original mode. Without either adapter, Torch's
+train/eval restriction remains intact. An already-captured result can still be
+converted through `m2m.convert(torch.export.export(cast_model, cast_inputs),
+cast_inputs, ...)` without changing that mode or disabling its input guards.
 
 For a captured graph with explicit floating-point casts or typed factories,
 opt in to audited FP32 staging:

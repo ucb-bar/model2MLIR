@@ -303,11 +303,10 @@ def test_exact_reexport_uses_recorded_original_ids_not_transient_probe_ids():
     exported = torch.export.export(model, inputs)
     actual = snapshot_exported_program(exported, stage="quantization_input")
     assert attach_original_identity(exported, original, actual)
-    from torch.ao.quantization import allow_exported_model_train_eval
-
     module = exported.module()
-    allow_exported_model_train_eval(module)
-    result = m2m.convert(module, inputs, backend="fx_importer", capture_trace=True,
+    # This test re-exports the unchanged captured module and needs no mode
+    # transition. Keep Torch's guards; the old public import moved to TorchAO.
+    result = m2m.convert(torch.export.export(module, inputs), inputs, backend="fx_importer", capture_trace=True,
                          original_frontend_snapshot=original)
     trace = result.capture_trace
     assert result.ok and trace["status"] == "complete", (result.diagnostics, trace["blockers"])
