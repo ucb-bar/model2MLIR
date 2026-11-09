@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 from collections import defaultdict
 from dataclasses import fields
-from types import BuiltinFunctionType, ModuleType
+from types import BuiltinFunctionType, FunctionType, ModuleType
 
 import torch
 
@@ -39,6 +39,8 @@ def _metadata(value):
         ),
     ):
         return value
+    if type(value) is FunctionType:
+        return value  # Captured callable identity, like the unchanged FX node target.
     if type(value) is BuiltinFunctionType and (
         value.__self__ is None or isinstance(value.__self__, (ModuleType, type))
     ):
@@ -47,6 +49,7 @@ def _metadata(value):
 
     source_type = getattr(traceback, "NodeSource", None)
     if source_type is not None and type(value) is source_type:
+        required = {"pass_name", "action", "from_node", "node_info"}
         allowed = {
             "pass_name",
             "action",
@@ -58,7 +61,7 @@ def _metadata(value):
         action_type = getattr(traceback, "NodeSourceAction", None)
         info = value.node_info
         if (
-            set(vars(value)) != allowed
+            not required <= set(vars(value)) <= allowed
             or type(value.pass_name) is not str
             or type(value.action) is not list
             or any(type(action) is not action_type for action in value.action)
@@ -82,8 +85,11 @@ def _metadata(value):
                 info.name, info.target, info.graph_id
             )
         owned.from_node = [_metadata(parent) for parent in value.from_node]
-        owned._dict = _metadata(value._dict)
-        owned._action_string = _metadata(value._action_string)
+        for cache in ("_dict", "_action_string"):
+            if hasattr(value, cache):
+                setattr(owned, cache, _metadata(getattr(value, cache)))
+            elif hasattr(owned, cache):
+                delattr(owned, cache)
         return owned
     from torch import _guards
     from torch.utils._pytree import LeafSpec, TreeSpec

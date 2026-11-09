@@ -137,3 +137,42 @@ else:
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_metadata_callable_identity_is_retained_without_copy_or_invocation():
+    model = torch.nn.Linear(4, 4).eval()
+    ep = torch.export.export(model, (torch.ones(1, 4),), strict=True)
+    node = next(iter(ep.graph.nodes))
+    state = model.weight
+    invoked = []
+
+    def captured_callable():
+        invoked.append(True)
+        return state
+
+    node.meta["custom"] = {"callback_identity": captured_callable}
+    owned = copy_trace_program(ep)
+    copied = next(iter(owned.graph.nodes))
+    assert copied.meta["custom"] is not node.meta["custom"]
+    assert copied.meta["custom"]["callback_identity"] is captured_callable
+    assert not invoked and state is model.weight
+
+
+def test_typed_node_source_core_fields_do_not_require_optional_cache_version():
+    from torch.fx.traceback import NodeSource
+
+    from m2m.capture.trace_copy import _metadata
+
+    source = NodeSource(None, "typed-provenance", [])
+    for cache in ("_dict", "_action_string"):
+        if hasattr(source, cache):
+            delattr(source, cache)
+    copied = _metadata(source)
+    assert copied is not source and copied.pass_name == source.pass_name
+    assert (
+        copied.action is not source.action and copied.from_node is not source.from_node
+    )
+    assert set(vars(copied)) == set(vars(source))
+    source.unproved_field = object()
+    with pytest.raises(ValueError, match="NodeSource"):
+        _metadata(source)
