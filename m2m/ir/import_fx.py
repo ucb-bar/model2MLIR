@@ -768,6 +768,23 @@ class FXImporter:
                     block.add_op(assertion)
                     self.decomposed_count += 1
                     continue
+            if node.target is torch.ops.aten._assert_async.msg:
+                # Zero-result source effects cannot use the ordinary tensor
+                # result-type path below. Preserve the exact scalar-bool guard
+                # before all following arithmetic; malformed guards refuse.
+                from m2m.ir.finite_checks import assert_async
+
+                condition = value_map.get(getattr(node.args[0], "name", "")) if node.args else None
+                meta = dict(node.meta)
+                meta.update(_fx_args=tuple(node.args), _fx_kwargs=dict(node.kwargs),
+                            _fx_ssa_args={0: condition}, _aten_target=target_str)
+                result = assert_async([condition] if condition is not None else [], meta, node.name)
+                for emitted in result.ops:
+                    emitted.verify()
+                    _forward_fx_meta(emitted, node.meta, "assert")
+                    block.add_op(emitted)
+                self.decomposed_count += 1
+                continue
             if node.target == torch.ops.aten._assert_tensor_metadata.default:
                 # Export inserts metadata guards around explicit dtype casts.
                 # Erase only assertions proved by the actual imported static SSA
