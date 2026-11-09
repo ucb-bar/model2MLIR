@@ -8,6 +8,7 @@ matching shape or an FX name never establishes an input/storage version.
 from __future__ import annotations
 
 import math
+import struct
 
 from m2m.capture.static_view_trace import _input_edge, _static_view, _typed
 from m2m.capture.trace import _forward_identity_value
@@ -150,6 +151,15 @@ def _projection(graph, aliases, node, parent, offset, incoming):
     return offset + relative
 
 
+def _scalar_control(value):
+    """Retain the exact Torch Scalar kind and bits without evaluating objects."""
+    if type(value) is int and -(1 << 63) <= value < (1 << 63):
+        return ("int64", value.to_bytes(8, "little", signed=True))
+    if type(value) is float and math.isfinite(value):
+        return ("float64", struct.pack("<d", value))
+    return None
+
+
 def _bound_add(source, dest, writer, candidate, mapped, source_aliases, dest_aliases):
     """Exact ordinary add operands and schema, with one fresh target result."""
     import torch
@@ -191,9 +201,9 @@ def _bound_add(source, dest, writer, candidate, mapped, source_aliases, dest_ali
             float,
         }:
             return False
-    if (writer.get("kwargs") or {}).get("alpha", 1) != (
-        candidate.get("kwargs") or {}
-    ).get("alpha", 1):
+    before_alpha = _scalar_control((writer.get("kwargs") or {}).get("alpha", 1))
+    after_alpha = _scalar_control((candidate.get("kwargs") or {}).get("alpha", 1))
+    if before_alpha is None or after_alpha is None or before_alpha != after_alpha:
         return False
     for before, after in zip(left, right, strict=True):
         original = source_aliases.tensor_ref(before)

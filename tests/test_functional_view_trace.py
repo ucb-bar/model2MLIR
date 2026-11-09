@@ -390,3 +390,64 @@ def test_proof_serialization_is_stable_across_hash_seeds(actual):
         outputs.append(completed.stdout)
     assert outputs[0] == outputs[1]
     assert len(json.loads(outputs[0])) == 7
+
+
+@pytest.mark.parametrize(
+    "source_alpha,prepared_alpha",
+    [
+        (0.0, -0.0),
+        (-0.0, 0.0),
+        (1, 1.0),
+        (True, 1),
+        (float("nan"), float("nan")),
+        (float("inf"), float("inf")),
+        (-float("inf"), -float("inf")),
+        (1 << 64, 1 << 64),
+    ],
+)
+def test_write_scalar_control_requires_exact_supported_kind_and_bits(
+    source_alpha, prepared_alpha, actual
+):
+    source, dest, premises, consumed, added = copy.deepcopy(actual)
+    writer = next(
+        node
+        for node in source["nodes"]
+        if node["id"] == added[0]["proof"]["source_write_id"]
+    )
+    anchor = next(
+        node
+        for node in dest["nodes"]
+        if node["id"] == added[0]["proof"]["prepared_functional_add_id"]
+    )
+    writer["kwargs"] = {"alpha": source_alpha}
+    anchor["kwargs"] = {"alpha": prepared_alpha}
+    assert functional_view_relations(source, dest, premises, consumed) == []
+
+
+@pytest.mark.parametrize("alpha", [0, 1, -1, 0.0, -0.0, 0.25])
+def test_same_supported_scalar_controls_preserve_the_exact_view_proof(alpha, actual):
+    source, dest, premises, consumed, added = copy.deepcopy(actual)
+    writer = next(
+        node
+        for node in source["nodes"]
+        if node["id"] == added[0]["proof"]["source_write_id"]
+    )
+    anchor = next(
+        node
+        for node in dest["nodes"]
+        if node["id"] == added[0]["proof"]["prepared_functional_add_id"]
+    )
+    writer["kwargs"] = {"alpha": alpha}
+    anchor["kwargs"] = {"alpha": alpha}
+    assert len(functional_view_relations(source, dest, premises, consumed)) == 7
+
+
+def test_actual_Torch_add_signed_zero_alpha_is_observable():
+    value, bias = (
+        torch.tensor([-0.0], dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+    )
+    plus = value.clone().add_(bias, alpha=0.0)
+    minus = torch.add(value, bias, alpha=-0.0)
+    assert (plus.view(torch.int32).item() & 0xFFFFFFFF) == 0
+    assert (minus.view(torch.int32).item() & 0xFFFFFFFF) == 0x80000000

@@ -174,8 +174,9 @@ clears call metadata or bypasses exported-program validation.
 
 `capture/functional_view_trace.py` can bind replayed static views of one
 exactly proved `aten.add_.Tensor` to its functional `aten.add.Tensor` result.
-Ordered operand ownership, unchanged input versions, registered schemas and
-explicit alias paths establish the storage version; derived offsets, strides,
+Ordered operand ownership, unchanged input versions, exact finite scalar-control
+kinds/bits (including signed zero), registered schemas and explicit alias paths
+establish the storage version; derived offsets, strides,
 positive static bounds and every source/prepared consumer lifetime must agree.
 Repeated pure views retain distinct source call IDs. Equal-batch matmul inputs
 are checked at the actual BMM operand slots through zero-copy batch reshapes,
