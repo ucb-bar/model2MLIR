@@ -149,6 +149,7 @@ def bridge_fx_graph(
     emit_named_ops: bool = False,
     weights_path: str | None = None,
     capture_trace: bool = False,
+    scaled_mm_policy: Any | None = None,
 ) -> BridgeResult:
     """Convert ``model`` + ``example_inputs`` into an xDSL ModuleOp.
 
@@ -174,6 +175,12 @@ def bridge_fx_graph(
             illegal and abort on -- this is what lets real LLMs/VLAs take
             the torch-mlir path instead of falling back wholesale.
     """
+    if scaled_mm_policy is not None:
+        from m2m.ir.scaled_mm import require_unchanged_policy, snapshot_policy
+
+        scaled_mm_snapshot = snapshot_policy(scaled_mm_policy)
+        if use_torch_mlir:
+            raise ValueError("explicit scaled-mm policy requires the selected FXImporter path")
     result = BridgeResult(output_type=output_type)
     if capture_trace and exported_program is None:
         result.diagnostics.append("capture_trace requires the exact already-captured program")
@@ -253,8 +260,20 @@ def bridge_fx_graph(
                     exported.validate()
         except Exception:  # noqa: BLE001 - non-fatal
             pass
-        importer = FXImporter(emit_named_ops=emit_named_ops)
+        selected_decompositions = {}
+        if scaled_mm_policy is not None:
+            from m2m.ir.scaled_mm import decomposition
+
+            selected_decompositions["aten._scaled_mm.default"] = decomposition(scaled_mm_policy)
+        importer = FXImporter(emit_named_ops=emit_named_ops, dynamic_decompositions=selected_decompositions)
         module = importer.import_graph(exported)
+        if scaled_mm_policy is not None:
+            require_unchanged_policy(scaled_mm_policy, scaled_mm_snapshot)
+        if scaled_mm_policy is not None and not any(
+            str(op.attributes.get("prov.scaled_mm_stage", "")) == '"raw_fp8_dot"'
+            for op in module.walk()
+        ):
+            raise ValueError("explicit scaled-mm policy did not lower an actual supported source call")
         result.trace_dispositions = dict(importer.trace_dispositions)
         errors = [d for d in importer.diagnostics if d.level == "error"]
         if errors:

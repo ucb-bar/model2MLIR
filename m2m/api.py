@@ -42,6 +42,7 @@ class ConversionResult:
     capture_trace: dict[str, Any] | None = None
     exported_program: Any | None = field(default=None, repr=False)
     quantization_manifest: dict[str, Any] | None = None
+    numerical_policy: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -67,6 +68,7 @@ def convert(
     calibration_inputs: Any | None = None,
     capture_trace: bool = False,
     original_frontend_snapshot: dict[str, Any] | None = None,
+    scaled_mm_policy: Any | None = None,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -91,9 +93,22 @@ def convert(
         original_frontend_snapshot: optional pre-quantization snapshot captured
             before an external quantizer mutates the model. An unavailable
             snapshot is preserved as unknown, never replaced by a quantized graph.
+        scaled_mm_policy: explicit default-off OrderedFP8ScaledMMPolicy for actual
+            supported ATen calls. It changes scale/reduction order, retains runtime
+            finite guards and diagnostic source attribution, and requires the
+            explicitly selected FXImporter. It does not select a device kernel,
+            quantization recipe or whole-model quality/target admission.
     """
     if quantization_preapplied and quantization is None:
         raise ValueError("quantization_preapplied requires a quantization config")
+    if scaled_mm_policy is not None:
+        from m2m.ir.scaled_mm import (
+            require_unchanged_policy, sealed_policy_record, snapshot_policy,
+        )
+
+        scaled_mm_snapshot = snapshot_policy(scaled_mm_policy)
+        if backend != "fx_importer" or type(decompose) is not bool or level != "linalg-on-tensors" or output_type != "linalg-on-tensors":
+            raise ValueError("explicit scaled-mm policy requires fx_importer, boolean decomposition and standard linalg output")
     if backend == "torch_mlir":
         allow_fallback = False
 
@@ -103,11 +118,15 @@ def convert(
     from pathlib import Path as _Path
 
     if isinstance(model, (str, _Path)) and str(model).endswith(".gguf"):
+        if scaled_mm_policy is not None:
+            raise ValueError("explicit scaled-mm policy requires an actual Torch source")
         from m2m.frontends.gguf import convert_gguf
 
         return convert_gguf(model, example_inputs, level=level)
 
     _is_torch = isinstance(model, torch.nn.Module) or type(model).__name__ == "ExportedProgram"
+    if scaled_mm_policy is not None and not _is_torch:
+        raise ValueError("explicit scaled-mm policy requires an actual Torch source")
     if not _is_torch:
         try:
             import jax  # noqa: F401
@@ -254,7 +273,10 @@ def convert(
         emit_named_ops=emit_named,
         weights_path=weights_path,
         capture_trace=capture_trace,
+        scaled_mm_policy=scaled_mm_policy,
     )
+    if scaled_mm_policy is not None:
+        require_unchanged_policy(scaled_mm_policy, scaled_mm_snapshot)
     # Stamp the representation level so downstream/merlin knows which contract it received
     # (default portable standard form vs the opt-in structured high-level form).
     if result.module is not None:
@@ -264,6 +286,13 @@ def convert(
             result.module.attributes["prov.level"] = StringAttr(level)
         except Exception:  # noqa: BLE001
             pass
+    if scaled_mm_policy is not None and result.module is not None:
+        import json
+        from xdsl.dialects.builtin import StringAttr
+
+        result.module.attributes["prov.explicit_scaled_mm_policy"] = StringAttr(
+            json.dumps(sealed_policy_record(scaled_mm_policy, scaled_mm_snapshot), sort_keys=True)
+        )
 
     # Record the quantization scheme on the module so the (fp8/int8) quantization
     # is captured in the IR even when fp8 element types render as f32 (xDSL has no
@@ -375,6 +404,12 @@ def convert(
                                dispositions=result.trace_dispositions)
         if trace["precision"]["projections"]:
             result.diagnostics.append("FP8 storage was projected to f32: diagnostic capture only, not native FP8 lowering")
+        if scaled_mm_policy is not None:
+            trace["numerical_policy"] = sealed_policy_record(scaled_mm_policy, scaled_mm_snapshot)
+            trace["status"] = "diagnostic"
+            trace["blockers"].append("explicit scaled-mm scale/reduction policy differs from original CPU arithmetic")
+    if scaled_mm_policy is not None:
+        require_unchanged_policy(scaled_mm_policy, scaled_mm_snapshot)
     return ConversionResult(
         mlir_text=mlir_text,
         module=result.module,
@@ -384,6 +419,7 @@ def convert(
         capture_trace=trace,
         exported_program=exported_program,
         quantization_manifest=external_manifest,
+        numerical_policy=None if scaled_mm_policy is None else sealed_policy_record(scaled_mm_policy, scaled_mm_snapshot),
     )
 
 

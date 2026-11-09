@@ -123,6 +123,51 @@ can produce NaN on overflow; it introduces no replacement quantizer or clamp.
 The guard establishes the overflow domain only: target arithmetic, floating
 environment and NaN payload behavior still require separate qualification.
 
+An explicitly selected numerical policy can retain an actual `_scaled_mm`
+source as a finite E4M3FN contraction with a positive-zero F32 seed, followed
+by separate F32 row-scale and column-scale multiplications:
+
+```python
+from m2m.ir.scaled_mm import OrderedFP8ScaledMMPolicy
+
+policy = OrderedFP8ScaledMMPolicy(
+    accept_scale_reordering=True,
+    accept_reduction_order_difference=True,
+    rounding="rne",
+    floating_effects="nontrapping_unobserved",
+)
+r = m2m.convert(exported_program, inputs, backend="fx_importer",
+                scaled_mm_policy=policy, capture_trace=True)
+```
+
+This is a distinct, default-off arithmetic contract, not a bit-exact claim about
+the original CPU kernel. The selected Torch CPU rowwise implementation may
+widen and scale each operand before BLAS; moving those multiplications after
+the dot product changes rounding. The caller must explicitly accept both that
+change and the reduction-order difference. The generated typed contraction
+has no fast-math flags; increasing-K accumulation, RNE and unobserved floating
+effects remain mandatory backend/execution qualifications. The trace remains
+diagnostic and records this policy separately from source IDs.
+
+Only actual E4M3FN rank-two A/B, F32 scales `[M,1]`/`[1,N]`, explicit F32 output,
+`bias=None`, `scale_result=None` and `use_fast_accum=False` are admitted.
+Source row-A/column-B layouts are checked, allowing irrelevant singleton-axis
+strides and recording the actual strides. All four tensors receive complete
+runtime finite checks. Unknown shapes/options/layouts/types refuse; they do
+not fall back to another arithmetic implementation. Ordinary F32 matmul is
+never converted to FP8 by this capability. Normal source decomposition may
+expose the original public quantizer's primitives, but the selected path must
+still match an actual `_scaled_mm` call after preparation. With `decompose=False`
+any unresolved quantizer operation remains visible.
+
+The emitted standard tensor IR is not a deployable program by itself. A target
+must qualify the typed FP8 contraction, scalar finite-check/guard placement,
+storage ABI and scale epilogue, or provide a separately verified FP8
+legalization. Toolchains without FP8 extension lowering may refuse the LLVM
+boundary. Neither policy metadata nor CPU agreement grants source-to-target
+lineage, automatic routing, model accuracy or performance admission. Quantizer
+scales and original weight bytes are not replaced, repaired or re-encoded.
+
 To change the precision of the captured static program while preserving its
 original operation identities:
 
