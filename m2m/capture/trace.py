@@ -285,6 +285,9 @@ def snapshot_exported_program(exported: Any, *, stage: str) -> dict[str, Any]:
     fields = getattr(exported, "_m2m_trace_subclass_fields", ())
     if fields:
         body["tensor_subclass_fields"] = list(fields)
+    dynamic = getattr(exported, "_m2m_trace_dynamic_linear_proof", None)
+    if dynamic:
+        body["dynamic_linear_proof"] = dynamic
     body["sha256"] = _digest(body)
     return body
 

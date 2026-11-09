@@ -881,6 +881,7 @@ def write_quantized_multi_program_bundle(
     source_path: str | Path | None = None,
     metadata: dict | None = None,
     original_frontend_by_program: Mapping[str, dict] | None = None,
+    shared_program_converter: Callable[[Any, Path], Any] | None = None,
 ) -> dict:
     """Capture a quantized v2 session derived from one transformed shared model.
 
@@ -889,6 +890,10 @@ def write_quantized_multi_program_bundle(
     transformation; this API verifies identity, typed state routes, stable shared
     weight bytes, and the same-conversion stage receipts before publishing the
     root binding. It never applies quantization independently to stage wrappers.
+    An explicit ``shared_program_converter`` may return an exact preconverted
+    result for each shared stage; ordinary stage objects, eager goldens, state
+    routing and shared-weight checks remain authoritative. A failed callback
+    never falls back to a different conversion.
     """
     import yaml
 
@@ -945,6 +950,24 @@ def write_quantized_multi_program_bundle(
     tensors = _shared_tensor_inventory(selected)
     out = Path(out)
     programs = session.bundle_programs()
+    if shared_program_converter is not None:
+        from m2m.api import ConversionResult
+        from m2m.capture.bundle_integrity import _bundle_files
+
+        if not callable(shared_program_converter):
+            raise TypeError("shared program converter must be callable")
+        out.mkdir(parents=True, exist_ok=True)
+        _bundle_files(out)
+        for program in programs:
+            name = program["name"]
+            if name not in shared_names:
+                continue
+            converted = shared_program_converter(by_name[name], out / "stages" / name)
+            if not isinstance(converted, ConversionResult) or not converted.ok:
+                raise ValueError(f"shared converter did not return a successful conversion for {name!r}")
+            if capture_trace and converted.capture_trace is None:
+                raise ValueError(f"shared converter omitted the requested trace for {name!r}")
+            program["conversion_result"] = converted
     if original_frontend_by_program is not None:
         for program in programs:
             if program["name"] in original_frontend_by_program:

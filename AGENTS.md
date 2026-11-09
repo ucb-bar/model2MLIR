@@ -77,6 +77,32 @@ A loader is a `.py` exposing `get_model_and_inputs() -> (model_or_fn, tuple_of_i
 
 ## Coverage / adding op support
 
+`capture/dynamic_linear_trace.py` provides opt-in `LinearInstrumentation` for
+ordinary inference FP32 `nn.Linear` sites under the default TorchAO v2 dynamic
+W8A8 recipe. Capture every original shared stage with `capture_source` before
+one caller-owned `apply_quantization`; then `export_selected` checks actual
+module-call boundaries, exact typed callers/call order, unchanged source and
+non-quantized state, independently repacked original weights and complete
+selected eager/export outputs. Failed checks publish no source IDs. Repeated
+module invocations, custom Linear behavior, unknown effects and unsupported
+recipes refuse. Use the owner as a context manager to restore temporary metadata
+wrappers. This is source correspondence, not model accuracy or target execution.
+`write_quantized_multi_program_bundle(shared_program_converter=...)` can consume
+these exact exports through an explicit successful `ConversionResult`; it keeps
+actual stage objects, eager goldens, routing, shared tensor checks and file
+integrity, and never falls back when the converter fails. Default capture is
+unchanged. Example consumer:
+
+```python
+with LinearInstrumentation(shared_model) as lineage:
+    source = lineage.capture_source(stage, inputs)
+    apply_quantization(shared_model, quant)
+    exported, proof = lineage.export_selected(source, stage, inputs, quantization=quant)
+    converted = m2m.convert(exported, inputs, quantization=quant,
+        quantization_preapplied=True, original_frontend_snapshot=source.snapshot,
+        capture_trace=True, backend="fx_importer")
+```
+
 Tensor-subclass field lineage in `capture/subclass_trace.py` observes actual
 state-field accesses before decomposition and binds only unique, unchanged live
 storage and bytes in the prepared parameters. It rejects unknown source effects,
