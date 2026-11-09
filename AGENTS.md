@@ -128,6 +128,13 @@ remain unsupported. Direct observation after a rewrite that changes public node
 ordinals still declines before any snapshot can overwrite IDs; no post-rewrite
 graph is relabelled as the raw source stage.
 
+Disabled `aten.dropout` may be proved as a forward tensor identity only with
+its selected schema, explicit `train=False`, a finite valid probability, exact
+tensor metadata and typed consumer-edge bypass. Source and destination storage
+versions must remain unchanged through every consuming edge. Training dropout,
+unknown controls, wrong consumers and intervening alias writes decline; this does
+not certify training/autograd semantics or numerical target execution.
+
 Frontend snapshots preserve historical `results` slots and add versioned
 `result_metadata` describing actual FX `val` presence, container and every
 existing result ordinal. Missing metadata stays unobserved; explicit None is

@@ -983,7 +983,8 @@ def _forward_identity_value(source: dict[str, Any], node: dict[str, Any], *, sou
     """Return an exact input/output tensor identity for a supported no-op call."""
     target = node.get("target")
     if node.get("op") != "call_function" or target not in {
-            "aten.to.dtype", "aten.to.dtype_layout", "aten.to.device", "aten.detach_.default"}:
+            "aten.to.dtype", "aten.to.dtype_layout", "aten.to.device", "aten.detach_.default",
+            "aten.dropout.default"}:
         return None
     args, kwargs = node.get("args"), node.get("kwargs") or {}
     if not isinstance(args, list) or not args or not isinstance(kwargs, dict):
@@ -1004,7 +1005,24 @@ def _forward_identity_value(source: dict[str, Any], node: dict[str, Any], *, sou
         return raw is None or (isinstance(raw, dict)
                                and raw.get("kind") == kind and raw.get("value") == expected)
 
-    if target == "aten.detach_.default":
+    if target == "aten.dropout.default":
+        import math
+        import torch
+
+        fields = ("input", "p", "train")
+        if (not 1 <= len(args) <= len(fields)
+                or set(kwargs) - set(fields[1:])
+                or any(field in kwargs for field in fields[:len(args)])
+                or source.get("operator_schemas", {}).get(target)
+                != str(torch.ops.aten.dropout.default._schema)):
+            return None
+        probability = args[1] if len(args) > 1 else kwargs.get("p")
+        training = args[2] if len(args) > 2 else kwargs.get("train")
+        if (type(probability) not in {int, float}
+                or not math.isfinite(probability) or not 0 <= probability <= 1
+                or training is not False):
+            return None
+    elif target == "aten.detach_.default":
         if len(args) != 1 or kwargs:
             return None
     elif target == "aten.to.dtype":
@@ -1059,6 +1077,7 @@ class _IdentityProofContext:
         self.source, self.dest = source, dest
         self.sources = {item["id"]: item for item in source["nodes"]}
         self._aliases = None
+        self._destination_aliases = None
         self.last_writers = {}
         self.descendants = {}
         for item in dest["nodes"]:
@@ -1080,6 +1099,14 @@ class _IdentityProofContext:
 
             self._aliases = SourceStorageAliases(self.source)
         return self._aliases
+
+    @property
+    def destination_aliases(self):
+        if self._destination_aliases is None:
+            from m2m.capture.view_trace import SourceStorageAliases
+
+            self._destination_aliases = SourceStorageAliases(self.dest)
+        return self._destination_aliases
 
     def require_binding(self, source, dest=None):
         if self.source is not source or (dest is not None and self.dest is not dest):
@@ -1168,6 +1195,12 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
     uses = terminal_uses(node, output, set())
     if not uses:
         return None
+    if node["target"] == "aten.dropout.default":
+        from m2m.capture.view_trace import unchanged_through_uses
+
+        if not unchanged_through_uses(
+                aliases, node, context.source_outgoing.get(node["id"], [])):
+            return None
     matched = []
     for use in uses:
         consumers = descendants.get(use.get("consumer_node_id"), set())
@@ -1191,11 +1224,20 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
                        ("kind", "dtype", "storage_dtype", "compute_dtype", "shape",
                         "device", "layout", "stride"))):
             return None
+        if node["target"] == "aten.dropout.default":
+            destination_aliases = context.destination_aliases
+            owner = destination_aliases.nodes.get(matching_edges[0]["producer_node_id"])
+            if (owner is None or not unchanged_through_uses(
+                    destination_aliases, owner,
+                    context.dest_outgoing.get(owner["id"], []))):
+                return None
         matched.extend((edge["producer_node_id"], edge["consumer_node_id"],
                         edge["argument_path"]) for edge in matching_edges)
     return {"source_ids": [node["id"]], "destination_ids": [], "kind": "eliminated",
             "reason": ("forward tensor-value-preserving detach_ with exact typed consumer-edge bypass"
                        if node["target"] == "aten.detach_.default" else
+                       "disabled inference dropout with exact typed consumer-edge bypass"
+                       if node["target"] == "aten.dropout.default" else
                        "type/device/layout-preserving aten.to with exact typed consumer-edge bypass"),
             "proof": {"input_node_id": producer["id"], "typed_bypass_edges": sorted(set(matched)),
                       "scope": "forward tensor values; autograd metadata is not certified"}}
