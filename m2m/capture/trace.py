@@ -1434,7 +1434,7 @@ def _no_op_dtype_aliases(source: dict[str, Any], dest: dict[str, Any],
     for node in source["nodes"]:
         args, kwargs = node.get("args"), node.get("kwargs") or {}
         target = node.get("target")
-        if (node["id"] in consumed or target not in {"aten.to.dtype", "aten.to.dtype_layout"}
+        if (node["id"] in consumed or target not in {"aten.to.dtype", "aten.to.dtype_layout", "aten.to.device"}
                 or not isinstance(args, list) or not args or not isinstance(args[0], dict)):
             continue
         producer = src_nodes.get(args[0].get("node_id"))
@@ -1452,6 +1452,17 @@ def _no_op_dtype_aliases(source: dict[str, Any], dest: dict[str, Any],
                     or kwargs.get("non_blocking", False) is not False
                     or kwargs.get("copy", False) is not False
                     or kwargs.get("memory_format") is not None):
+                continue
+        elif target == "aten.to.device":
+            incoming = [edge for edge in source.get("edges") or []
+                        if edge.get("consumer_node_id") == node["id"]]
+            if (_forward_identity_value(source, node) is None or len(incoming) != 1
+                    or incoming[0].get("producer_node_id") != producer["id"]
+                    or incoming[0].get("producer_value_id") != original["id"]
+                    or incoming[0].get("argument_path") != "args/0"
+                    or incoming[0].get("value_kind") != "tensor"
+                    or incoming[0].get("dtype") != original.get("dtype")
+                    or incoming[0].get("shape") != original.get("shape")):
                 continue
         elif (len(args) != 1
               or set(kwargs) - {"dtype", "layout", "device", "pin_memory",
@@ -1926,9 +1937,18 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
     consumed.update(identity for relation in views for identity in relation["source_ids"])
     unknown = [identity for identity in unknown if identity not in {
         target for relation in views for target in relation["destination_ids"]}]
+    from m2m.capture.static_view_trace import dead_static_view_relations, static_view_relations
+    anchored_views = static_view_relations(source, dest, relations, consumed)
+    relations.extend(anchored_views)
+    consumed.update(identity for relation in anchored_views for identity in relation["source_ids"])
+    unknown = [identity for identity in unknown if identity not in {
+        target for relation in anchored_views for target in relation["destination_ids"]}]
     dead = _dead_forward_value_relations(source, consumed)
     relations.extend(dead)
     consumed.update(origin for relation in dead for origin in relation["source_ids"])
+    dead_views = dead_static_view_relations(source, consumed)
+    relations.extend(dead_views)
+    consumed.update(identity for relation in dead_views for identity in relation["source_ids"])
     fanout = Counter(s for rel in relations for s in rel["source_ids"] if rel["destination_ids"])
     for rel in relations:
         if rel["kind"] == "transformation":
