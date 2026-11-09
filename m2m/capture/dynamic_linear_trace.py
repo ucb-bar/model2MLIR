@@ -675,6 +675,7 @@ class LinearSource:
     seals: tuple[_Seal, ...]
     inputs: tuple
     input_seals: tuple[_Seal, ...]
+    call_contract: tuple
 
 
 @dataclass(frozen=True)
@@ -693,6 +694,7 @@ class _SelectedBinding:
     snapshot: dict
     states: tuple[_StateBinding, ...]
     input_seals: tuple[_Seal, ...]
+    call_contract: tuple
 
 
 def _state_bindings(exported):
@@ -722,6 +724,24 @@ def _state_bindings(exported):
     return tuple(result)
 
 
+def _call_contract(exported):
+    from m2m.capture.call_contract import freeze_call_contract
+
+    try:
+        return freeze_call_contract(exported)
+    except ValueError as exc:
+        raise DynamicLinearLineageError(
+            "unproved sealed call contract: " + str(exc)
+        ) from exc
+
+
+def _check_call_contract(exported, expected):
+    if _call_contract(exported) != expected:
+        raise DynamicLinearLineageError(
+            "sealed public/callee/range call contract changed"
+        )
+
+
 def validate_selected_source(exported, inputs):
     """Revalidate the actual owned source/selected export at conversion entry.
 
@@ -738,6 +758,8 @@ def validate_selected_source(exported, inputs):
             "source correspondence has no owned live binding"
         )
     source = binding.source
+    _check_call_contract(source.exported, source.call_contract)
+    _check_call_contract(exported, binding.call_contract)
     for program, snapshot in (
         (source.exported, source.snapshot),
         (exported, binding.snapshot),
@@ -855,6 +877,7 @@ class LinearInstrumentation:
             seals,
             inputs,
             tuple(_seal(str(index), value) for index, value in enumerate(inputs)),
+            _call_contract(exported),
         )
 
     def export_selected(self, source: LinearSource, model, inputs, *, quantization):
@@ -879,6 +902,7 @@ class LinearInstrumentation:
             not isinstance(x, torch.Tensor) for x in inputs
         ):
             raise DynamicLinearLineageError("explicit tensor tuple inputs required")
+        _check_call_contract(source.exported, source.call_contract)
         sites = self._program_sites(model)
         if set(sites) != set(source.sites) or any(
             sites[path] is not source.sites[path] for path in sites
@@ -938,6 +962,7 @@ class LinearInstrumentation:
             copy.deepcopy(snapshot_exported_program(selected, stage="quantized")),
             _state_bindings(selected),
             tuple(_seal(str(index), value) for index, value in enumerate(inputs)),
+            _call_contract(selected),
         )
         validate_selected_source(selected, inputs)
         return selected, proof

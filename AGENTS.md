@@ -87,6 +87,14 @@ selected eager/export outputs. Failed checks publish no source IDs. Repeated
 module invocations, custom Linear behavior, unknown effects and unsupported
 recipes refuse. Use the owner as a context manager to restore temporary metadata
 wrappers. This is source correspondence, not model accuracy or target execution.
+The opt-in Linear source-pair seal also records exact ordered module-call
+entries, argument references, builtin tuple/list/dict tree type/context/key
+order and derived counts, optional forward names, and typed range contracts.
+Original contracts are checked before selected export; both original and
+selected contracts are checked at conversion entry. Unknown tree containers,
+argument/context kinds and extra unproved fields refuse; no tensor state is
+copied and no constraint is evaluated. Metadata-only preparation may normalize
+an owned callee identity after this unchanged raw-source check.
 The source-pair export retains an owned, process-local live seal over original
 and selected graphs, proof data, state/field owners, storage, recipe metadata,
 bytes and the exact selected input example. Traced conversion revalidates that
