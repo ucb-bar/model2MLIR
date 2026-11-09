@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 
+from m2m.capture.context_trace import context_projection, live_nodes, observe_contexts
 from m2m.capture.trace import _digest, snapshot_exported_program
 from m2m.capture.view_trace import SourceStorageAliases
 
@@ -116,9 +117,17 @@ def observe(exported, *, quantized_frontend_snapshot=None) -> Observation | None
     aliases = SourceStorageAliases(snapshot)
     states = _states(exported)
     rows = snapshot["nodes"]
-    if len(nodes) != len(rows):
-        return None  # Nested scopes require their own explicit call/state proof.
-    by_node = dict(zip(nodes, rows, strict=True))
+    contexts = observe_contexts(exported, snapshot)
+    nested = {row["graph_id"] for row in rows if row["graph_id"] != "g:quantized:root"}
+    if nested != {context.scope for context in contexts.values()}:
+        return None
+    actual = live_nodes(exported, snapshot)
+    if any(
+        row["graph_id"] != "g:quantized:root" and actual[row["id"]].target is accessor
+        for row in rows
+    ):
+        return None  # Body-local field receivers need their own state binding.
+    by_node = {actual[row["id"]]: row for row in rows}
     specs = {spec.arg.name: spec for spec in exported.graph_signature.input_specs}
     fields = []
     guarded_roots = set()
@@ -190,9 +199,13 @@ def observe(exported, *, quantized_frontend_snapshot=None) -> Observation | None
             continue
         if row["op"] != "call_function":
             return None
+        if row["id"] in contexts:
+            continue
         schema = aliases.schema(row)
         if schema is None:
-            if aliases.tuple_projection_root(row) is None:
+            if aliases.tuple_projection_root(row) is None and not context_projection(
+                row, snapshot, contexts, actual
+            ):
                 return None
             continue
         for index, arg in enumerate(schema.arguments):

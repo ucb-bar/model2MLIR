@@ -168,6 +168,14 @@ def convert(
             actual = snapshot_exported_program(raw, stage="quantized")
             attach_original_identity(raw, trace_graphs["original"], actual)
             trace_graphs["quantized"] = snapshot_exported_program(raw, stage="quantized")
+            from m2m.capture.subclass_trace import observe
+            from m2m.capture.trace_copy import copy_trace_program
+
+            # Observe the archived RAW graph before any HOP rewrite. Transform
+            # an owned graph/metadata copy; the actual raw source and state
+            # owners remain live and sealed for the later field-binding check.
+            raw_fields = observe(raw, quantized_frontend_snapshot=trace_graphs["quantized"])
+            raw = copy_trace_program(raw)
             # Inline captured higher-order regions while their inner FX nodes still
             # carry their own identities. Decomposition otherwise attributes every
             # operation in a region to its outer wrapper and loses the per-op proof.
@@ -179,7 +187,8 @@ def convert(
                 exported_program, _ = _prepare_exported_program(
                     raw, run_default_decompositions=True,
                     export_decomposition_table=torch_mlir_gap_decompositions(), capture_trace=True,
-                    quantized_frontend_snapshot=trace_graphs["quantized"])
+                    quantized_frontend_snapshot=trace_graphs["quantized"],
+                    raw_subclass_observation=raw_fields)
             else:
                 exported_program = raw
             for _ in range(8):

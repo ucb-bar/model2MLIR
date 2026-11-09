@@ -118,10 +118,15 @@ liftings. Exact multi-return tensor slots are separate storage owners; repeated
 selection of one slot retains its intervening writes. This closes a specific
 quantized-to-prepared proof and does not certify original-to-TorchAO attribution,
 quantization quality, arbitrary tensor subclasses or target execution.
-The field observer is bound to the archived raw quantized snapshot. If a prior
-rewrite (including grad-HOP inlining) changes public node ordinals, it declines
-before any snapshot can overwrite their IDs. Such higher-order field lifting
-remains unproved; no post-rewrite graph is relabelled as the raw source stage.
+The field observer is bound to the archived raw quantized snapshot. Traced
+conversion observes this actual source before HOP inlining, then transforms an
+owned graph/custom-metadata copy with separately verified signature and the same
+immutable state owners. The original graph remains live and unchanged for the
+binding check; no checkpoint storage is copied. Supported read-only grad-context
+bodies retain exact ordered input/output/schema proofs. Body-local field receivers
+remain unsupported. Direct observation after a rewrite that changes public node
+ordinals still declines before any snapshot can overwrite IDs; no post-rewrite
+graph is relabelled as the raw source stage.
 
 Frontend snapshots preserve historical `results` slots and add versioned
 `result_metadata` describing actual FX `val` presence, container and every

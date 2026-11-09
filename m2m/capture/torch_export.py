@@ -200,6 +200,7 @@ def _prepare_exported_program(
     export_decomposition_table: dict[Any, Any] | None,
     capture_trace: bool = False,
     quantized_frontend_snapshot: dict | None = None,
+    raw_subclass_observation: Any = None,
 ) -> tuple[Any, tuple[str, ...]]:
     table, targets = _build_decomposition_table(
         run_default_decompositions=run_default_decompositions,
@@ -212,9 +213,24 @@ def _prepare_exported_program(
     ) if capture_trace else []
     subclass_fields = None
     if capture_trace:
-        from m2m.capture.subclass_trace import observe
+        from m2m.capture.subclass_trace import Observation, observe
 
-        subclass_fields = observe(exported_program, quantized_frontend_snapshot=quantized_frontend_snapshot)
+        if raw_subclass_observation is not None:
+            from m2m.capture.trace import _digest
+
+            archived = dict(quantized_frontend_snapshot or {})
+            claimed_hash = archived.pop("sha256", None)
+            if (not isinstance(raw_subclass_observation, Observation)
+                    or archived.get("stage") != "quantized"
+                    or archived.get("status") != "complete"
+                    or claimed_hash != _digest(archived)
+                    or raw_subclass_observation.source_graph_sha256 != claimed_hash):
+                raise ValueError("raw field observation differs from archived source")
+            subclass_fields = raw_subclass_observation
+        else:
+            subclass_fields = observe(
+                exported_program, quantized_frontend_snapshot=quantized_frontend_snapshot
+            )
         from m2m.capture.trace import tuple_selection_trace_program
 
         exported_program = tuple_selection_trace_program(exported_program)

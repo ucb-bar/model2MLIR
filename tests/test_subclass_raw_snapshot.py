@@ -132,7 +132,7 @@ def test_stale_bind_does_not_renumber_the_surviving_source_nodes():
     }
 
 
-def test_actual_conversion_never_emits_post_inline_fields_as_raw_source_claims():
+def test_actual_conversion_binds_only_archived_raw_fields_without_mutating_source():
     import m2m
 
     quant = QuantizationConfig(scheme="int8_dyn_act_int8_weight")
@@ -152,6 +152,10 @@ def test_actual_conversion_never_emits_post_inline_fields_as_raw_source_claims()
     hop.append(field)
     ep.graph_module.recompile()
     ep.validate()
+    raw = snapshot_exported_program(ep, stage="quantized")
+    raw_nodes = list(ep.graph.nodes)
+    raw_metadata = [copy.deepcopy(node.meta.get("custom")) for node in raw_nodes]
+    source_owners = dict(ep.state_dict)
     result = m2m.convert(
         ep,
         (value,),
@@ -161,25 +165,28 @@ def test_actual_conversion_never_emits_post_inline_fields_as_raw_source_claims()
         capture_trace=True,
     )
     assert result.ok
-    # The source HOP still needs an explicit field-lifting proof. Absence of
-    # that proof is diagnostic, rather than a newly numbered source claim.
-    assert (
-        result.capture_trace["graphs"]["prepared"].get("tensor_subclass_fields", [])
-        == []
-    )
-    assert result.capture_trace["transformations"][1]["status"] == "diagnostic"
-    getter = next(
-        row
-        for row in result.capture_trace["graphs"]["quantized"]["nodes"]
+    assert snapshot_exported_program(ep, stage="quantized") == raw
+    assert list(ep.graph.nodes) == raw_nodes
+    assert [node.meta.get("custom") for node in raw_nodes] == raw_metadata
+    assert all(ep.state_dict[key] is value for key, value in source_owners.items())
+    fields = result.capture_trace["graphs"]["prepared"]["tensor_subclass_fields"]
+    assert fields and all(row["source_graph_sha256"] == raw["sha256"] for row in fields)
+    getters = {
+        row["id"]: row
+        for row in raw["nodes"]
         if row["target"] == "export.access_subclass_inner_tensor.default"
-        and row["args"][-1] == "qdata"
-    )
-    # A rewritten F32 body must not consume the old I8 accessor's source ID.
-    assert (
-        getter["id"]
-        in result.capture_trace["transformations"][1]["unresolved_source_ids"]
-    )
-    assert not any(
-        getter["id"] in row["origin_node_ids"]
-        for row in result.capture_trace["graphs"]["prepared"]["nodes"]
-    )
+    }
+    assert {row["source_id"] for row in fields} == set(getters)
+    assert result.capture_trace["transformations"][1]["status"] == "complete"
+    for binding in fields:
+        getter = getters[binding["source_id"]]
+        assert binding["field"] == getter["args"][-1]
+        lifted = [
+            row
+            for row in result.capture_trace["graphs"]["prepared"]["nodes"]
+            if row["op"] == "placeholder"
+            and row["input_target"] == binding["prepared_state_target"]
+        ]
+        assert len(lifted) == 1
+        assert getter["id"] in lifted[0]["origin_node_ids"]
+        assert getter["results"][0]["dtype"] == lifted[0]["results"][0]["dtype"]
