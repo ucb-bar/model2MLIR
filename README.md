@@ -114,7 +114,14 @@ This opt-in proves the actual `aten.embedding` weight/index/control boundary and
 independently repacks the original FP32 weight with the public recipe. Typed
 qdata/scales/zero-points, field geometry, owners, aliases and unchanged surrounding
 caller arithmetic must agree. A subclass postscale remains an ordinary exact
-source operation; no subclass name grants numerical permission. Mutable
+source operation; no subclass name grants numerical permission. A subclass is
+admitted only for a closed unary return grammar: one actual public embedding
+lookup, optionally multiplied by a finite builtin instance scalar or owned
+ordinary F32 scalar buffer (optionally cast to the weight dtype). Compile-only
+comparison binds the accepted syntax to the executed code; ordinary module
+lookup, call path, scale ownership, code and closure remain checked. Other
+Python calls, stores, helpers, descriptors and hooks refuse. This does not prove
+arbitrary Python effects. Mutable
 `max_norm`, unrelated weight reads, repeated invocations and unknown behavior
 refuse. Original ties may split into independently checked public encodings; no
 storage deduplication or new tie is inferred. The original capability references,

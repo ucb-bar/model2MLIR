@@ -59,6 +59,9 @@ def options(module):
 def admit(module, policy):
     if type(policy) is not Int8WeightOnlyEmbeddingPolicy:
         _error("explicit Int8WeightOnlyEmbeddingPolicy required")
+    from m2m.capture.embedding_forward import observe
+
+    observe(module)
     weight = module.weight
     if (
         module.training
@@ -97,6 +100,11 @@ def admit(module, policy):
 
 
 def validate_site(site):
+    from m2m.capture.embedding_forward import validate
+
+    validate(
+        site["module"], site["embedding_forward_contract"], wrapper=site["wrapper"]
+    )
     if (
         type(site.get("embedding_policy")) is not Int8WeightOnlyEmbeddingPolicy
         or site["module"].training

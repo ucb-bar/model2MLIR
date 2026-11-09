@@ -176,10 +176,12 @@ def _instrument(model, embedding_policy=None):
         }
         if embedding_policy is not None and isinstance(module, torch.nn.Embedding):
             from m2m.capture import embedding_trace
+            from m2m.capture.embedding_forward import observe
 
             sites[path].update(
                 embedding_policy=embedding_policy,
                 embedding_options=embedding_trace.options(module),
+                embedding_forward_contract=observe(module),
             )
         module.forward = wrapped
     return sites
@@ -422,12 +424,15 @@ def _bind_pair(source, selected, sites):
                 else "declared_dynamic_linear_quantization"
             )
         if "embedding_policy" in site:
+            from m2m.capture.embedding_forward import summary
+
             site_records[-1].update(
                 source_operator="aten.embedding.default",
                 selected_recipe="default_v2_per_row_weight_only_INT8",
                 original_module_post_arithmetic_collapsed=False,
                 module_output_source_id=sb[path]["module_output"],
                 module_output_selected_id=db[path]["module_output"],
+                forward_contract=summary(site["embedding_forward_contract"]),
             )
     if any("embedding_policy" in site for site in sites.values()):
         from m2m.capture import embedding_trace
