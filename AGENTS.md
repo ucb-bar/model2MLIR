@@ -87,6 +87,13 @@ selected eager/export outputs. Failed checks publish no source IDs. Repeated
 module invocations, custom Linear behavior, unknown effects and unsupported
 recipes refuse. Use the owner as a context manager to restore temporary metadata
 wrappers. This is source correspondence, not model accuracy or target execution.
+The source-pair export retains an owned, process-local live seal over original
+and selected graphs, proof data, state/field owners, storage, recipe metadata,
+bytes and the exact selected input example. Traced conversion revalidates that
+seal before any source snapshot or transformation. Later qdata/scales/zero-points,
+biases, state, inputs or graph changes refuse; copying serialized proof metadata
+without the actual owned binding cannot grant source correspondence. This is an
+opt-in immutable-source contract, not a checkpoint or input repair mechanism.
 Read-only `wrap_with_set_grad_enabled` regions may remain in both actual exports.
 Their exact control value, ordered typed caller operands, schema-owned nonwriting
 body, output slots and call order must match. Context projections grant no fresh

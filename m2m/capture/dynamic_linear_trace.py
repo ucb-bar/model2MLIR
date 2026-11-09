@@ -594,6 +594,29 @@ class _Seal:
     value: Any
     description: tuple
     sha256: str
+    storage: int
+
+
+def _storage(value):
+    return value.untyped_storage()._cdata
+
+
+def _seal(target, value):
+    return _Seal(
+        target, value, _description(value), _sha_tensor(value), _storage(value)
+    )
+
+
+def _check_seal(value, seal):
+    if (
+        value is not seal.value
+        or _description(value) != seal.description
+        or _storage(value) != seal.storage
+        or _sha_tensor(value) != seal.sha256
+    ):
+        raise DynamicLinearLineageError(
+            "sealed tensor owner/storage/metadata/bytes changed"
+        )
 
 
 def _description(value):
@@ -639,6 +662,111 @@ class LinearSource:
     sites: dict
     seals: tuple[_Seal, ...]
     inputs: tuple
+    input_seals: tuple[_Seal, ...]
+
+
+@dataclass(frozen=True)
+class _StateBinding:
+    target: str
+    owner: Any
+    fields: tuple[str, ...]
+    metadata: Any
+    leaves: tuple[_Seal, ...]
+
+
+@dataclass(frozen=True)
+class _SelectedBinding:
+    selected: Any
+    source: LinearSource
+    snapshot: dict
+    states: tuple[_StateBinding, ...]
+    input_seals: tuple[_Seal, ...]
+
+
+def _state_bindings(exported):
+    from torchao.quantization import Int8Tensor
+
+    result = []
+    for target, value in {**exported.state_dict, **exported.constants}.items():
+        if type(value) in (torch.Tensor, torch.nn.Parameter):
+            result.append(
+                _StateBinding(target, value, (), None, (_seal(target, value),))
+            )
+        elif type(value) is Int8Tensor:
+            fields, metadata = value.__tensor_flatten__()
+            if not fields or any(type(name) is not str for name in fields):
+                raise DynamicLinearLineageError("unknown selected state fields")
+            result.append(
+                _StateBinding(
+                    target,
+                    value,
+                    tuple(fields),
+                    copy.deepcopy(metadata),
+                    tuple(_seal(name, getattr(value, name)) for name in fields),
+                )
+            )
+        else:
+            raise DynamicLinearLineageError("unsupported selected state owner")
+    return tuple(result)
+
+
+def validate_selected_source(exported, inputs):
+    """Revalidate the actual owned source/selected export at conversion entry.
+
+    Serialized origins or a copied proof record cannot replace the original
+    live owner, immutable source graph, tensor storage and exact selected input
+    example. No quantization is rerun and no changed selected state is repaired.
+    """
+    proof = getattr(exported, "_m2m_trace_dynamic_linear_proof", None)
+    binding = getattr(exported, "_m2m_dynamic_linear_binding", None)
+    if proof is None and binding is None:
+        return False
+    if not isinstance(binding, _SelectedBinding) or binding.selected is not exported:
+        raise DynamicLinearLineageError(
+            "source correspondence has no owned live binding"
+        )
+    source = binding.source
+    for program, snapshot in (
+        (source.exported, source.snapshot),
+        (exported, binding.snapshot),
+    ):
+        live_nodes(
+            program, snapshot
+        )  # Refuse changed ordinals before any snapshot can restamp IDs.
+        if snapshot_exported_program(program, stage=snapshot["stage"]) != snapshot:
+            raise DynamicLinearLineageError(
+                "sealed source/selected graph or proof changed"
+            )
+    original_states = {**source.exported.state_dict, **source.exported.constants}
+    if set(original_states) != {seal.target for seal in source.seals}:
+        raise DynamicLinearLineageError("sealed original state roster changed")
+    for seal in source.seals:
+        _check_seal(original_states[seal.target], seal)
+    for value, seal in zip(source.inputs, source.input_seals, strict=True):
+        _check_seal(value, seal)
+    states = {**exported.state_dict, **exported.constants}
+    if set(states) != {state.target for state in binding.states}:
+        raise DynamicLinearLineageError("sealed selected state roster changed")
+    for state in binding.states:
+        owner = states[state.target]
+        if owner is not state.owner:
+            raise DynamicLinearLineageError("sealed selected state owner changed")
+        if state.fields:
+            fields, metadata = owner.__tensor_flatten__()
+            if tuple(fields) != state.fields or metadata != state.metadata:
+                raise DynamicLinearLineageError(
+                    "sealed selected recipe metadata changed"
+                )
+            values = [getattr(owner, name) for name in fields]
+        else:
+            values = [owner]
+        for value, seal in zip(values, state.leaves, strict=True):
+            _check_seal(value, seal)
+    if not isinstance(inputs, tuple) or len(inputs) != len(binding.input_seals):
+        raise DynamicLinearLineageError("sealed selected input roster changed")
+    for value, seal in zip(inputs, binding.input_seals, strict=True):
+        _check_seal(value, seal)
+    return True
 
 
 class LinearInstrumentation:
@@ -707,12 +835,14 @@ class LinearInstrumentation:
         _readonly(snapshot, contexts=contexts, live=live_nodes(exported, snapshot))
         _boundaries(exported, sites, snapshot, source=True)
         states = {**exported.state_dict, **exported.constants}
-        seals = tuple(
-            _Seal(target, value, _description(value), _sha_tensor(value))
-            for target, value in states.items()
-        )
+        seals = tuple(_seal(target, value) for target, value in states.items())
         return LinearSource(
-            exported, copy.deepcopy(snapshot), dict(sites), seals, inputs
+            exported,
+            copy.deepcopy(snapshot),
+            dict(sites),
+            seals,
+            inputs,
+            tuple(_seal(str(index), value) for index, value in enumerate(inputs)),
         )
 
     def export_selected(self, source: LinearSource, model, inputs, *, quantization):
@@ -744,6 +874,12 @@ class LinearInstrumentation:
             raise DynamicLinearLineageError(
                 "selected stage does not reference the same source modules"
             )
+        try:
+            live_nodes(source.exported, source.snapshot)
+        except ValueError as exc:
+            raise DynamicLinearLineageError(
+                "original source graph changed after capture"
+            ) from exc
         fresh = snapshot_exported_program(source.exported, stage="original")
         if fresh != source.snapshot:
             raise DynamicLinearLineageError(
@@ -753,15 +889,9 @@ class LinearInstrumentation:
         if set(states) != {seal.target for seal in source.seals}:
             raise DynamicLinearLineageError("original source state roster changed")
         for seal in source.seals:
-            value = states[seal.target]
-            if (
-                value is not seal.value
-                or _description(value) != seal.description
-                or _sha_tensor(value) != seal.sha256
-            ):
-                raise DynamicLinearLineageError(
-                    "original source state changed after capture"
-                )
+            _check_seal(states[seal.target], seal)
+        for value, seal in zip(source.inputs, source.input_seals, strict=True):
+            _check_seal(value, seal)
         expected, expected_tree = _outputs(model, inputs)
         selected = torch.export.export(
             model, inputs, strict=True, preserve_module_call_signature=tuple(sites)
@@ -782,6 +912,7 @@ class LinearInstrumentation:
         proof.update(
             source_state_sha256={seal.target: seal.sha256 for seal in source.seals},
             selected_output_sha256=[_sha_tensor(value) for value in actual],
+            selected_input_sha256=[_sha_tensor(value) for value in inputs],
             source_graph_sha256=source.snapshot["sha256"],
             selected_export_exact_eager_output=True,
             scope="declared v2 dynamic Linear transform; source correspondence only",
@@ -789,6 +920,14 @@ class LinearInstrumentation:
             application_accuracy=False,
         )
         selected._m2m_trace_dynamic_linear_proof = proof
+        selected._m2m_dynamic_linear_binding = _SelectedBinding(
+            selected,
+            source,
+            copy.deepcopy(snapshot_exported_program(selected, stage="quantized")),
+            _state_bindings(selected),
+            tuple(_seal(str(index), value) for index, value in enumerate(inputs)),
+        )
+        validate_selected_source(selected, inputs)
         return selected, proof
 
     def close(self):

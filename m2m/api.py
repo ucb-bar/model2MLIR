@@ -163,6 +163,9 @@ def convert(
         try:
             raw = model if hasattr(model, "graph_signature") and hasattr(model, "graph_module") \
                 else capture_model(model, tuple(example_inputs))
+            from m2m.capture.dynamic_linear_trace import validate_selected_source
+
+            validate_selected_source(raw, tuple(example_inputs))
             if "original" not in trace_graphs:
                 trace_graphs["original"] = snapshot_exported_program(raw, stage="original")
             actual = snapshot_exported_program(raw, stage="quantized")
