@@ -972,7 +972,7 @@ def tuple_selection_trace_program(exported: Any) -> Any:
     return detached
 
 
-def _forward_identity_value(source: dict[str, Any], node: dict[str, Any]
+def _forward_identity_value(source: dict[str, Any], node: dict[str, Any], *, sources=None
                             ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
     """Return an exact input/output tensor identity for a supported no-op call."""
     target = node.get("target")
@@ -985,7 +985,8 @@ def _forward_identity_value(source: dict[str, Any], node: dict[str, Any]
     input_ref = args[0]
     if not isinstance(input_ref, dict) or not isinstance(input_ref.get("node_id"), str):
         return None
-    sources = {item["id"]: item for item in source["nodes"]}
+    if sources is None:
+        sources = {item["id"]: item for item in source["nodes"]}
     producer = sources.get(input_ref["node_id"])
     outputs = node.get("results") or []
     inputs = producer.get("results") or [] if producer is not None else []
@@ -1040,8 +1041,53 @@ def _forward_identity_value(source: dict[str, Any], node: dict[str, Any]
     return producer, original, output
 
 
+class _IdentityProofContext:
+    """Indices for one immutable source/destination relation evaluation.
+
+    These are lookup caches, not cached acceptance decisions. The original
+    type, alias ownership and edge predicates still execute for every candidate.
+    No context survives graph_relation(), or binds another capture's objects.
+    """
+
+    def __init__(self, source, dest):
+        self.source, self.dest = source, dest
+        self.sources = {item["id"]: item for item in source["nodes"]}
+        self._aliases = None
+        self.last_writers = {}
+        self.descendants = {}
+        for item in dest["nodes"]:
+            for ancestor in item.get("origin_node_ids") or ():
+                self.descendants.setdefault(ancestor, set()).add(item["id"])
+        self.dest_values = {value["id"]: value for item in dest["nodes"]
+                            for value in item.get("results") or [] if isinstance(value.get("id"), str)}
+        self.source_outgoing, self.source_incoming, self.dest_outgoing = {}, {}, {}
+        for edge in source.get("edges") or []:
+            self.source_outgoing.setdefault(edge.get("producer_node_id"), []).append(edge)
+            self.source_incoming.setdefault(edge.get("consumer_node_id"), []).append(edge)
+        for edge in dest.get("edges") or []:
+            self.dest_outgoing.setdefault(edge.get("producer_node_id"), []).append(edge)
+
+    @property
+    def aliases(self):
+        if self._aliases is None:
+            from m2m.capture.view_trace import SourceStorageAliases
+
+            self._aliases = SourceStorageAliases(self.source)
+        return self._aliases
+
+    def require_binding(self, source, dest=None):
+        if self.source is not source or (dest is not None and self.dest is not dest):
+            raise ValueError("identity proof context belongs to a different capture")
+
+    def last_writer(self, node):
+        identity = node["id"]
+        if identity not in self.last_writers:
+            self.last_writers[identity] = self.aliases.last_writer(node)
+        return self.last_writers[identity]
+
+
 def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
-                                node: dict[str, Any]) -> dict[str, Any] | None:
+                                node: dict[str, Any], *, context=None) -> dict[str, Any] | None:
     """Prove an eliminated identity chain by exact typed terminal use edges.
 
     PyTorch can remove both ``detach_`` and an adjacent no-op ``to`` during
@@ -1049,33 +1095,31 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
     value and metadata, and every terminal use must bypass to the same mapped
     producer at the same typed consumer argument. Autograd is not certified.
     """
-    checked = _forward_identity_value(source, node)
+    if context is not None:
+        context.require_binding(source, dest)
+    checked = _forward_identity_value(source, node, sources=context.sources if context else None)
     if checked is None:
         return None
     producer, original, output = checked
-    from m2m.capture.view_trace import SourceStorageAliases
-
-    aliases = SourceStorageAliases(source)
+    if context is None:
+        context = _IdentityProofContext(source, dest)
+    aliases = context.aliases
     if not aliases.valid or source.get("runtime_versions") != dest.get("runtime_versions"):
         return None
 
     def unmodified_input(identity: dict[str, Any], input_node: dict[str, Any]) -> bool:
         if identity.get("graph_id") != input_node.get("graph_id"):
             return False
-        state = aliases.last_writer(identity)
+        state = context.last_writer(identity)
         return (state is not None and
                 (state[1] is None or state[1]["ordinal"] <= input_node["ordinal"]))
 
     if not unmodified_input(node, producer):
         return None
-    sources = {item["id"]: item for item in source["nodes"]}
-    descendants: dict[str, set[str]] = {}
-    for item in dest["nodes"]:
-        for ancestor in item.get("origin_node_ids") or ():
-            descendants.setdefault(ancestor, set()).add(item["id"])
+    sources, descendants = context.sources, context.descendants
     bypassed = {node["id"]}
     while producer["id"] not in descendants:
-        upstream = _forward_identity_value(source, producer)
+        upstream = _forward_identity_value(source, producer, sources=sources)
         if upstream is None:
             return None
         parent, parent_value, parent_output = upstream
@@ -1087,18 +1131,14 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
     corresponding_producers = descendants.get(producer["id"], set())
     if not corresponding_producers:
         return None
-    dest_edges = dest.get("edges") or []
-    dest_values = {value["id"]: value for item in dest["nodes"]
-                   for value in item.get("results") or [] if isinstance(value.get("id"), str)}
-    source_edges = source.get("edges") or []
+    dest_values = context.dest_values
 
     def terminal_uses(value_node: dict[str, Any], value: dict[str, Any],
                       visited: set[str]) -> list[dict[str, Any]] | None:
         if value_node["id"] in visited:
             return None
         visited = {*visited, value_node["id"]}
-        uses = [edge for edge in source_edges
-                if edge.get("producer_node_id") == value_node["id"]]
+        uses = context.source_outgoing.get(value_node["id"], [])
         if not uses or any(edge.get("producer_value_id") != value.get("id") for edge in uses):
             return None
         terminal = []
@@ -1108,7 +1148,7 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
                 terminal.append(use)
                 continue
             consumer = sources.get(consumer_id)
-            next_link = _forward_identity_value(source, consumer) if consumer else None
+            next_link = _forward_identity_value(source, consumer, sources=sources) if consumer else None
             if (next_link is None or next_link[0]["id"] != value_node["id"]
                     or next_link[1] != value or use.get("argument_path") != "args/0"
                     or not unmodified_input(consumer, value_node)):
@@ -1131,7 +1171,8 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
         # exactly one direct edge from the mapped producer into that descendant
         # set at the original argument path; an internal edge from a different
         # producer cannot establish that the vanished cast was bypassed.
-        matching_edges = [edge for edge in dest_edges
+        matching_edges = [edge for producer_id in corresponding_producers
+                          for edge in context.dest_outgoing.get(producer_id, [])
                           if edge.get("consumer_node_id") in consumers
                           and edge.get("argument_path") == use.get("argument_path")
                           and edge.get("producer_node_id") in corresponding_producers]
@@ -1154,16 +1195,21 @@ def _identity_conversion_bypass(source: dict[str, Any], dest: dict[str, Any],
                       "scope": "forward tensor values; autograd metadata is not certified"}}
 
 
-def _unused_tuple_selection(source: dict[str, Any], node: dict[str, Any]) -> dict[str, Any] | None:
+def _unused_tuple_selection(source: dict[str, Any], node: dict[str, Any], *, context=None) -> dict[str, Any] | None:
     """Prove an unobserved, in-bounds tuple getitem cannot affect program output."""
+    if context is not None:
+        context.require_binding(source)
+    outgoing = (context.source_outgoing.get(node.get("id"), []) if context else
+                [edge for edge in source.get("edges") or [] if edge.get("producer_node_id") == node.get("id")])
     if (node.get("op") != "call_function" or node.get("target") != "<built-in function getitem>"
             or node.get("kwargs") or len(node.get("args") or ()) != 2
-            or any(edge.get("producer_node_id") == node.get("id") for edge in source.get("edges") or ())):
+            or outgoing):
         return None
     ref, index = node["args"]
     if not isinstance(ref, dict) or type(index) is not int:
         return None
-    producer = next((item for item in source["nodes"] if item["id"] == ref.get("node_id")), None)
+    producer = (context.sources.get(ref.get("node_id")) if context else
+                next((item for item in source["nodes"] if item["id"] == ref.get("node_id")), None))
     results = producer.get("results") or [] if producer is not None else []
     if len(results) < 2 or not -len(results) <= index < len(results):
         return None
@@ -1173,7 +1219,8 @@ def _unused_tuple_selection(source: dict[str, Any], node: dict[str, Any]) -> dic
             or any(output[0].get(field) != selected.get(field) for field in
                    ("kind", "dtype", "storage_dtype", "compute_dtype", "shape", "device", "layout", "stride"))):
         return None
-    incoming = [edge for edge in source.get("edges") or [] if edge.get("consumer_node_id") == node["id"]]
+    incoming = (context.source_incoming.get(node["id"], []) if context else
+                [edge for edge in source.get("edges") or [] if edge.get("consumer_node_id") == node["id"]])
     if (len(incoming) != 1 or incoming[0].get("producer_node_id") != producer["id"]
             or incoming[0].get("producer_value_id") != selected.get("id")
             or incoming[0].get("argument_path") != "args/0"):
@@ -1828,10 +1875,11 @@ def graph_relation(source: dict[str, Any] | None, dest: dict[str, Any] | None) -
         if origins:
             consumed.update(origins)
             relations.append({**elimination, "source_ids": origins, "destination_ids": []})
+    identity_context = _IdentityProofContext(source, dest)
     for node in source["nodes"]:
         if node["id"] not in consumed:
-            proved = (_identity_conversion_bypass(source, dest, node)
-                      or _unused_tuple_selection(source, node))
+            proved = (_identity_conversion_bypass(source, dest, node, context=identity_context)
+                      or _unused_tuple_selection(source, node, context=identity_context))
             if proved is not None:
                 consumed.add(node["id"])
                 relations.append(proved)
