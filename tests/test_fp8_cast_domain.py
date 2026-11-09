@@ -219,3 +219,18 @@ def test_valid_domain_is_derived_from_actual_float_constants():
     source.owner.body.block.first_op.properties["value"] = FloatAttr(-1000.0, f32)
     meta["range_hint"] = [-448.0, 448.0]
     assert _e4m3fn_cast_clamp_domain(source, meta) is None
+
+
+@pytest.mark.parametrize("key", ["prov.module", "prov.fqn"])
+def test_known_module_provenance_does_not_change_the_clamp_proof(key):
+    source, meta = _clamp_source()
+    source.owner.attributes[key] = StringAttr("ordinary.nested.module")
+    source.owner.body.block.first_op.attributes[key] = StringAttr("another.name")
+    assert _e4m3fn_cast_clamp_domain(source, meta) == (-448.0, 448.0)
+
+
+@pytest.mark.parametrize("key", ["prov.module", "prov.fqn"])
+def test_module_provenance_must_have_the_importer_string_type(key):
+    source, meta = _clamp_source()
+    source.owner.attributes[key] = IntegerAttr(0, 64)
+    assert _e4m3fn_cast_clamp_domain(source, meta) is None

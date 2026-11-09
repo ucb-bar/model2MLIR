@@ -4871,8 +4871,13 @@ def _e4m3fn_cast_clamp_domain(source, meta):
     # attributes/properties, nested regions or altered floating effects refuse.
     metadata = {"prov.region_id", "prov.family", "prov._pattern_hint", "prov.op",
                 "prov.source_node_ids", "prov.origin_node_ids", "prov.trace_role",
-                "prov.aten", "prov.orig_dtype"}
+                "prov.aten", "prov.orig_dtype", "prov.module", "prov.fqn"}
     if any(set(op.attributes) - metadata for op in (producer, *ops)):
+        return None
+    # The importer adds these diagnostic names to ordinary submodule calls.
+    # Retain their typed values without using either name to select arithmetic.
+    if any(key in op.attributes and not isinstance(op.attributes[key], StringAttr)
+           for op in (producer, *ops) for key in ("prov.module", "prov.fqn")):
         return None
     lo, low_cmp, low_select, hi, high_cmp, high_select, yielded = ops
     if (set(lo.properties) != {"value"} or set(hi.properties) != {"value"}
