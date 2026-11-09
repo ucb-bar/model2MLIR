@@ -242,6 +242,36 @@ def frozen_metadata(value):
     _error("unsupported embedding recipe metadata kind")
 
 
+def _checked_span(device, pointer, capacity):
+    """An actual storage byte interval, including empty/null and size_t bounds."""
+    limit = (1 << (8 * struct.calcsize("P"))) - 1
+    if (
+        not isinstance(device, torch.device)
+        or type(pointer) is not int
+        or type(capacity) is not int
+        or not 0 <= pointer <= limit
+        or not 0 <= capacity <= limit - pointer
+        or (capacity and not pointer)
+    ):
+        _error("unproved embedding storage byte interval")
+    return device, pointer, capacity
+
+
+def _storage_span(value):
+    if type(value) not in (torch.Tensor, torch.nn.Parameter):
+        _error("unproved embedding storage owner")
+    storage = value.untyped_storage()
+    return _checked_span(value.device, storage.data_ptr(), storage.nbytes())
+
+
+def _overlap(left, right):
+    # Distinct StorageImpl owners (e.g. separate from_numpy views) may point
+    # into the same allocation. Tensor start pointers and _cdata are insufficient.
+    ld, lp, ln = left
+    rd, rp, rn = right
+    return ld == rd and bool(ln and rn) and max(lp, rp) < min(lp + ln, rp + rn)
+
+
 def verify_source_weight_uses(source, sites, boundaries):
     nodes = {n.meta.get("_m2m_node_id"): n for n in source.graph.nodes}
     admitted = {nodes[b["output"]] for b in boundaries.values()}
@@ -288,18 +318,22 @@ def verify_weight_uses(source, selected, sites, before, after):
         for v in torch.utils._pytree.tree_leaves(selected.example_inputs)
         if isinstance(v, torch.Tensor)
     ]
-    forbidden = {
-        v.untyped_storage()._cdata
+    forbidden = [
+        _storage_span(v)
         for v in original
         if type(v) in (torch.Tensor, torch.nn.Parameter)
-    }
+    ]
     for site in sites.values():
         if "embedding_policy" not in site:
             continue
         weight = site["module"].weight
         names, _ = weight.__tensor_flatten__()
-        storage = [getattr(weight, n).untyped_storage()._cdata for n in names]
-        if len(set(storage)) != len(storage) or set(storage) & forbidden:
+        storage = [_storage_span(getattr(weight, n)) for n in names]
+        if any(
+            _overlap(span, other)
+            for index, span in enumerate(storage)
+            for other in storage[index + 1 :] + forbidden
+        ):
             _error(
                 "embedding selected fields alias original state, input or each other"
             )
@@ -309,7 +343,8 @@ def verify_weight_uses(source, selected, sites, before, after):
             flatten = getattr(value, "__tensor_flatten__", None)
             leaves = [getattr(value, n) for n in flatten()[0]] if flatten else [value]
             if any(
-                isinstance(v, torch.Tensor) and v.untyped_storage()._cdata in storage
+                isinstance(v, torch.Tensor)
+                and any(_overlap(_storage_span(v), span) for span in storage)
                 for v in leaves
             ):
                 _error("embedding selected fields alias unrelated selected state")

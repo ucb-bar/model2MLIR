@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
@@ -354,3 +355,75 @@ def test_noncontiguous_source_input_allocation_resize_is_observed():
         storage.resize_(storage.nbytes() + 64)
         with pytest.raises(DynamicLinearLineageError, match="sealed tensor"):
             owner.export_selected(original, model, inputs, quantization=QUANT)
+
+
+@pytest.mark.parametrize("offset,rebind", [(0, False), (8, False), (8, True)])
+def test_distinct_storage_shared_numpy_backing_refuses(offset, rebind):
+    model, inputs = setup()
+    model.embedding.weight.data.zero_()
+    with LinearInstrumentation(
+        model, embedding_policy=Int8WeightOnlyEmbeddingPolicy()
+    ) as owner:
+        original = owner.capture_source(model, inputs)
+        source_weight = model.embedding.weight
+        apply(model)
+        actual = model.embedding.weight.qdata
+        backing = source_weight.detach().numpy().view(np.int8).reshape(-1)
+        aliased = torch.from_numpy(
+            backing[offset : offset + actual.numel()].reshape(actual.shape)
+        )
+        assert torch.equal(actual, aliased)
+        assert (
+            aliased.untyped_storage()._cdata != source_weight.untyped_storage()._cdata
+        )
+        assert aliased.data_ptr() == source_weight.data_ptr() + offset
+        if rebind:
+            actual.set_(aliased)
+        else:
+            model.embedding.weight.qdata = aliased
+        with pytest.raises(DynamicLinearLineageError, match="alias"):
+            owner.export_selected(original, model, inputs, quantization=QUANT)
+
+
+def test_distinct_storage_shared_input_backing_refuses():
+    model, _ = setup()
+    model.embedding.weight.data.zero_()
+    inputs = (torch.zeros((1, 64), dtype=torch.int64),)
+    with LinearInstrumentation(
+        model, embedding_policy=Int8WeightOnlyEmbeddingPolicy()
+    ) as owner:
+        original = owner.capture_source(model, inputs)
+        apply(model)
+        actual = model.embedding.weight.qdata
+        backing = inputs[0].numpy().view(np.int8).reshape(-1)
+        model.embedding.weight.qdata = torch.from_numpy(
+            backing[8 : 8 + actual.numel()].reshape(actual.shape)
+        )
+        with pytest.raises(DynamicLinearLineageError, match="alias"):
+            owner.export_selected(original, model, inputs, quantization=QUANT)
+
+
+def test_storage_span_uses_full_capacity_and_device_not_tensor_start():
+    from m2m.capture.embedding_trace import _checked_span, _overlap, _storage_span
+
+    base = torch.zeros(100)
+    tail = base[99:]
+    assert tail.data_ptr() != base.data_ptr()
+    assert _storage_span(tail) == _storage_span(base)
+    assert _overlap(_storage_span(tail), _storage_span(base))
+    cpu = torch.device("cpu")
+    other = torch.device("cuda", 0)
+    assert not _overlap(_checked_span(cpu, 32, 8), _checked_span(cpu, 40, 1))
+    assert not _overlap(_checked_span(cpu, 32, 8), _checked_span(other, 32, 8))
+    assert not _overlap(_checked_span(cpu, 0, 0), _checked_span(cpu, 1, 8))
+
+
+@pytest.mark.parametrize(
+    "pointer,capacity",
+    [(0, 1), (-1, 1), (1, -1), (2**64, 0), (2**64 - 1, 1), (True, 1), (1, True)],
+)
+def test_unproved_storage_interval_refuses(pointer, capacity):
+    from m2m.capture.embedding_trace import _checked_span
+
+    with pytest.raises(DynamicLinearLineageError, match="interval"):
+        _checked_span(torch.device("cpu"), pointer, capacity)
