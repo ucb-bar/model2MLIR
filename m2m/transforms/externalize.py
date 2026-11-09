@@ -1,7 +1,7 @@
 """Externalize weights/constants to a safetensors file.
 
-Keep the ``.mlir`` small and inspectable while preserving the actual parameter/buffer data:
-write them to a widely-supported ``safetensors`` file keyed by their state-dict names, tag the
+Keep the ``.mlir`` small and inspectable while preserving actual parameter/buffer/constant data:
+write them to a widely-supported ``safetensors`` file keyed by their exported targets, tag the
 module with ``prov.weights_file``, and emit a JSON manifest mapping each func argument
 (placeholder) to its weight key + dtype + shape. A consumer loads the safetensors and binds
 each tensor to the corresponding function argument.
@@ -16,7 +16,7 @@ from xdsl.dialects.builtin import ModuleOp, StringAttr
 
 
 def externalize_weights(exported: Any, module: ModuleOp, path: str) -> dict:
-    """Write the exported program's parameters/buffers to ``path`` (safetensors) and a
+    """Write the exported program's parameters/buffers/constants to ``path`` (safetensors) and a
     ``path + '.manifest.json'`` mapping func-arg index -> {weight, kind, dtype, shape}.
     Tags ``module`` with ``prov.weights_file``. Returns a summary dict. Best-effort: tensors
     that can't be serialized (e.g. exotic quant subclasses) are recorded in the manifest
@@ -26,18 +26,25 @@ def externalize_weights(exported: Any, module: ModuleOp, path: str) -> dict:
 
     sig = getattr(exported, "graph_signature", None)
     sd = dict(getattr(exported, "state_dict", {}) or {})
+    constants = dict(getattr(exported, "constants", {}) or {})
     in2param = dict(getattr(sig, "inputs_to_parameters", {})) if sig else {}
     in2buf = dict(getattr(sig, "inputs_to_buffers", {})) if sig else {}
+    in2const = dict(getattr(sig, "inputs_to_lifted_tensor_constants", {})) if sig else {}
     placeholders = [n for n in exported.graph.nodes if n.op == "placeholder"]
 
     tensors: dict[str, Any] = {}
     manifest: dict[str, Any] = {}
     for idx, ph in enumerate(placeholders):
-        wname = in2param.get(ph.name) or in2buf.get(ph.name)
-        kind = "param" if ph.name in in2param else ("buffer" if ph.name in in2buf else "input")
-        if wname is not None and wname in sd:
+        wname = in2param.get(ph.name) or in2buf.get(ph.name) or in2const.get(ph.name)
+        kind = ("param" if ph.name in in2param else "buffer" if ph.name in in2buf
+                else "constant" if ph.name in in2const else "input")
+        # Nonpersistent buffers and lifted tensor constants live in constants,
+        # while parameters and persistent buffers retain their state-dict source.
+        source = (sd if kind == "param" or (kind == "buffer" and wname in sd)
+                  else constants)
+        if wname is not None and wname in source:
             try:
-                t = sd[wname]
+                t = source[wname]
                 t = t.detach() if hasattr(t, "detach") else t
                 # Quantized tensor-subclass weights (torchao AffineQuantizedTensor & friends)
                 # are NOT serialized as their dequantized fp32: torch.export unfolds them into
@@ -64,6 +71,9 @@ def externalize_weights(exported: Any, module: ModuleOp, path: str) -> dict:
                 manifest[str(idx)] = {"weight": wname, "kind": kind,
                                       "dtype": str(t.dtype).replace("torch.", ""),
                                       "shape": list(t.shape)}
+                if kind == "constant":
+                    # Keep the lifted-placeholder binding used by bundle extras.
+                    manifest[str(idx)]["name"] = ph.name
             except Exception as exc:  # noqa: BLE001
                 manifest[str(idx)] = {"weight": wname, "kind": kind, "error": str(exc)[:120]}
         else:

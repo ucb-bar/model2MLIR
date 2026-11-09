@@ -147,6 +147,7 @@ def bridge_fx_graph(
     emit_named_ops: bool = False,
     weights_path: str | None = None,
     capture_trace: bool = False,
+    opaque_custom_ops: bool = False,
 ) -> BridgeResult:
     """Convert ``model`` + ``example_inputs`` into an xDSL ModuleOp.
 
@@ -250,7 +251,7 @@ def bridge_fx_graph(
                         break
         except Exception:  # noqa: BLE001 - non-fatal
             pass
-        importer = FXImporter(emit_named_ops=emit_named_ops)
+        importer = FXImporter(emit_named_ops=emit_named_ops, opaque_custom_ops=opaque_custom_ops)
         module = importer.import_graph(exported)
         result.trace_dispositions = dict(importer.trace_dispositions)
         errors = [d for d in importer.diagnostics if d.level == "error"]

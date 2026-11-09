@@ -16,6 +16,12 @@ float dtype. This differs from a `host` fallback and from an unsupported
 interpreting or certifying the backend. The v1 manifest remains accepted for
 existing adapters.
 
+Providers can pass `convert(..., capture_trace=True, normalize=normalize)` with a callable `normalize(module, manifest) -> ModuleOp`. It runs once after import and built-in transforms, receives the validated external manifest (or `None` without external quantization), and must preserve source lineage and ordered operand/result bindings. The returned module is verified before final MLIR text and trace hashes are computed; normalization errors propagate. With normalization selected, custom operations enter through the generic opaque importer so their provider can replace them.
+
+Opaque custom calls retain all tensor results and schema-ordered tensor operands, including keyword arguments. `m2m.schema` stores the exact source schema; `m2m.literal.<argument_name>` stores canonical JSON using the frontend trace literal encoding, including omitted defaults. Calls carry `prov.source_node_ids` and `prov.origin_node_ids`; function argument dictionaries carry these identities plus `prov.input_target` and `prov.get_attr` for lifted tensors. Providers must bind manifest records through these identities and validate literal values and buffer targets rather than relying on callee suffixes or call order.
+
+In provider normalization mode, identity decompositions retain `prov.value_aliases` as JSON on the underlying result's owner or function argument dictionary. Each entry carries `node_ids`, the underlying `result_index`, and the source alias's `alias_result_index`. Consumers must check all three fields to distinguish a forwarded tuple result from the alias's own result numbering.
+
 ## Inspect frontend operations and lowering correspondence
 
 ```python

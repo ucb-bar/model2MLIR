@@ -199,6 +199,7 @@ def _prepare_exported_program(
     run_default_decompositions: bool,
     export_decomposition_table: dict[Any, Any] | None,
     capture_trace: bool = False,
+    opaque_custom_ops: bool = False,
 ) -> tuple[Any, tuple[str, ...]]:
     table, targets = _build_decomposition_table(
         run_default_decompositions=run_default_decompositions,
@@ -209,8 +210,12 @@ def _prepare_exported_program(
     eliminations: list[dict[str, Any]] = list(
         getattr(exported_program.graph_module, "_m2m_trace_eliminations", ())
     ) if capture_trace else []
+    noop_conversions: list[tuple[str, dict[str, Any]]] = []
     if capture_trace:
         from m2m.capture.trace import tuple_selection_trace_program
+
+        if opaque_custom_ops:
+            from m2m.capture.trace import _literal
 
         exported_program = tuple_selection_trace_program(exported_program)
         import functools
@@ -222,6 +227,42 @@ def _prepare_exported_program(
             n.meta.get("custom", {}).get("m2m_node_id"): str(n.target)
             for n in exported_program.graph.nodes
         }
+        source_nodes = ({n.meta.get("custom", {}).get("m2m_node_id"): n
+                         for n in exported_program.graph.nodes} if opaque_custom_ops else {})
+        # Dispatcher-level no-copy conversions can disappear before a Python
+        # decomposition wrapper runs. Certify only exact unchanged tensor ABI
+        # and unchanged dtype/layout/device with all copying options disabled.
+        for source_id, node in source_nodes.items():
+            if (node.target not in {torch.ops.aten.to.dtype, torch.ops.aten.to.dtype_layout}
+                    or not node.args or not isinstance(node.args[0], torch.fx.Node)):
+                continue
+            values = {spec.name: node.args[i] if i < len(node.args)
+                      else node.kwargs.get(spec.name, spec.default_value)
+                      for i, spec in enumerate(node.target._schema.arguments)}
+            argument = node.args[0]
+            before, after = argument.meta.get("val"), node.meta.get("val")
+            if not isinstance(before, torch.Tensor) or not isinstance(after, torch.Tensor):
+                continue
+            if (before.dtype != after.dtype or tuple(before.shape) != tuple(after.shape)
+                    or before.layout != after.layout or before.device != after.device
+                    or before.layout != torch.strided or before.stride() != after.stride()
+                    or values.get("dtype") != before.dtype
+                    or values.get("layout") not in (None, before.layout)
+                    or values.get("device") not in (None, before.device)
+                    or values.get("pin_memory") is not None
+                    or values.get("non_blocking", False) is not False
+                    or values.get("copy", False) is not False
+                    or values.get("memory_format") is not None):
+                continue
+            custom = node.meta.get("custom") or {}
+            argument_meta = argument.meta.get("custom") or {}
+            noop_conversions.append((source_id, {
+                "source_ids": list(custom.get("m2m_lineage") or ()),
+                "kind": "eliminated", "reason": "identity decomposition", "argument_index": 0,
+                "alias_input_source_ids": list(argument_meta.get("m2m_lineage") or ()),
+                "alias_input_result_index": 0,
+                "alias_input_abi": _literal(argument.meta.get("val")),
+            }))
         def wrap(target, function):
             @functools.wraps(function)
             def traced(*args, **kwargs):
@@ -231,15 +272,30 @@ def _prepare_exported_program(
                 if source_targets.get(source_id) == str(target):
                     for index, arg in enumerate(args):
                         if isinstance(arg, torch.Tensor) and result is arg:
-                            eliminations.append({"source_ids": list(custom.get("m2m_lineage") or ()),
-                                                 "kind": "eliminated", "reason": "identity decomposition",
-                                                 "argument_index": index})
+                            evidence = {"source_ids": list(custom.get("m2m_lineage") or ()),
+                                        "kind": "eliminated", "reason": "identity decomposition",
+                                        "argument_index": index}
+                            if opaque_custom_ops:
+                                source = source_nodes.get(source_id)
+                                source_arg = source.args[index] if source is not None and index < len(source.args) else None
+                                if isinstance(source_arg, torch.fx.Node):
+                                    argument_meta = source_arg.meta.get("custom") or {}
+                                    evidence["alias_input_source_ids"] = list(argument_meta.get("m2m_lineage") or ())
+                                    evidence["alias_input_result_index"] = 0
+                                    evidence["alias_input_abi"] = _literal(source_arg.meta.get("val"))
+                            eliminations.append(evidence)
                             break
                 return result
             return traced
         table = {target: wrap(target, function) for target, function in table.items()}
     prepared = exported_program.run_decompositions(table)
     if capture_trace:
+        if opaque_custom_ops:
+            survivors = {node.meta.get("custom", {}).get("m2m_node_id") for node in prepared.graph.nodes}
+            # Value alias metadata does not replace the trace's independent typed
+            # producer/consumer bypass proof for a removed conversion.
+            prepared._m2m_value_aliases = [*getattr(exported_program, "_m2m_value_aliases", ()),
+                                           *(row for source_id, row in noop_conversions if source_id not in survivors)]
         prepared._m2m_trace_eliminations = eliminations
     return prepared, targets
 
