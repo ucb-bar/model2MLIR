@@ -119,3 +119,35 @@ def test_value_ranges_preserve_all_bounds_and_flags_without_rechecking_them(
         source.is_int,
         source.is_float,
     )
+
+
+def test_extra_value_range_payload_is_not_silently_discarded():
+    from torch.utils._sympy.value_ranges import ValueRanges
+
+    source = ValueRanges(0, 4)
+    payload = torch.ones(32)
+    object.__setattr__(source, "unproved_payload", payload)
+    with pytest.raises(ValueError, match="extra typed trace metadata"):
+        _metadata(source)
+    assert source.unproved_payload is payload
+
+
+def test_current_slotted_path_descriptors_cannot_hide_extra_fields():
+    from torch.fx.experimental.symbolic_shapes import CallMethodKey, DivideByKey
+    from torch.utils._pytree import GetAttrKey, MappingKey, SequenceKey
+
+    for source in (
+        CallMethodKey("size"),
+        DivideByKey(2),
+        SequenceKey(0),
+        MappingKey("value"),
+        GetAttrKey("shape"),
+    ):
+        try:
+            object.__setattr__(source, "unproved_payload", torch.ones(1))
+        except AttributeError:
+            copied = _metadata(source)
+            assert type(copied) is type(source) and copied == source
+        else:
+            with pytest.raises(ValueError, match="extra typed trace metadata"):
+                _metadata(source)

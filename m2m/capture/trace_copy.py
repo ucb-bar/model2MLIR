@@ -12,6 +12,15 @@ from types import BuiltinFunctionType, FunctionType, ModuleType
 import torch
 
 
+def _typed_fields(value):
+    declared = tuple(fields(type(value)))
+    if hasattr(value, "__dict__") and set(vars(value)) != {
+        field.name for field in declared
+    }:
+        raise ValueError("unsupported extra typed trace metadata fields")
+    return declared
+
+
 def _metadata(value):
     if isinstance(value, torch.Tensor):
         # Tensor metadata and state storage are observed, never mutated here.
@@ -67,7 +76,7 @@ def _metadata(value):
             return type(value)(
                 **{
                     field.name: _metadata(getattr(value, field.name))
-                    for field in fields(value)
+                    for field in _typed_fields(value)
                 }
             )
     from sympy import Basic
@@ -79,7 +88,7 @@ def _metadata(value):
 
         if type(value) is ValueRanges:
             owned = object.__new__(ValueRanges)
-            for field in fields(ValueRanges):
+            for field in _typed_fields(value):
                 object.__setattr__(
                     owned, field.name, _metadata(getattr(value, field.name))
                 )
@@ -169,7 +178,7 @@ def _metadata(value):
 
     CompileId = getattr(_guards, "CompileId", None)
     if CompileId is not None and type(value) is CompileId:
-        names = tuple(field.name for field in fields(CompileId) if field.init)
+        names = tuple(field.name for field in _typed_fields(value) if field.init)
         if any(
             getattr(value, name) is not None and type(getattr(value, name)) is not int
             for name in names
