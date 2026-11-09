@@ -1,4 +1,4 @@
-"""Preserve actual callee values when decomposition erases no-op type_as."""
+"""Preserve callee values when decomposition erases proved tensor identities."""
 
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ def normalize_call_boundary_aliases(exported):
 
     The arithmetic graph is unchanged. Raw caller signatures remain untouched.
     A module-call argument is redirected only through an exact identity type_as
-    and its unchanged alias lifetime, never through names/types/shapes alone.
+    or disabled dropout and its unchanged alias lifetime, never through
+    names/types/shapes alone.
     This handles framework signature maintenance, not model accuracy or target
     execution. Unsupported identity/effect cases remain a precise refusal.
     """
@@ -24,6 +25,7 @@ def normalize_call_boundary_aliases(exported):
     from torch.export.graph_signature import TensorArgument
 
     nodes = {node.name: node for node in exported.graph.nodes}
+    identities = {torch.ops.aten.type_as.default, torch.ops.aten.dropout.default}
     candidates = []
     for entry_index, entry in enumerate(exported.module_call_graph):
         if entry.signature is None:
@@ -33,7 +35,7 @@ def normalize_call_boundary_aliases(exported):
                 if not isinstance(arg, TensorArgument):
                     continue
                 node = nodes.get(arg.name)
-                if node is not None and node.target is torch.ops.aten.type_as.default:
+                if node is not None and node.target in identities:
                     candidates.append((entry_index, entry.fqn, direction, index, node))
     if not candidates:
         return exported, []
@@ -58,21 +60,29 @@ def normalize_call_boundary_aliases(exported):
     for entry_index, fqn, direction, index, node in candidates:
         cursor = node
         traversed = []
-        while cursor.target is torch.ops.aten.type_as.default:
+        while cursor.target in identities:
+            tensor_arguments = (
+                cursor.args
+                if cursor.target is torch.ops.aten.type_as.default
+                else cursor.args[:1]
+            )
             if (
-                len(cursor.args) != 2
-                or cursor.kwargs
-                or any(not isinstance(arg, torch.fx.Node) for arg in cursor.args)
+                not tensor_arguments
+                or (
+                    cursor.target is torch.ops.aten.type_as.default
+                    and (len(cursor.args) != 2 or cursor.kwargs)
+                )
+                or any(not isinstance(arg, torch.fx.Node) for arg in tensor_arguments)
                 or any(
                     type(value) not in (torch.Tensor, torch.nn.Parameter, FakeTensor)
                     for value in (
                         cursor.meta.get("val"),
-                        *(arg.meta.get("val") for arg in cursor.args),
+                        *(arg.meta.get("val") for arg in tensor_arguments),
                     )
                 )
             ):
                 raise ValueError(
-                    "callee type_as alias lacks ordinary dense tensor metadata"
+                    "callee tensor identity lacks ordinary dense tensor metadata"
                 )
             row = rows[cursor.name]
             checked = _forward_identity_value(snapshot, row)
@@ -90,7 +100,7 @@ def normalize_call_boundary_aliases(exported):
                 or not unchanged_through_uses(aliases, row, uses.get(row["id"], []))
             ):
                 raise ValueError(
-                    "callee type_as alias/effect/consumer lifetime is unproved"
+                    "callee tensor identity alias/effect/consumer lifetime is unproved"
                 )
             traversed.append(cursor.name)
             cursor = cursor.args[0]

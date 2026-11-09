@@ -164,8 +164,9 @@ unknown controls, wrong consumers and intervening alias writes decline; this doe
 not certify training/autograd semantics or numerical target execution.
 
 `capture/call_boundary_trace.py` normalizes owned module-call signature slots
-only through an exact no-op `aten.type_as` primitive with typed operand/result
-and unchanged consumer-lifetime proofs. It leaves the arithmetic graph and raw
+only through an exact no-op `aten.type_as` or explicitly disabled
+`aten.dropout` primitive with typed operand/result, schema/control and unchanged
+consumer-lifetime proofs. It leaves the arithmetic graph and raw
 export untouched, records each actual module-call entry/slot and source IDs,
 and keeps real dtype/device conversions as operations. This repairs framework
 callee-signature maintenance when decomposition erases the identity; it never
