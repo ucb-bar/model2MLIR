@@ -216,7 +216,7 @@ def _broadcast_map(operand_shape, result_shape):
     return AffineMap(r, 0, tuple(exprs))
 
 
-def _cast_scalar_arg(x, dst):
+def _cast_scalar_arg(x, dst, *, source_unsigned=False):
     """Cast a scalar SSA value to ``dst`` element type (for arith dtype promotion)."""
     src = x.type
     if src == dst:
@@ -244,14 +244,14 @@ def _cast_scalar_arg(x, dst):
         op = TruncFOp(x, dst) if dst.bitwidth < src.bitwidth else ExtFOp(x, dst)
     elif isinstance(src, IntegerType) and isinstance(dst, AnyFloat):
         # i1 is a boolean: signed conversion would turn True into -1.
-        op = UIToFPOp(x, dst) if src.width.data == 1 else SIToFPOp(x, dst)
+        op = UIToFPOp(x, dst) if source_unsigned or src.width.data == 1 else SIToFPOp(x, dst)
     elif isinstance(src, AnyFloat) and isinstance(dst, IntegerType):
         op = FPToSIOp(x, dst)
     elif isinstance(src, IntegerType) and isinstance(dst, IntegerType):
         if dst.width.data < src.width.data:
             op = TruncIOp(x, dst)
         # widening: bool (i1) zero-extends (True->1), signed ints sign-extend
-        elif src.width.data == 1:
+        elif source_unsigned or src.width.data == 1:
             op = ExtUIOp(x, dst)
         else:
             op = ExtSIOp(x, dst)
@@ -390,12 +390,12 @@ def _splat_scalar(scalar: Any, result_type: TensorType):
     return [*ops, splat], splat.results[0]
 
 
-def _cast_scalar_build(target_elem):
+def _cast_scalar_build(target_elem, *, source_unsigned=False):
     """scalar_build for a dtype cast: float trunc/ext, int<->float, or int<->int
     (bool zero-extends), picked by types -- delegates to ``_cast_scalar_arg``."""
 
     def build(args, out_elem):
-        return _cast_scalar_arg(args[0], target_elem)
+        return _cast_scalar_arg(args[0], target_elem, source_unsigned=source_unsigned)
 
     return build
 
@@ -4757,14 +4757,45 @@ def decompose_matmul(operands, meta, node_name):
 # ---------------------------------------------------------------------------
 
 
+def _cast_source_unsigned(operands, meta):
+    """Prove source integer signedness from the actual FX tensor argument.
+
+    Signless MLIR i8 alone cannot distinguish torch.uint8 from torch.int8.
+    The importer's positional SSA binding must agree when present. Missing,
+    unsupported or contradictory integer source metadata remains unproved.
+    """
+    import torch
+    from xdsl.dialects.builtin import IntegerType
+
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return None
+    element = operands[0].type.element_type
+    if not isinstance(element, IntegerType):
+        return False
+    source_arg = _fx_arg(meta, 0)
+    value = getattr(source_arg, "meta", {}).get("val") if hasattr(source_arg, "meta") else source_arg
+    dtype = getattr(value, "dtype", None)
+    widths = {torch.bool: 1, torch.int8: 8, torch.uint8: 8, torch.int16: 16,
+              torch.int32: 32, torch.int64: 64}
+    if element.width.data != widths.get(dtype):
+        return None
+    positional = meta.get("_fx_ssa_args")
+    if positional is not None and (not isinstance(positional, dict) or positional.get(0) is not operands[0]):
+        return None
+    return dtype in {torch.bool, torch.uint8}
+
+
 def decompose_to_copy(operands, meta, node_name):
     """aten._to_copy.default — dtype cast (linalg.generic arith.trunc/ext/sitofp), or
     identity when the dtype is unchanged (device-only copy -> no cast op)."""
     target_elem = _element_type_from_meta(meta)
+    source_unsigned = _cast_source_unsigned(operands, meta)
+    if source_unsigned is None:
+        raise ValueError("dtype cast requires an actual FX integer source dtype consistent with its SSA operand")
     if operands and isinstance(operands[0].type, TensorType) and operands[0].type.element_type == target_elem:
         return DecompResult(ops=[], result=operands[0], pattern_hint="identity")
     real = _unary_elementwise(
-        operands, meta, "dtype_cast", _cast_scalar_build(target_elem),
+        operands, meta, "dtype_cast", _cast_scalar_build(target_elem, source_unsigned=source_unsigned),
         out_elem=target_elem, dynamic_same_shape=True,
     )
     if real is not None:
