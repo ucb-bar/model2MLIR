@@ -939,7 +939,6 @@ def tuple_selection_trace_program(exported: Any) -> Any:
     proxy object instead of reconstructing a relationship from graph names or order.
     The captured program's input/state/signature is unchanged; no new export runs.
     """
-    import copy
     import operator
     import torch
     from torch.fx.experimental.proxy_tensor import get_proxy_mode, get_proxy_slot
@@ -950,8 +949,9 @@ def tuple_selection_trace_program(exported: Any) -> Any:
         return exported
     # GraphModule holds lifted structure; the ExportedProgram state_dict is not
     # deep-copied. _update validates the unchanged graph before instrumentation.
-    detached = exported._update(graph_module=copy.deepcopy(exported.graph_module),
-                                graph_signature=copy.deepcopy(exported.graph_signature))
+    from m2m.capture.trace_copy import copy_trace_program
+
+    detached = copy_trace_program(exported)
 
     def traced_getitem(value, index):
         result = operator.getitem(value, index)

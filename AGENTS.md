@@ -135,6 +135,14 @@ remain unsupported. Direct observation after a rewrite that changes public node
 ordinals still declines before any snapshot can overwrite IDs; no post-rewrite
 graph is relabelled as the raw source stage.
 
+Graph copying preserves the verified exported node names and signature, including
+builtin-like `input` and colliding suffixed names. Custom metadata containers are
+owned; tensor storage/global operator identities are retained, supported Torch
+provenance records are copied by their typed fields, and unknown opaque objects
+refuse without invoking arbitrary deepcopy hooks. Linear source annotations are
+an optional runtime capability, loaded only when that opt-in owner is requested.
+Byte identities flatten scalar and one-element strided tensors before reinterpretation.
+
 Disabled `aten.dropout` may be proved as a forward tensor identity only with
 its selected schema, explicit `train=False`, a finite valid probability, exact
 tensor metadata and typed consumer-edge bypass. Source and destination storage

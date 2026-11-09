@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from torch.fx.traceback import annotate
 
 from m2m.capture.context_trace import context_projection, live_nodes, observe_contexts
 from m2m.capture.trace import snapshot_exported_program
@@ -33,8 +32,8 @@ def _exact(a, b):
         and a.shape == b.shape
         and a.stride() == b.stride()
         and torch.equal(
-            a.detach().contiguous().view(torch.uint8),
-            b.detach().contiguous().view(torch.uint8),
+            _byte_view(a),
+            _byte_view(b),
         )
     )
 
@@ -107,6 +106,12 @@ def _readonly(snapshot, *, contexts=None, live=None):
 
 
 def _instrument(model):
+    try:
+        from torch.fx.traceback import annotate
+    except ImportError as exc:
+        raise DynamicLinearLineageError(
+            "this runtime lacks explicit Linear source annotation support"
+        ) from exc
     candidates = []
     seen = set()
     for path, module in model.named_modules(remove_duplicate=False):
@@ -637,10 +642,17 @@ def _description(value):
     return str(value.dtype), shape, strides, offset, str(value.device)
 
 
+def _byte_view(value):
+    raw = value.detach().contiguous().reshape(-1)
+    # A one-element view can be logically contiguous with a non-unit stride;
+    # dtype reinterpretation still requires unit byte-addressable last stride.
+    if raw.numel() and raw.stride(0) != 1:
+        raw = raw.clone(memory_format=torch.contiguous_format)
+    return raw.view(torch.uint8)
+
+
 def _sha_tensor(value):
-    return hashlib.sha256(
-        memoryview(value.detach().contiguous().view(torch.uint8).cpu().numpy())
-    ).hexdigest()
+    return hashlib.sha256(memoryview(_byte_view(value).cpu().numpy())).hexdigest()
 
 
 def _outputs(model, inputs):

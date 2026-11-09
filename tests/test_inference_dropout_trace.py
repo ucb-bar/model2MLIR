@@ -167,3 +167,27 @@ def test_destination_alias_write_before_consumer_refuses_inference_dropout_bypas
         torch.ops.aten.add_.Tensor._schema
     )
     assert _identity_conversion_bypass(source, dest, node) is None
+
+
+def test_source_instrumentation_refuses_write_through_disabled_dropout_input_alias():
+    from m2m.capture.dynamic_linear_trace import (
+        DynamicLinearLineageError,
+        LinearInstrumentation,
+    )
+
+    class WritingInput(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(32, 32, bias=False)
+
+        def forward(self, value):
+            alias = torch.nn.functional.dropout(value, p=0.25, training=False)
+            alias.add_(1)
+            return self.linear(alias)
+
+    model = WritingInput().eval().requires_grad_(False)
+    with (
+        LinearInstrumentation(model) as owner,
+        pytest.raises(DynamicLinearLineageError, match="external input/state mutation"),
+    ):
+        owner.capture_source(model, (torch.randn(1, 32),))

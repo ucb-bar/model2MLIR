@@ -205,15 +205,21 @@ def convert(
                                     capture_trace=finalize_trace(trace_graphs, "", path="failed"))
     elif decompose:
         try:
-            from m2m.capture.torch_export import capture_frontend_artifact
+            from m2m.capture.torch_export import capture_frontend_artifact, _prepare_exported_program
             from m2m.ir.torchmlir_decomps import inline_set_grad_hops, torch_mlir_gap_decompositions
 
-            artifact = capture_frontend_artifact(
-                model,
-                tuple(example_inputs),
-                export_decomposition_table=torch_mlir_gap_decompositions(),
-            )
-            exported_program = artifact.exported_program or artifact.original_exported_program
+            if hasattr(model, "graph_signature") and hasattr(model, "graph_module"):
+                model.validate()
+                exported_program, _ = _prepare_exported_program(
+                    model, run_default_decompositions=True,
+                    export_decomposition_table=torch_mlir_gap_decompositions())
+            else:
+                artifact = capture_frontend_artifact(
+                    model,
+                    tuple(example_inputs),
+                    export_decomposition_table=torch_mlir_gap_decompositions(),
+                )
+                exported_program = artifact.exported_program or artifact.original_exported_program
             # Inline torch.no_grad() HOPs (wrap_with_set_grad_enabled) so the FXImporter
             # sees a flat graph (torch 2.7.x quantized exports keep these; modern stacks
             # inline them). Cascades to resolve their downstream ops.
@@ -228,6 +234,11 @@ def convert(
                     pass
         except Exception:  # noqa: BLE001 - bridge will re-export as a fallback
             exported_program = None
+
+    if (not capture_trace and not decompose and hasattr(model, "graph_signature")
+            and hasattr(model, "graph_module")):
+        model.validate()
+        exported_program = model
 
     # The high-level (structured) form is only produced by the FXImporter path -- torch-mlir
     # always emits standard linalg -- so requesting it forces the FXImporter backend.

@@ -154,3 +154,41 @@ def test_source_storage_replacement_before_selected_export_refuses_even_with_equ
         apply_quantization(model, quant)
         with pytest.raises(DynamicLinearLineageError, match="sealed"):
             owner.export_selected(source, model, inputs, quantization=quant)
+
+
+@pytest.mark.parametrize(
+    "value", [torch.tensor(3, dtype=torch.int64), torch.arange(40)[39:40]]
+)
+def test_scalar_and_one_element_strided_input_bytes_hash_without_stride_assumptions(
+    value,
+):
+    import hashlib
+
+    from m2m.capture.dynamic_linear_trace import _sha_tensor
+
+    if value.ndim:
+        value = torch.arange(80, dtype=torch.int64)[::40].reshape(1, 2)[:, 1:2]
+        assert value.numel() == 1 and value.stride(-1) == 40
+    expected = hashlib.sha256(value.detach().cpu().numpy().tobytes()).hexdigest()
+    assert _sha_tensor(value) == expected
+
+
+def test_zero_rank_original_buffer_and_constant_keep_exact_original_ao_source_relation():
+    class Scalar(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(32, 32, bias=False)
+            self.register_buffer("factor", torch.tensor(0.25))
+
+        def forward(self, value):
+            return self.linear(value) * self.factor + torch.tensor(0.125)
+
+    model = Scalar().eval().requires_grad_(False)
+    inputs = (torch.ones(1, 32),)
+    quant = QuantizationConfig(scheme="int8_dyn_act_int8_weight")
+    with LinearInstrumentation(model) as owner:
+        source = owner.capture_source(model, inputs)
+        apply_quantization(model, quant)
+        selected, _ = owner.export_selected(source, model, inputs, quantization=quant)
+        result = convert(selected, inputs, quant, source)
+        assert result.ok and result.capture_trace["status"] == "complete"
