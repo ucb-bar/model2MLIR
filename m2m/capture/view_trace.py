@@ -271,6 +271,8 @@ def unchanged_through_uses(aliases, node, uses):
             if spec is None or any(arg.alias_info is not None and arg.alias_info.is_write
                                    for arg in spec.arguments):
                 return False
+        elif consumer.get("op") != "output" or consumer.get("target") != "output":
+            return False
     return True
 
 

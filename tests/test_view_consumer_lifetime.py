@@ -236,3 +236,51 @@ def test_existing_replayed_writer_path_also_rejects_later_mutation(side):
     reader = _node(graph, _uses(graph, identity)[0]["consumer_node_id"])
     _write_before(graph, identity, reader)
     assert replayed_view_relations(source, dest, premises, consumed) == []
+
+
+@pytest.mark.parametrize("side", ["source", "destination"])
+@pytest.mark.parametrize(
+    "kind",
+    ["call_module", "call_method", "unknown", "unknown_schema", "mutating_schema"],
+)
+def test_unproved_or_mutating_consumer_kind_refuses(side, kind, static_capture):
+    source, dest, premises, consumed, source_id, dest_id = static_capture
+    source, dest = copy.deepcopy(source), copy.deepcopy(dest)
+    graph, identity = (source, source_id) if side == "source" else (dest, dest_id)
+    reader = _node(graph, _uses(graph, identity)[0]["consumer_node_id"])
+    if kind == "unknown_schema":
+        reader.update(
+            op="call_function", target="unregistered_consumer.consume.default"
+        )
+    elif kind == "mutating_schema":
+        reader.update(op="call_function", target="aten.copy_.default")
+        graph["operator_schemas"][reader["target"]] = str(
+            torch.ops.aten.copy_.default._schema
+        )
+    else:
+        reader.update(op=kind, target="unproved_consumer")
+    assert static_view_relations(source, dest, premises, consumed) == []
+
+
+def test_only_canonical_output_is_a_structural_consumer():
+    from m2m.capture.view_trace import unchanged_through_uses
+
+    class ReturnView(torch.nn.Module):
+        def forward(self, x):
+            return x.transpose(1, 2)
+
+    converted = m2m.convert(
+        ReturnView(), (torch.zeros(1, 2, 3),), backend="fx_importer", capture_trace=True
+    )
+    assert converted.ok
+    source = converted.capture_trace["graphs"]["quantized"]
+    view = next(
+        node for node in source["nodes"] if node["target"] == "aten.transpose.int"
+    )
+    uses = _uses(source, view["id"])
+    assert len(uses) == 1
+    assert unchanged_through_uses(SourceStorageAliases(source), view, uses)
+    output = _node(source, uses[0]["consumer_node_id"])
+    assert output["op"] == output["target"] == "output"
+    output["target"] = "unproved_side_effect"
+    assert not unchanged_through_uses(SourceStorageAliases(source), view, uses)
