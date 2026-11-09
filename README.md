@@ -98,7 +98,7 @@ diagnostic. Existing callers without `capture_trace=True` keep normal serializat
 Precision is not inferred from a scheme name. BF16/FP16 tensors retain native
 `bf16`/`f16` MLIR types. Exact Torch E4M3FN and E5M2 tensors retain standard
 `f8E4M3FN`/`f8E5M2` signatures and one-byte external storage. Pure layout
-operations and explicit widening/narrowing casts preserve those types; unknown
+operations and supported explicit casts preserve those types; unknown
 FP8 formats refuse instead of becoming FP32. No local encoder or replacement
 quantization recipe is introduced. The trace checks actual source-ID-mapped
 MLIR storage, including positional arguments and existing checked aliases;
@@ -110,6 +110,18 @@ explicit unresolved external call with typed FP8 operands, and its trace remains
 diagnostic. Accumulation order, scale/bias evaluation, floating effects and
 numeric permission require separate proofs before any target implementation or
 mixed-precision policy can be selected.
+
+FP32-to-E4M3FN narrowing has an additional overflow-domain guard: a standard
+`arith.truncf` is emitted only when the actual incoming SSA producer is a
+complete pure ordered clamp whose finite bounds lie within the format's finite
+range. The original clamp and cast remain in the graph. An unbounded cast,
+unknown producer, altered effects or unproved source binding instead remains an
+explicit typed `aten_to_e4m3fn_unproved_cast_domain` external call and a diagnostic
+trace. Example values or range hints cannot grant this proof. This avoids
+silently representing a finite-saturating source cast as a standard cast that
+can produce NaN on overflow; it introduces no replacement quantizer or clamp.
+The guard establishes the overflow domain only: target arithmetic, floating
+environment and NaN payload behavior still require separate qualification.
 
 To change the precision of the captured static program while preserving its
 original operation identities:

@@ -4810,6 +4810,96 @@ def _cast_source_unsigned(operands, meta):
     return dtype in {torch.bool, torch.uint8}
 
 
+def _e4m3fn_cast_clamp_domain(source, meta):
+    """Prove an existing ordered FP32 clamp, without examining sample values.
+
+    Torch's finite-saturating E4M3FN narrowing is not an unconstrained standard
+    ``arith.truncf``: overflow/infinity may become NaN under the latter. Only
+    the complete pure SSA body below bounds every non-NaN input to the format's
+    finite range. This proves the overflow domain, not target arithmetic or NaN
+    payload semantics. Other producers require a separately proved cast mode.
+    """
+    import math
+
+    import torch
+    from xdsl.dialects.arith import CmpfOp, ConstantOp, FastMathFlagsAttr, SelectOp
+    from xdsl.dialects.builtin import FloatAttr, NoneAttr
+    from xdsl.dialects.linalg.attrs import IteratorTypeAttr
+    from xdsl.dialects.linalg.ops import GenericOp, YieldOp
+    from xdsl.ir.affine import AffineMap
+
+    from m2m.ir.types import Float8E4M3FNType
+
+    typ = source.type
+    if (not isinstance(typ, TensorType)
+            or not isinstance(typ.element_type, Float32Type)
+            or not isinstance(typ.encoding, NoneAttr)):
+        return None
+    arg = _fx_arg(meta, 0)
+    if isinstance(arg, torch.fx.Node):
+        if type(arg.meta) is not dict:
+            return None
+        value = arg.meta.get("val")
+    else:
+        value = arg
+    positional = meta.get("_fx_ssa_args")
+    if (not isinstance(value, torch.Tensor) or value.dtype is not torch.float32
+            or type(positional) is not dict or positional.get(0) is not source):
+        return None
+    producer = source.owner
+    if (not isinstance(producer, GenericOp) or len(producer.inputs) != 1
+            or len(producer.outputs) != 1 or len(producer.results) != 1
+            or source is not producer.results[0]
+            or any(v.type != typ for v in (*producer.inputs, *producer.outputs))
+            or set(producer.properties) != {
+                "indexing_maps", "iterator_types", "operandSegmentSizes"}):
+        return None
+    rank = typ.get_num_dims()
+    if (any(m.data != AffineMap.identity(rank) for m in producer.indexing_maps)
+            or len(producer.indexing_maps) != 2
+            or list(producer.iterator_types) != [IteratorTypeAttr.parallel()] * rank
+            or len(producer.body.blocks) != 1):
+        return None
+    block = producer.body.block
+    ops = list(block.ops)
+    classes = (ConstantOp, CmpfOp, SelectOp, ConstantOp, CmpfOp, SelectOp, YieldOp)
+    if (len(block.args) != 2 or any(a.type != typ.element_type for a in block.args)
+            or len(ops) != len(classes)
+            or any(type(op) is not cls for op, cls in zip(ops, classes))):
+        return None
+    # Metadata is preserved but cannot supply the arithmetic proof. Unknown
+    # attributes/properties, nested regions or altered floating effects refuse.
+    metadata = {"prov.region_id", "prov.family", "prov._pattern_hint", "prov.op",
+                "prov.source_node_ids", "prov.origin_node_ids", "prov.trace_role",
+                "prov.aten", "prov.orig_dtype"}
+    if any(set(op.attributes) - metadata for op in (producer, *ops)):
+        return None
+    lo, low_cmp, low_select, hi, high_cmp, high_select, yielded = ops
+    if (set(lo.properties) != {"value"} or set(hi.properties) != {"value"}
+            or not isinstance(lo.value, FloatAttr) or not isinstance(hi.value, FloatAttr)
+            or lo.value.type != typ.element_type or hi.value.type != typ.element_type
+            or any(op.regions or op.successors for op in ops)
+            or any(set(op.properties) != {"predicate", "fastmath"}
+                   or op.fastmath != FastMathFlagsAttr("none")
+                   for op in (low_cmp, high_cmp))
+            or any(op.properties for op in (low_select, high_select, yielded))):
+        return None
+    minimum, maximum = lo.value.value.data, hi.value.value.data
+    limit = Float8E4M3FNType().max_finite
+    if not (math.isfinite(minimum) and math.isfinite(maximum)
+            and -limit <= minimum <= maximum <= limit):
+        return None
+    if (list(low_cmp.operands) != [block.args[0], lo.result]
+            or low_cmp.predicate.value.data != 4  # ordered less-than
+            or list(low_select.operands) != [low_cmp.result, lo.result, block.args[0]]
+            or list(high_cmp.operands) != [low_select.result, hi.result]
+            or high_cmp.predicate.value.data != 2  # ordered greater-than
+            or list(high_select.operands) != [high_cmp.result, hi.result, low_select.result]
+            or list(yielded.operands) != [high_select.result]):
+        return None
+    return minimum, maximum
+
+
 def decompose_to_copy(operands, meta, node_name):
     """aten._to_copy.default — dtype cast (linalg.generic arith.trunc/ext/sitofp), or
     identity when the dtype is unchanged (device-only copy -> no cast op)."""
@@ -4819,11 +4909,32 @@ def decompose_to_copy(operands, meta, node_name):
         raise ValueError("dtype cast requires an actual FX integer source dtype consistent with its SSA operand")
     if operands and isinstance(operands[0].type, TensorType) and operands[0].type.element_type == target_elem:
         return DecompResult(ops=[], result=operands[0], pattern_hint="identity")
+    from m2m.ir.types import Float8E4M3FNType
+
+    domain = None
+    if isinstance(target_elem, Float8E4M3FNType):
+        domain = _e4m3fn_cast_clamp_domain(operands[0], meta) if operands else None
+        if domain is None:
+            from xdsl.dialects.func import CallOp
+
+            result_type = TensorType(target_elem, [_coerce_static_dim(d) for d in meta["val"].shape])
+            call = CallOp("aten_to_e4m3fn_unproved_cast_domain", operands[:1], [result_type])
+            rid = _next_region_id("cast")
+            _attach_region_id(call, rid)
+            call.attributes["prov.fp8_cast_domain"] = StringAttr("unproved_saturation_mode")
+            return DecompResult(ops=[call], result=call.res[0], region_ids=[rid],
+                                pattern_hint="dtype_cast")
     real = _unary_elementwise(
         operands, meta, "dtype_cast", _cast_scalar_build(target_elem, source_unsigned=source_unsigned),
         out_elem=target_elem, dynamic_same_shape=True,
     )
     if real is not None:
+        if domain is not None:
+            for op in real.ops:
+                for nested in op.walk():
+                    if nested.name == "arith.truncf":
+                        nested.attributes["prov.fp8_cast_domain"] = StringAttr(
+                            "existing_ordered_fp32_clamp_within_finite_range")
         return real
     return _opaque_decomp("aten_to_dtype", operands[:1], meta, "cast", pattern_hint="dtype_cast")
 
